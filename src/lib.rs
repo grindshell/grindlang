@@ -13,8 +13,8 @@
 //!
 //! * Phase 0–1: diagnostics, lexer, AST, parser.
 //! * Phase 2: resolver + constraint enforcement.
-//! * **Phase 3 (current):** static type inference & checking.
-//! * Phase 4: reference interpreter (semantics oracle).
+//! * Phase 3: static type inference & checking.
+//! * **Phase 4 (current):** reference interpreter (semantics oracle).
 //! * Phase 5–7: typed IR → cranelift JIT.
 //! * Phase 8–9: host embedding API, hardening, docs.
 //!
@@ -34,10 +34,16 @@ pub mod parser;
 pub mod resolve;
 pub mod types;
 
+#[cfg(feature = "interp")]
+pub mod interp;
+
 pub use ast::Module;
 pub use diagnostics::{Diagnostic, Diagnostics, Severity, Span};
 pub use resolve::{Binding, Resolution, ResolveConfig};
 pub use types::{FnType, Type, TypeConfig, TypeInfo};
+
+#[cfg(feature = "interp")]
+pub use interp::{Interpreter, RunError, Value};
 
 /// Lex and parse Grindlang source into an untyped [`ast::Module`].
 ///

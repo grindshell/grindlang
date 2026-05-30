@@ -1,0 +1,1442 @@
+//! Reference interpreter: a tree-walking evaluator over the resolved AST (`PLAN.md`
+//! Phase 4, gated behind the `interp` feature).
+//!
+//! This is the **semantics oracle**. It implements the canonical meaning of every
+//! construct so the future cranelift JIT (Phase 7) can be validated by differential
+//! testing — interpret a program, JIT the same program, assert equal results. It also
+//! serves as a debug / fallback execution mode.
+//!
+//! It is intentionally simple, not fast: runtime values are reference-counted rather than
+//! arena-allocated (the arena model described in `PLAN.md` is a JIT-runtime concern; the
+//! oracle just needs to be *correct*). Closures own a cloned [`crate::ast::FuncBody`] via
+//! `Rc`, so [`Value`] carries no lifetime and host code can hold values freely.
+//!
+//! ## Execution model
+//!
+//! * A [`Value`] is `nil`, a bool, an `f64` number, an immutable string, a mutable array,
+//!   a mutable string-keyed table (used for both records and maps *and* host memory), or a
+//!   callable (a script function/closure or a host native function).
+//! * Each function activation gets a fresh [`Frame`] keyed by [`SymbolId`]. Block scoping
+//!   is already resolved into unique symbol ids, so one flat frame per call is sufficient.
+//!   Closures capture the enclosing frame chain by `Rc`.
+//! * `return`/`break` propagate via [`Flow`].
+//! * Host state is injected after construction: [`Interpreter::set_host_function`] and
+//!   [`Interpreter::set_memory`]. Memory tables are shared by `Rc`, so script mutations are
+//!   observable by the host through [`Interpreter::memory`] after a call returns.
+//!
+//! Assumes its input already passed resolution and type checking — runtime "type" errors
+//! are treated as internal invariant violations ([`RunError::Internal`]) rather than user
+//! errors, since the checker should have rejected them.
+
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::rc::Rc;
+
+use crate::ast::*;
+use crate::diagnostics::Diagnostics;
+use crate::resolve::{Binding, Resolution, ResolveConfig, SymbolId};
+
+/// An error raised while executing a Grindlang program.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum RunError {
+    /// A host-registered function returned an error.
+    #[error("host error: {0}")]
+    Host(String),
+    /// A runtime fault that should have been impossible after type checking (e.g. an
+    /// out-of-range array write). Indicates either a script edge case or a checker gap.
+    #[error("runtime error: {0}")]
+    Runtime(String),
+    /// An invariant the resolver/checker should have guaranteed was violated.
+    #[error("internal interpreter error: {0}")]
+    Internal(String),
+    /// A function was requested by a name the module does not export.
+    #[error("no exported function named `{0}`")]
+    UnknownExport(String),
+}
+
+/// A runtime value.
+#[derive(Clone)]
+pub enum Value {
+    Nil,
+    Bool(bool),
+    Number(f64),
+    Str(Rc<str>),
+    /// A 1-based, mutable, homogeneous array.
+    Array(Rc<RefCell<Vec<Value>>>),
+    /// A mutable string-keyed table — the runtime representation of records, maps, and
+    /// host memory alike.
+    Table(Rc<RefCell<BTreeMap<String, Value>>>),
+    /// A script function or closure.
+    Function(Rc<Func>),
+    /// A host-registered native function.
+    Native(NativeFn),
+}
+
+/// A host-registered native function: takes the evaluated arguments and returns a value.
+pub type NativeFn = Rc<dyn Fn(&[Value]) -> Result<Value, RunError>>;
+
+/// A script function: its parameter symbols, body, and (for closures) the captured frame
+/// chain. Top-level functions capture nothing.
+pub struct Func {
+    params: Vec<SymbolId>,
+    body: Rc<FuncBody>,
+    captured: Vec<Frame>,
+}
+
+type Frame = Rc<RefCell<HashMap<SymbolId, Value>>>;
+
+fn new_frame() -> Frame {
+    Rc::new(RefCell::new(HashMap::new()))
+}
+
+/// Control-flow signal threaded out of statement/block execution.
+enum Flow {
+    Normal,
+    Break,
+    Return(Value),
+}
+
+impl Value {
+    pub fn string(s: impl Into<String>) -> Value {
+        Value::Str(Rc::from(s.into().as_str()))
+    }
+
+    pub fn array(items: Vec<Value>) -> Value {
+        Value::Array(Rc::new(RefCell::new(items)))
+    }
+
+    pub fn table(entries: BTreeMap<String, Value>) -> Value {
+        Value::Table(Rc::new(RefCell::new(entries)))
+    }
+
+    /// An empty mutable table — convenient for building host memory.
+    pub fn empty_table() -> Value {
+        Value::table(BTreeMap::new())
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// The string contents, if this is a string value.
+    pub fn as_string(&self) -> Option<String> {
+        match self {
+            Value::Str(s) => Some(s.to_string()),
+            _ => None,
+        }
+    }
+
+    /// A clone of the elements, if this is an array.
+    pub fn as_array(&self) -> Option<Vec<Value>> {
+        match self {
+            Value::Array(a) => Some(a.borrow().clone()),
+            _ => None,
+        }
+    }
+
+    /// Read a field/key, if this is a table. Returns `None` for a missing key.
+    pub fn field(&self, key: &str) -> Option<Value> {
+        match self {
+            Value::Table(t) => t.borrow().get(key).cloned(),
+            _ => None,
+        }
+    }
+
+    /// Lua-style truthiness: only `nil` and `false` are falsy.
+    fn is_truthy(&self) -> bool {
+        !matches!(self, Value::Nil | Value::Bool(false))
+    }
+
+    fn type_name(&self) -> &'static str {
+        match self {
+            Value::Nil => "nil",
+            Value::Bool(_) => "bool",
+            Value::Number(_) => "number",
+            Value::Str(_) => "string",
+            Value::Array(_) => "array",
+            Value::Table(_) => "table",
+            Value::Function(_) | Value::Native(_) => "function",
+        }
+    }
+}
+
+/// Structural-by-value for scalars, identity-by-`Rc` for reference types (Lua semantics).
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Nil, Value::Nil) => true,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Number(x), Value::Number(y)) => x == y,
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Array(x), Value::Array(y)) => Rc::ptr_eq(x, y),
+        (Value::Table(x), Value::Table(y)) => Rc::ptr_eq(x, y),
+        (Value::Function(x), Value::Function(y)) => Rc::ptr_eq(x, y),
+        (Value::Native(x), Value::Native(y)) => Rc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
+/// Format a number the way `tostring` does: integral values without a trailing `.0`.
+fn num_to_string(n: f64) -> String {
+    if n.is_finite() && n == n.trunc() && n.abs() < 1e15 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n}")
+    }
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Nil => f.write_str("nil"),
+            Value::Bool(b) => write!(f, "{b}"),
+            Value::Number(n) => f.write_str(&num_to_string(*n)),
+            Value::Str(s) => f.write_str(s),
+            Value::Array(a) => {
+                f.write_str("[")?;
+                for (i, v) in a.borrow().iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                f.write_str("]")
+            }
+            Value::Table(t) => {
+                f.write_str("{")?;
+                for (i, (k, v)) in t.borrow().iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{k} = {v}")?;
+                }
+                f.write_str("}")
+            }
+            Value::Function(_) | Value::Native(_) => f.write_str("function"),
+        }
+    }
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}({})", self.type_name(), self)
+    }
+}
+
+/// The reference interpreter for one resolved module.
+pub struct Interpreter<'a> {
+    res: &'a Resolution,
+    /// Top-level function declarations, by declared name.
+    funcs: HashMap<String, Value>,
+    /// Top-level constants, by declared name.
+    consts: HashMap<String, Value>,
+    /// The public surface callable via [`Interpreter::call`] — the curated export table if
+    /// present, otherwise every top-level declaration.
+    exports: HashMap<String, Value>,
+    /// Host-registered native functions, by name.
+    host: HashMap<String, Value>,
+    /// Host memory handles, by name.
+    memory: HashMap<String, Value>,
+    /// The current activation frame chain (innermost last).
+    env: Vec<Frame>,
+}
+
+impl<'a> Interpreter<'a> {
+    /// Build an interpreter for a resolved module. Evaluates top-level constants and the
+    /// export table eagerly.
+    pub fn new(module: &Module, res: &'a Resolution) -> Result<Self, RunError> {
+        let mut me = Interpreter {
+            res,
+            funcs: HashMap::new(),
+            consts: HashMap::new(),
+            exports: HashMap::new(),
+            host: HashMap::new(),
+            memory: HashMap::new(),
+            env: Vec::new(),
+        };
+        me.init(module)?;
+        Ok(me)
+    }
+
+    fn init(&mut self, module: &Module) -> Result<(), RunError> {
+        // Top-level functions: closures over nothing (all free names are global).
+        for decl in &module.decls {
+            if let TopDecl::Function(f) = decl {
+                let func = Func {
+                    params: self.param_ids(&f.body),
+                    body: Rc::new(f.body.clone()),
+                    captured: Vec::new(),
+                };
+                self.funcs
+                    .insert(f.name.node.clone(), Value::Function(Rc::new(func)));
+            }
+        }
+
+        // Top-level constants: evaluated in an empty environment (const RHS references no
+        // names, per the resolver's E0303 rule).
+        self.env = vec![new_frame()];
+        for decl in &module.decls {
+            if let TopDecl::Const(c) = decl {
+                let v = self.eval_expr(&c.value)?;
+                self.consts.insert(c.name.node.clone(), v);
+            }
+        }
+
+        // Exports.
+        if let Some(export) = &module.export {
+            for field in &export.node {
+                if let Field::Named { name, value } = field {
+                    let v = self.eval_expr(value)?;
+                    self.exports.insert(name.node.clone(), v);
+                }
+            }
+        } else {
+            for (k, v) in self.funcs.iter().chain(self.consts.iter()) {
+                self.exports.insert(k.clone(), v.clone());
+            }
+        }
+
+        self.env.clear();
+        Ok(())
+    }
+
+    /// Register a host function callable from scripts under `name`.
+    pub fn set_host_function<F>(&mut self, name: impl Into<String>, f: F)
+    where
+        F: Fn(&[Value]) -> Result<Value, RunError> + 'static,
+    {
+        self.host.insert(name.into(), Value::Native(Rc::new(f)));
+    }
+
+    /// Bind a host memory handle. `value` is typically a [`Value::table`]; the interpreter
+    /// shares it by `Rc`, so mutations made by scripts are visible through [`Self::memory`].
+    pub fn set_memory(&mut self, name: impl Into<String>, value: Value) {
+        self.memory.insert(name.into(), value);
+    }
+
+    /// Read back a memory handle (a clone of the shared `Rc`), e.g. to observe mutations.
+    pub fn memory(&self, name: &str) -> Option<Value> {
+        self.memory.get(name).cloned()
+    }
+
+    /// Call an exported function by name with `args`.
+    pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RunError> {
+        let func = self
+            .exports
+            .get(name)
+            .cloned()
+            .ok_or_else(|| RunError::UnknownExport(name.to_string()))?;
+        self.call_value(&func, args)
+    }
+
+    fn param_ids(&self, body: &FuncBody) -> Vec<SymbolId> {
+        body.params
+            .iter()
+            .filter_map(|p| self.res.def(p.span))
+            .collect()
+    }
+
+    // ---- calling -------------------------------------------------------------
+
+    fn call_value(&mut self, callee: &Value, args: Vec<Value>) -> Result<Value, RunError> {
+        match callee {
+            Value::Native(f) => f(&args),
+            Value::Function(func) => {
+                let func = Rc::clone(func);
+                let mut frame_map: HashMap<SymbolId, Value> = HashMap::new();
+                for (i, &pid) in func.params.iter().enumerate() {
+                    frame_map.insert(pid, args.get(i).cloned().unwrap_or(Value::Nil));
+                }
+                let mut new_env = func.captured.clone();
+                new_env.push(Rc::new(RefCell::new(frame_map)));
+
+                let saved = std::mem::replace(&mut self.env, new_env);
+                let result = self.exec_block(&func.body.block);
+                self.env = saved;
+
+                match result? {
+                    Flow::Return(v) => Ok(v),
+                    Flow::Normal => Ok(Value::Nil),
+                    Flow::Break => {
+                        Err(RunError::Internal("`break` escaped a function body".into()))
+                    }
+                }
+            }
+            other => Err(RunError::Internal(format!(
+                "attempted to call a {} value",
+                other.type_name()
+            ))),
+        }
+    }
+
+    // ---- statements ----------------------------------------------------------
+
+    fn exec_block(&mut self, block: &Block) -> Result<Flow, RunError> {
+        for stat in &block.stats {
+            match self.exec_stat(stat)? {
+                Flow::Normal => {}
+                other => return Ok(other),
+            }
+        }
+        if let Some(ret) = &block.ret {
+            let v = match ret.exprs.first() {
+                Some(e) => self.eval_expr(e)?,
+                None => Value::Nil,
+            };
+            return Ok(Flow::Return(v));
+        }
+        Ok(Flow::Normal)
+    }
+
+    fn exec_stat(&mut self, stat: &Stat) -> Result<Flow, RunError> {
+        match &stat.kind {
+            StatKind::Empty => Ok(Flow::Normal),
+            StatKind::Break => Ok(Flow::Break),
+            StatKind::Local { names, exprs } => {
+                let values = self.eval_list(exprs)?;
+                for (i, name) in names.iter().enumerate() {
+                    let v = values.get(i).cloned().unwrap_or(Value::Nil);
+                    self.declare(name, v)?;
+                }
+                Ok(Flow::Normal)
+            }
+            StatKind::LocalFunction { name, body } => {
+                // Declare first (so the body may recurse), then build the closure.
+                self.declare(name, Value::Nil)?;
+                let func = Func {
+                    params: self.param_ids(body),
+                    body: Rc::new(body.clone()),
+                    captured: self.env.clone(),
+                };
+                let v = Value::Function(Rc::new(func));
+                self.assign_symbol(name.span, v)?;
+                Ok(Flow::Normal)
+            }
+            StatKind::Assign { targets, exprs } => {
+                let values = self.eval_list(exprs)?;
+                for (i, target) in targets.iter().enumerate() {
+                    let v = values.get(i).cloned().unwrap_or(Value::Nil);
+                    self.assign_to(target, v)?;
+                }
+                Ok(Flow::Normal)
+            }
+            StatKind::Call(e) => {
+                self.eval_expr(e)?;
+                Ok(Flow::Normal)
+            }
+            StatKind::Do(block) => self.exec_block(block),
+            StatKind::While { cond, body } => {
+                while self.eval_expr(cond)?.is_truthy() {
+                    match self.exec_block(body)? {
+                        Flow::Normal => {}
+                        Flow::Break => break,
+                        ret @ Flow::Return(_) => return Ok(ret),
+                    }
+                }
+                Ok(Flow::Normal)
+            }
+            StatKind::If { arms, else_block } => {
+                for (cond, block) in arms {
+                    if self.eval_expr(cond)?.is_truthy() {
+                        return self.exec_block(block);
+                    }
+                }
+                if let Some(block) = else_block {
+                    return self.exec_block(block);
+                }
+                Ok(Flow::Normal)
+            }
+            StatKind::NumericFor {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => self.exec_numeric_for(var, start, end, step.as_ref(), body),
+            StatKind::GenericFor { names, iter, body } => self.exec_generic_for(names, iter, body),
+        }
+    }
+
+    fn exec_numeric_for(
+        &mut self,
+        var: &Ident,
+        start: &Expr,
+        end: &Expr,
+        step: Option<&Expr>,
+        body: &Block,
+    ) -> Result<Flow, RunError> {
+        let start = self.eval_number(start)?;
+        let end = self.eval_number(end)?;
+        let step = match step {
+            Some(e) => self.eval_number(e)?,
+            None => 1.0,
+        };
+        let mut i = start;
+        loop {
+            let cont = if step >= 0.0 { i <= end } else { i >= end };
+            if !cont {
+                break;
+            }
+            self.declare(var, Value::Number(i))?;
+            match self.exec_block(body)? {
+                Flow::Normal => {}
+                Flow::Break => break,
+                ret @ Flow::Return(_) => return Ok(ret),
+            }
+            i += step;
+        }
+        Ok(Flow::Normal)
+    }
+
+    fn exec_generic_for(
+        &mut self,
+        names: &[Ident],
+        iter: &IterExpr,
+        body: &Block,
+    ) -> Result<Flow, RunError> {
+        match iter {
+            IterExpr::IPairs { arg, .. } => {
+                let arr = match self.eval_expr(arg)? {
+                    Value::Array(a) => a,
+                    other => {
+                        return Err(RunError::Internal(format!(
+                            "ipairs expected an array, found {}",
+                            other.type_name()
+                        )));
+                    }
+                };
+                let len = arr.borrow().len();
+                for idx in 0..len {
+                    let item = arr.borrow()[idx].clone();
+                    if let Some(k) = names.first() {
+                        self.declare(k, Value::Number((idx + 1) as f64))?;
+                    }
+                    if let Some(v) = names.get(1) {
+                        self.declare(v, item)?;
+                    }
+                    match self.exec_block(body)? {
+                        Flow::Normal => {}
+                        Flow::Break => break,
+                        ret @ Flow::Return(_) => return Ok(ret),
+                    }
+                }
+                Ok(Flow::Normal)
+            }
+            IterExpr::Pairs { arg, .. } => {
+                let table = match self.eval_expr(arg)? {
+                    Value::Table(t) => t,
+                    other => {
+                        return Err(RunError::Internal(format!(
+                            "pairs expected a table, found {}",
+                            other.type_name()
+                        )));
+                    }
+                };
+                let entries: Vec<(String, Value)> = table
+                    .borrow()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                for (k, v) in entries {
+                    if let Some(kn) = names.first() {
+                        self.declare(kn, Value::string(k))?;
+                    }
+                    if let Some(vn) = names.get(1) {
+                        self.declare(vn, v)?;
+                    }
+                    match self.exec_block(body)? {
+                        Flow::Normal => {}
+                        Flow::Break => break,
+                        ret @ Flow::Return(_) => return Ok(ret),
+                    }
+                }
+                Ok(Flow::Normal)
+            }
+        }
+    }
+
+    // ---- environment ---------------------------------------------------------
+
+    /// Introduce or rebind a symbol in the current (innermost) frame.
+    fn declare(&mut self, name: &Ident, value: Value) -> Result<(), RunError> {
+        let id = self
+            .res
+            .def(name.span)
+            .ok_or_else(|| RunError::Internal(format!("no symbol id for `{}`", name.node)))?;
+        self.env
+            .last()
+            .ok_or_else(|| RunError::Internal("declare with no active frame".into()))?
+            .borrow_mut()
+            .insert(id, value);
+        Ok(())
+    }
+
+    /// Assign to an existing symbol, found by searching the frame chain outward.
+    fn assign_symbol(
+        &mut self,
+        span: crate::diagnostics::Span,
+        value: Value,
+    ) -> Result<(), RunError> {
+        let id = self
+            .res
+            .binding(span)
+            .and_then(|b| match b {
+                Binding::Local(id) | Binding::Upvalue(id) => Some(*id),
+                _ => None,
+            })
+            .or_else(|| self.res.def(span))
+            .ok_or_else(|| RunError::Internal("assignment to unresolved symbol".into()))?;
+
+        for frame in self.env.iter().rev() {
+            if frame.borrow().contains_key(&id) {
+                frame.borrow_mut().insert(id, value);
+                return Ok(());
+            }
+        }
+        // Not yet present (e.g. first assignment to a same-frame local): bind innermost.
+        self.env
+            .last()
+            .ok_or_else(|| RunError::Internal("assign with no active frame".into()))?
+            .borrow_mut()
+            .insert(id, value);
+        Ok(())
+    }
+
+    fn lookup_symbol(&self, id: SymbolId) -> Option<Value> {
+        for frame in self.env.iter().rev() {
+            if let Some(v) = frame.borrow().get(&id) {
+                return Some(v.clone());
+            }
+        }
+        None
+    }
+
+    // ---- assignment targets --------------------------------------------------
+
+    fn assign_to(&mut self, target: &Expr, value: Value) -> Result<(), RunError> {
+        match &target.kind {
+            ExprKind::Name(_) => self.assign_symbol(target.span, value),
+            ExprKind::Field { base, name } => {
+                let base_v = self.eval_expr(base)?;
+                match base_v {
+                    Value::Table(t) => {
+                        t.borrow_mut().insert(name.node.clone(), value);
+                        Ok(())
+                    }
+                    other => Err(RunError::Internal(format!(
+                        "cannot set field `{}` on a {} value",
+                        name.node,
+                        other.type_name()
+                    ))),
+                }
+            }
+            ExprKind::Index { base, index } => {
+                let base_v = self.eval_expr(base)?;
+                match base_v {
+                    Value::Array(a) => {
+                        let idx = self.eval_number(index)?;
+                        self.array_set(&a, idx, value)
+                    }
+                    Value::Table(t) => {
+                        let key = self.eval_string_key(index)?;
+                        t.borrow_mut().insert(key, value);
+                        Ok(())
+                    }
+                    other => Err(RunError::Internal(format!(
+                        "cannot index-assign a {} value",
+                        other.type_name()
+                    ))),
+                }
+            }
+            _ => Err(RunError::Internal("invalid assignment target".into())),
+        }
+    }
+
+    fn array_set(
+        &self,
+        arr: &Rc<RefCell<Vec<Value>>>,
+        idx: f64,
+        value: Value,
+    ) -> Result<(), RunError> {
+        let len = arr.borrow().len();
+        if idx < 1.0 || idx.fract() != 0.0 {
+            return Err(RunError::Runtime(format!(
+                "array index {} is not a positive integer",
+                num_to_string(idx)
+            )));
+        }
+        let i = idx as usize;
+        if i <= len {
+            arr.borrow_mut()[i - 1] = value;
+            Ok(())
+        } else if i == len + 1 {
+            // Append at exactly len+1 (the canonical array-growth idiom).
+            arr.borrow_mut().push(value);
+            Ok(())
+        } else {
+            Err(RunError::Runtime(format!(
+                "array index {} is out of range (length {len}); arrays may only grow by one",
+                i
+            )))
+        }
+    }
+
+    // ---- expressions ---------------------------------------------------------
+
+    fn eval_list(&mut self, exprs: &[Expr]) -> Result<Vec<Value>, RunError> {
+        exprs.iter().map(|e| self.eval_expr(e)).collect()
+    }
+
+    fn eval_number(&mut self, expr: &Expr) -> Result<f64, RunError> {
+        match self.eval_expr(expr)? {
+            Value::Number(n) => Ok(n),
+            other => Err(RunError::Internal(format!(
+                "expected a number, found {}",
+                other.type_name()
+            ))),
+        }
+    }
+
+    fn eval_string_key(&mut self, expr: &Expr) -> Result<String, RunError> {
+        match self.eval_expr(expr)? {
+            Value::Str(s) => Ok(s.to_string()),
+            other => Err(RunError::Internal(format!(
+                "expected a string key, found {}",
+                other.type_name()
+            ))),
+        }
+    }
+
+    fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RunError> {
+        match &expr.kind {
+            ExprKind::Nil => Ok(Value::Nil),
+            ExprKind::Bool(b) => Ok(Value::Bool(*b)),
+            ExprKind::Number(n) => Ok(Value::Number(*n)),
+            ExprKind::Str(s) => Ok(Value::string(s.clone())),
+            ExprKind::Paren(inner) => self.eval_expr(inner),
+            ExprKind::Name(name) => self.eval_name(expr, name),
+            ExprKind::Function(body) => {
+                let func = Func {
+                    params: self.param_ids(body),
+                    body: Rc::new(body.clone()),
+                    captured: self.env.clone(),
+                };
+                Ok(Value::Function(Rc::new(func)))
+            }
+            ExprKind::Field { base, name } => self.eval_field(base, name),
+            ExprKind::Index { base, index } => self.eval_index(base, index),
+            ExprKind::Call { callee, args } => self.eval_call(callee, args),
+            ExprKind::MethodCall { method, .. } => Err(RunError::Internal(format!(
+                "method call `:{}` is not supported by the interpreter",
+                method.node
+            ))),
+            ExprKind::Table(fields) => self.eval_table(fields),
+            ExprKind::Unary { op, operand } => self.eval_unary(*op, operand),
+            ExprKind::Binary { op, lhs, rhs } => self.eval_binary(*op, lhs, rhs),
+        }
+    }
+
+    fn eval_name(&mut self, expr: &Expr, name: &str) -> Result<Value, RunError> {
+        let binding = self
+            .res
+            .binding(expr.span)
+            .ok_or_else(|| RunError::Internal(format!("unresolved name `{name}`")))?;
+        match binding {
+            Binding::Local(id) | Binding::Upvalue(id) => self
+                .lookup_symbol(*id)
+                .ok_or_else(|| RunError::Internal(format!("`{name}` used before assignment"))),
+            Binding::TopFunction(n) => self
+                .funcs
+                .get(n)
+                .cloned()
+                .ok_or_else(|| RunError::Internal(format!("missing function `{n}`"))),
+            Binding::TopConst(n) => self
+                .consts
+                .get(n)
+                .cloned()
+                .ok_or_else(|| RunError::Internal(format!("missing const `{n}`"))),
+            Binding::HostFunction(n) => self.host.get(n).cloned().ok_or_else(|| {
+                RunError::Runtime(format!("host function `{n}` was not registered"))
+            }),
+            Binding::Memory(n) => self
+                .memory
+                .get(n)
+                .cloned()
+                .ok_or_else(|| RunError::Runtime(format!("memory `{n}` was not provided"))),
+            Binding::Builtin(ns) => Err(RunError::Internal(format!(
+                "builtin namespace `{ns}` used as a value"
+            ))),
+        }
+    }
+
+    fn eval_field(&mut self, base: &Expr, name: &Ident) -> Result<Value, RunError> {
+        if let Some(ns) = self.builtin_namespace(base) {
+            return builtin_namespace_field(ns, &name.node);
+        }
+        let base_v = self.eval_expr(base)?;
+        match base_v {
+            Value::Table(t) => Ok(t.borrow().get(&name.node).cloned().unwrap_or(Value::Nil)),
+            other => Err(RunError::Internal(format!(
+                "cannot read field `{}` of a {} value",
+                name.node,
+                other.type_name()
+            ))),
+        }
+    }
+
+    fn eval_index(&mut self, base: &Expr, index: &Expr) -> Result<Value, RunError> {
+        let base_v = self.eval_expr(base)?;
+        match base_v {
+            Value::Array(a) => {
+                let idx = self.eval_number(index)?;
+                if idx < 1.0 || idx.fract() != 0.0 {
+                    return Ok(Value::Nil);
+                }
+                let i = idx as usize;
+                Ok(a.borrow().get(i - 1).cloned().unwrap_or(Value::Nil))
+            }
+            Value::Table(t) => {
+                let key = self.eval_string_key(index)?;
+                Ok(t.borrow().get(&key).cloned().unwrap_or(Value::Nil))
+            }
+            other => Err(RunError::Internal(format!(
+                "cannot index a {} value",
+                other.type_name()
+            ))),
+        }
+    }
+
+    fn eval_call(&mut self, callee: &Expr, args: &[Expr]) -> Result<Value, RunError> {
+        // Plain builtin value call: `tostring(...)`, `tonumber(...)`.
+        if let ExprKind::Name(_) = &callee.kind
+            && let Some(Binding::Builtin(ns)) = self.res.binding(callee.span)
+        {
+            let argv = self.eval_list(args)?;
+            return builtin_value_call(ns, &argv);
+        }
+        // Builtin namespace member call: `math.floor(...)`, `string.sub(...)`.
+        if let ExprKind::Field { base, name } = &callee.kind
+            && let Some(ns) = self.builtin_namespace(base)
+        {
+            let argv = self.eval_list(args)?;
+            return builtin_member_call(ns, &name.node, &argv);
+        }
+        let func = self.eval_expr(callee)?;
+        let argv = self.eval_list(args)?;
+        self.call_value(&func, argv)
+    }
+
+    fn eval_table(&mut self, fields: &[Field]) -> Result<Value, RunError> {
+        // Mirror the checker's shape inference: all-positional → array; otherwise table.
+        let all_positional =
+            !fields.is_empty() && fields.iter().all(|f| matches!(f, Field::Positional(_)));
+        if all_positional || fields.is_empty() {
+            let mut items = Vec::with_capacity(fields.len());
+            for f in fields {
+                if let Field::Positional(e) = f {
+                    items.push(self.eval_expr(e)?);
+                }
+            }
+            return Ok(Value::array(items));
+        }
+        let mut map = BTreeMap::new();
+        for f in fields {
+            match f {
+                Field::Named { name, value } => {
+                    let v = self.eval_expr(value)?;
+                    map.insert(name.node.clone(), v);
+                }
+                Field::Keyed { key, value } => {
+                    let k = self.eval_string_key(key)?;
+                    let v = self.eval_expr(value)?;
+                    map.insert(k, v);
+                }
+                Field::Positional(e) => {
+                    // The checker rejects mixed shapes; treat as internal if reached.
+                    let _ = self.eval_expr(e)?;
+                    return Err(RunError::Internal(
+                        "mixed positional/keyed table reached the interpreter".into(),
+                    ));
+                }
+            }
+        }
+        Ok(Value::table(map))
+    }
+
+    fn eval_unary(&mut self, op: UnOp, operand: &Expr) -> Result<Value, RunError> {
+        let v = self.eval_expr(operand)?;
+        match op {
+            UnOp::Neg => match v {
+                Value::Number(n) => Ok(Value::Number(-n)),
+                other => Err(RunError::Internal(format!(
+                    "unary `-` on a {} value",
+                    other.type_name()
+                ))),
+            },
+            UnOp::Not => Ok(Value::Bool(!v.is_truthy())),
+            UnOp::Len => match v {
+                Value::Str(s) => Ok(Value::Number(s.len() as f64)),
+                Value::Array(a) => Ok(Value::Number(a.borrow().len() as f64)),
+                other => Err(RunError::Internal(format!(
+                    "`#` on a {} value",
+                    other.type_name()
+                ))),
+            },
+        }
+    }
+
+    fn eval_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<Value, RunError> {
+        use BinOp::*;
+        // Short-circuiting logical operators (Lua semantics, used post-typecheck).
+        match op {
+            And => {
+                let l = self.eval_expr(lhs)?;
+                return if l.is_truthy() {
+                    self.eval_expr(rhs)
+                } else {
+                    Ok(l)
+                };
+            }
+            Or => {
+                let l = self.eval_expr(lhs)?;
+                return if l.is_truthy() {
+                    Ok(l)
+                } else {
+                    self.eval_expr(rhs)
+                };
+            }
+            _ => {}
+        }
+
+        let l = self.eval_expr(lhs)?;
+        let r = self.eval_expr(rhs)?;
+        match op {
+            Add | Sub | Mul | Div | FloorDiv | Mod | Pow => {
+                let (a, b) = (number(&l)?, number(&r)?);
+                Ok(Value::Number(match op {
+                    Add => a + b,
+                    Sub => a - b,
+                    Mul => a * b,
+                    Div => a / b,
+                    FloorDiv => (a / b).floor(),
+                    Mod => a - (a / b).floor() * b,
+                    Pow => a.powf(b),
+                    _ => unreachable!(),
+                }))
+            }
+            Concat => Ok(Value::string(format!(
+                "{}{}",
+                string_of(&l)?,
+                string_of(&r)?
+            ))),
+            Lt | Le | Gt | Ge => {
+                let ord = compare(&l, &r)?;
+                Ok(Value::Bool(match op {
+                    Lt => ord == std::cmp::Ordering::Less,
+                    Le => ord != std::cmp::Ordering::Greater,
+                    Gt => ord == std::cmp::Ordering::Greater,
+                    Ge => ord != std::cmp::Ordering::Less,
+                    _ => unreachable!(),
+                }))
+            }
+            Eq => Ok(Value::Bool(values_equal(&l, &r))),
+            Ne => Ok(Value::Bool(!values_equal(&l, &r))),
+            And | Or => unreachable!("handled above"),
+        }
+    }
+
+    /// If `expr` is a bare name bound to a builtin namespace, return it.
+    fn builtin_namespace(&self, expr: &Expr) -> Option<&'static str> {
+        if let ExprKind::Name(_) = &expr.kind
+            && let Some(Binding::Builtin(ns)) = self.res.binding(expr.span)
+        {
+            return Some(ns);
+        }
+        None
+    }
+}
+
+// ---- builtin helpers --------------------------------------------------------
+
+fn number(v: &Value) -> Result<f64, RunError> {
+    v.as_f64()
+        .ok_or_else(|| RunError::Internal(format!("expected a number, found {}", v.type_name())))
+}
+
+fn string_of(v: &Value) -> Result<String, RunError> {
+    match v {
+        Value::Str(s) => Ok(s.to_string()),
+        other => Err(RunError::Internal(format!(
+            "expected a string, found {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn compare(l: &Value, r: &Value) -> Result<std::cmp::Ordering, RunError> {
+    match (l, r) {
+        (Value::Number(a), Value::Number(b)) => a
+            .partial_cmp(b)
+            .ok_or_else(|| RunError::Runtime("comparison with NaN".into())),
+        (Value::Str(a), Value::Str(b)) => Ok(a.cmp(b)),
+        _ => Err(RunError::Internal(format!(
+            "cannot compare {} with {}",
+            l.type_name(),
+            r.type_name()
+        ))),
+    }
+}
+
+fn builtin_namespace_field(ns: &str, field: &str) -> Result<Value, RunError> {
+    match (ns, field) {
+        ("math", "pi") => Ok(Value::Number(std::f64::consts::PI)),
+        ("math", "huge") => Ok(Value::Number(f64::INFINITY)),
+        _ => Err(RunError::Internal(format!(
+            "`{ns}.{field}` is not a builtin constant"
+        ))),
+    }
+}
+
+fn builtin_value_call(ns: &str, args: &[Value]) -> Result<Value, RunError> {
+    match ns {
+        "tostring" => {
+            let v = args.first().unwrap_or(&Value::Nil);
+            Ok(Value::string(match v {
+                Value::Str(s) => s.to_string(),
+                Value::Number(n) => num_to_string(*n),
+                Value::Bool(b) => b.to_string(),
+                other => other.to_string(),
+            }))
+        }
+        "tonumber" => {
+            let v = args.first().unwrap_or(&Value::Nil);
+            match v {
+                Value::Str(s) => Ok(s
+                    .trim()
+                    .parse::<f64>()
+                    .map(Value::Number)
+                    .unwrap_or(Value::Nil)),
+                Value::Number(n) => Ok(Value::Number(*n)),
+                _ => Ok(Value::Nil),
+            }
+        }
+        _ => Err(RunError::Internal(format!("unknown builtin `{ns}`"))),
+    }
+}
+
+fn builtin_member_call(ns: &str, name: &str, args: &[Value]) -> Result<Value, RunError> {
+    let num = |i: usize| -> Result<f64, RunError> { number(args.get(i).unwrap_or(&Value::Nil)) };
+    let string =
+        |i: usize| -> Result<String, RunError> { string_of(args.get(i).unwrap_or(&Value::Nil)) };
+    match (ns, name) {
+        ("math", "floor") => Ok(Value::Number(num(0)?.floor())),
+        ("math", "ceil") => Ok(Value::Number(num(0)?.ceil())),
+        ("math", "abs") => Ok(Value::Number(num(0)?.abs())),
+        ("math", "sqrt") => Ok(Value::Number(num(0)?.sqrt())),
+        ("math", "min") => Ok(Value::Number(num(0)?.min(num(1)?))),
+        ("math", "max") => Ok(Value::Number(num(0)?.max(num(1)?))),
+        ("math", "pow") => Ok(Value::Number(num(0)?.powf(num(1)?))),
+        ("string", "len") => Ok(Value::Number(string(0)?.len() as f64)),
+        ("string", "upper") => Ok(Value::string(string(0)?.to_uppercase())),
+        ("string", "lower") => Ok(Value::string(string(0)?.to_lowercase())),
+        ("string", "sub") => {
+            let s = string(0)?;
+            let i = num(1)? as isize;
+            let j = num(2)? as isize;
+            Ok(Value::string(lua_sub(&s, i, j)))
+        }
+        ("string", "find") => {
+            let s = string(0)?;
+            let pat = string(1)?;
+            match s.find(pat.as_str()) {
+                // 1-based start index of a plain (non-pattern) match.
+                Some(byte_idx) => Ok(Value::Number((byte_idx + 1) as f64)),
+                None => Ok(Value::Nil),
+            }
+        }
+        ("string", "format") => Ok(Value::string(lua_format(&string(0)?, &args[1..])?)),
+        _ => Err(RunError::Internal(format!(
+            "unknown builtin member `{ns}.{name}`"
+        ))),
+    }
+}
+
+/// Lua-style `string.sub`: 1-based, inclusive, with negative indices counting from the end.
+fn lua_sub(s: &str, i: isize, j: isize) -> String {
+    let bytes = s.as_bytes();
+    let len = bytes.len() as isize;
+    let norm = |x: isize| -> isize {
+        if x < 0 {
+            (len + x + 1).max(1)
+        } else {
+            x.max(1)
+        }
+    };
+    let start = norm(i);
+    let end = if j < 0 { len + j + 1 } else { j.min(len) };
+    if start > end || start > len {
+        return String::new();
+    }
+    let a = (start - 1) as usize;
+    let b = end as usize;
+    String::from_utf8_lossy(&bytes[a..b]).into_owned()
+}
+
+/// Minimal `string.format`: supports `%d`/`%i`, `%f`, `%s`, `%g`, and `%%`. Each verb
+/// consumes the next argument in order. Width/precision modifiers are not supported (v1).
+fn lua_format(fmt: &str, args: &[Value]) -> Result<String, RunError> {
+    let mut out = String::new();
+    let mut arg_i = 0;
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => out.push('%'),
+            Some('d') | Some('i') => {
+                let n = number(args.get(arg_i).unwrap_or(&Value::Nil))?;
+                arg_i += 1;
+                out.push_str(&format!("{}", n as i64));
+            }
+            Some('f') => {
+                let n = number(args.get(arg_i).unwrap_or(&Value::Nil))?;
+                arg_i += 1;
+                out.push_str(&format!("{n:.6}"));
+            }
+            Some('g') => {
+                let n = number(args.get(arg_i).unwrap_or(&Value::Nil))?;
+                arg_i += 1;
+                out.push_str(&num_to_string(n));
+            }
+            Some('s') => {
+                let v = args.get(arg_i).unwrap_or(&Value::Nil);
+                arg_i += 1;
+                out.push_str(&v.to_string());
+            }
+            Some(other) => {
+                return Err(RunError::Runtime(format!(
+                    "unsupported string.format verb `%{other}`"
+                )));
+            }
+            None => return Err(RunError::Runtime("trailing `%` in format string".into())),
+        }
+    }
+    Ok(out)
+}
+
+/// Convenience: parse, resolve, and interpret a call against a fresh interpreter with no
+/// host functions or memory. Mainly for tests and quick experiments.
+pub fn run_call(
+    src: &str,
+    cfg: &ResolveConfig,
+    func: &str,
+    args: Vec<Value>,
+) -> Result<Value, RunError> {
+    let module = crate::parse(src).map_err(diag_to_run)?;
+    let res = crate::resolve::resolve(&module, cfg).map_err(diag_to_run)?;
+    let mut interp = Interpreter::new(&module, &res)?;
+    interp.call(func, args)
+}
+
+fn diag_to_run(d: Diagnostics) -> RunError {
+    RunError::Runtime(format!("{d}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interp_module<'a>(module: &'a Module, res: &'a Resolution) -> Interpreter<'a> {
+        Interpreter::new(module, res).expect("interpreter init")
+    }
+
+    fn build<'a>(
+        src: &str,
+        cfg: &ResolveConfig,
+        store: &'a mut Option<(Module, Resolution)>,
+    ) -> Interpreter<'a> {
+        let module = crate::parse(src).expect("parse");
+        let res = crate::resolve::resolve(&module, cfg).expect("resolve");
+        *store = Some((module, res));
+        let (m, r) = store.as_ref().unwrap();
+        interp_module(m, r)
+    }
+
+    fn empty() -> ResolveConfig {
+        ResolveConfig::default()
+    }
+
+    #[test]
+    fn calls_a_simple_function() {
+        let v = run_call(
+            "function add(a, b) return a + b end",
+            &empty(),
+            "add",
+            vec![Value::Number(2.0), Value::Number(3.0)],
+        )
+        .unwrap();
+        assert_eq!(v.as_f64(), Some(5.0));
+    }
+
+    #[test]
+    fn recursion_with_loop_and_branch() {
+        let src = "function fact(n)\n\
+                     local acc = 1\n\
+                     local i = 2\n\
+                     while i <= n do\n\
+                       acc = acc * i\n\
+                       i = i + 1\n\
+                     end\n\
+                     return acc\n\
+                   end";
+        let v = run_call(src, &empty(), "fact", vec![Value::Number(5.0)]).unwrap();
+        assert_eq!(v.as_f64(), Some(120.0));
+    }
+
+    #[test]
+    fn mutual_recursion() {
+        let src = "function even(n)\n\
+                     if n == 0 then return true end\n\
+                     return odd(n - 1)\n\
+                   end\n\
+                   function odd(n)\n\
+                     if n == 0 then return false end\n\
+                     return even(n - 1)\n\
+                   end";
+        let mut store = None;
+        let mut it = build(src, &empty(), &mut store);
+        assert_eq!(
+            it.call("even", vec![Value::Number(10.0)])
+                .unwrap()
+                .as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            it.call("even", vec![Value::Number(7.0)]).unwrap().as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn closure_captures_upvalue() {
+        let src = "function make(base)\n\
+                     local add = function(x) return x + base end\n\
+                     return add(10)\n\
+                   end";
+        let v = run_call(src, &empty(), "make", vec![Value::Number(5.0)]).unwrap();
+        assert_eq!(v.as_f64(), Some(15.0));
+    }
+
+    #[test]
+    fn generic_for_sums_array() {
+        let src = "function total(xs)\n\
+                     local s = 0\n\
+                     for _, v in ipairs(xs) do\n\
+                       s = s + v\n\
+                     end\n\
+                     return s\n\
+                   end";
+        let arr = Value::array(vec![
+            Value::Number(1.0),
+            Value::Number(2.0),
+            Value::Number(3.0),
+        ]);
+        let v = run_call(src, &empty(), "total", vec![arr]).unwrap();
+        assert_eq!(v.as_f64(), Some(6.0));
+    }
+
+    #[test]
+    fn array_append_idiom() {
+        let src = "function grow()\n\
+                     local out = { 1, 2 }\n\
+                     out[#out + 1] = 3\n\
+                     return out\n\
+                   end";
+        let v = run_call(src, &empty(), "grow", vec![]).unwrap();
+        let items = v.as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[2].as_f64(), Some(3.0));
+    }
+
+    #[test]
+    fn numeric_for_with_step() {
+        let src = "function countdown(n)\n\
+                     local s = 0\n\
+                     for i = n, 1, -1 do\n\
+                       s = s + i\n\
+                     end\n\
+                     return s\n\
+                   end";
+        let v = run_call(src, &empty(), "countdown", vec![Value::Number(4.0)]).unwrap();
+        assert_eq!(v.as_f64(), Some(10.0));
+    }
+
+    #[test]
+    fn break_exits_loop() {
+        let src = "function firsthit(xs)\n\
+                     local found = 0\n\
+                     for _, v in ipairs(xs) do\n\
+                       if v > 2 then\n\
+                         found = v\n\
+                         break\n\
+                       end\n\
+                     end\n\
+                     return found\n\
+                   end";
+        let arr = Value::array(vec![
+            Value::Number(1.0),
+            Value::Number(3.0),
+            Value::Number(5.0),
+        ]);
+        let v = run_call(src, &empty(), "firsthit", vec![arr]).unwrap();
+        assert_eq!(v.as_f64(), Some(3.0));
+    }
+
+    #[test]
+    fn string_concat_and_builtins() {
+        let src = "function greet(name)\n\
+                     return \"hi \" .. string.upper(name)\n\
+                   end";
+        let v = run_call(src, &empty(), "greet", vec![Value::string("bob")]).unwrap();
+        assert_eq!(v.as_string().as_deref(), Some("hi BOB"));
+    }
+
+    #[test]
+    fn math_floor_and_const() {
+        let src = "K = 10\n\
+                   function f(x) return math.floor(x) + K end";
+        let v = run_call(src, &empty(), "f", vec![Value::Number(3.7)]).unwrap();
+        assert_eq!(v.as_f64(), Some(13.0));
+    }
+
+    #[test]
+    fn tostring_formats_integers() {
+        let src = "function f(n) return tostring(n) end";
+        let v = run_call(src, &empty(), "f", vec![Value::Number(42.0)]).unwrap();
+        assert_eq!(v.as_string().as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn logical_operators_short_circuit() {
+        // `or` returns the first truthy operand; with bools that's the disjunction.
+        let src = "function f(a, b) return a or b end";
+        let v = run_call(
+            src,
+            &empty(),
+            "f",
+            vec![Value::Bool(false), Value::Bool(true)],
+        )
+        .unwrap();
+        assert_eq!(v.as_bool(), Some(true));
+    }
+
+    #[test]
+    fn host_function_is_called() {
+        let src = "function f(n) return roll(n) + 1 end";
+        let module = crate::parse(src).unwrap();
+        let res = crate::resolve::resolve(
+            &module,
+            &ResolveConfig {
+                host_functions: vec!["roll".into()],
+                memory: vec![],
+            },
+        )
+        .unwrap();
+        let mut it = Interpreter::new(&module, &res).unwrap();
+        it.set_host_function("roll", |args| {
+            Ok(Value::Number(args[0].as_f64().unwrap_or(0.0) * 2.0))
+        });
+        let v = it.call("f", vec![Value::Number(3.0)]).unwrap();
+        assert_eq!(v.as_f64(), Some(7.0));
+    }
+
+    #[test]
+    fn host_function_error_propagates() {
+        let src = "function f() return boom() end";
+        let module = crate::parse(src).unwrap();
+        let res = crate::resolve::resolve(
+            &module,
+            &ResolveConfig {
+                host_functions: vec!["boom".into()],
+                memory: vec![],
+            },
+        )
+        .unwrap();
+        let mut it = Interpreter::new(&module, &res).unwrap();
+        it.set_host_function("boom", |_| Err(RunError::Host("kaboom".into())));
+        let err = it.call("f", vec![]).unwrap_err();
+        assert!(matches!(err, RunError::Host(msg) if msg == "kaboom"));
+    }
+
+    #[test]
+    fn memory_persists_across_calls() {
+        let src = "function spend(n)\n\
+                     if mem.gold >= n then\n\
+                       mem.gold = mem.gold - n\n\
+                       return true\n\
+                     end\n\
+                     return false\n\
+                   end";
+        let module = crate::parse(src).unwrap();
+        let res = crate::resolve::resolve(&module, &ResolveConfig::with_memory("mem")).unwrap();
+        let mut it = Interpreter::new(&module, &res).unwrap();
+
+        let mut initial = BTreeMap::new();
+        initial.insert("gold".to_string(), Value::Number(100.0));
+        it.set_memory("mem", Value::table(initial));
+
+        assert_eq!(
+            it.call("spend", vec![Value::Number(30.0)])
+                .unwrap()
+                .as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            it.call("spend", vec![Value::Number(50.0)])
+                .unwrap()
+                .as_bool(),
+            Some(true)
+        );
+        // 100 - 30 - 50 = 20; a 30 spend still succeeds, a later large one fails.
+        assert_eq!(
+            it.call("spend", vec![Value::Number(30.0)])
+                .unwrap()
+                .as_bool(),
+            Some(false)
+        );
+
+        let gold = it.memory("mem").unwrap().field("gold").unwrap();
+        assert_eq!(gold.as_f64(), Some(20.0));
+    }
+
+    #[test]
+    fn unknown_export_errors() {
+        let module = crate::parse("function a() return 1 end").unwrap();
+        let res = crate::resolve::resolve(&module, &empty()).unwrap();
+        let mut it = Interpreter::new(&module, &res).unwrap();
+        assert!(matches!(
+            it.call("nope", vec![]),
+            Err(RunError::UnknownExport(_))
+        ));
+    }
+
+    #[test]
+    fn curated_export_renames() {
+        let src = "function impl() return 7 end\n\
+                   return { run = impl }";
+        let v = run_call(src, &empty(), "run", vec![]).unwrap();
+        assert_eq!(v.as_f64(), Some(7.0));
+    }
+}
