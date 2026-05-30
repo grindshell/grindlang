@@ -101,6 +101,10 @@ pub enum Binding {
 pub struct Resolution {
     /// Each name-use span mapped to its binding.
     pub bindings: HashMap<Span, Binding>,
+    /// Each symbol *definition* site (param/local/loop-var name span) mapped to its
+    /// [`SymbolId`]. Lets later phases recover the symbol introduced at a declaration
+    /// without re-deriving scope.
+    pub defs: HashMap<Span, SymbolId>,
     /// All in-function symbol definitions, indexed by [`SymbolId`].
     pub symbols: Vec<SymbolInfo>,
 }
@@ -109,6 +113,11 @@ impl Resolution {
     /// Look up the binding recorded for a name use at `span`.
     pub fn binding(&self, span: Span) -> Option<&Binding> {
         self.bindings.get(&span)
+    }
+
+    /// Look up the [`SymbolId`] introduced at the definition site `span`.
+    pub fn def(&self, span: Span) -> Option<SymbolId> {
+        self.defs.get(&span).copied()
     }
 }
 
@@ -123,6 +132,7 @@ pub fn resolve(module: &Module, cfg: &ResolveConfig) -> Result<Resolution, Diagn
     } else {
         Ok(Resolution {
             bindings: r.bindings,
+            defs: r.defs,
             symbols: r.symbols,
         })
     }
@@ -151,6 +161,7 @@ struct Resolver<'a> {
     func_stack: Vec<FuncScope>,
     symbols: Vec<SymbolInfo>,
     bindings: HashMap<Span, Binding>,
+    defs: HashMap<Span, SymbolId>,
     loop_depth: usize,
     diags: Diagnostics,
 }
@@ -164,6 +175,7 @@ impl<'a> Resolver<'a> {
             func_stack: Vec::new(),
             symbols: Vec::new(),
             bindings: HashMap::new(),
+            defs: HashMap::new(),
             loop_depth: 0,
             diags: Diagnostics::new(),
         }
@@ -325,6 +337,7 @@ impl<'a> Resolver<'a> {
             kind,
             func_depth,
         });
+        self.defs.insert(span, id);
         // Redeclaration in the same block shadows the earlier binding (Lua-compatible).
         self.func_stack
             .last_mut()
