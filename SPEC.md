@@ -118,7 +118,10 @@ exportstat ::= 'return' tablecons [';']
   **immutable bindings**. All top-level names are mutually in scope, so functions may
   call one another and recurse (including mutual recursion).
 - `constexpr` is a **compile-time-evaluable** expression: literals, `tablecons` of
-  constants, and `unop`/`binop` over constants. No function calls _(v1)_.
+  constants, and `unop`/`binop` over constants. In v1 a `constexpr` may **not** reference
+  names (not even other top-level constants), call functions, or index/field-access —
+  only literal values and operators over them. (This avoids const-ordering and cycle
+  analysis; revisit if a consumer needs constant folding across declarations.)
 - If present, the trailing `exportstat` **curates the public surface**: only the names it
   lists are exported, under the keys given. Without it, *all* top-level declarations are
   exported under their own names. (There is no `local M = {}` / `return M` idiom — the
