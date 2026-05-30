@@ -1,0 +1,27 @@
+[package]
+name = "grindlang"
+version = "0.1.0"
+edition = "2024"
+description = "A statically-typed, cranelift-JIT-compiled, Lua-syntax embedded calculation/decision language for Grindshell."
+license = "MIT OR Apache-2.0"
+
+[features]
+# Default: the front end plus the reference interpreter. The cranelift JIT backend
+# (Phase 7) is gated behind `jit` and its heavy deps are added when that phase lands.
+default = ["interp"]
+
+# Reference tree-walking interpreter (semantics oracle + debug execution).
+interp = []
+
+# Cranelift JIT backend. No-op for now; cranelift-* deps are added in Phase 7 and
+# wired here so the rest of the crate stays insulated from backend churn.
+jit = []
+
+# serde marshaling of values / export signatures across process boundaries.
+serde = ["dep:serde"]
+
+[dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
