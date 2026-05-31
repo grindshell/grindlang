@@ -14,8 +14,11 @@
 //! * Phase 0–1: diagnostics, lexer, AST, parser.
 //! * Phase 2: resolver + constraint enforcement.
 //! * Phase 3: static type inference & checking.
-//! * **Phase 4 (current):** reference interpreter (semantics oracle).
-//! * Phase 5–7: typed IR → cranelift JIT.
+//! * Phase 4: reference interpreter (semantics oracle).
+//! * Phase 5: mid-level typed IR + lowering.
+//! * **Phase 6 (current):** runtime & host ABI ([`runtime`]) — value representation, arena,
+//!   heap layouts, host calling convention, and the builtin catalog.
+//! * Phase 7: cranelift JIT.
 //! * Phase 8–9: host embedding API, hardening, docs.
 //!
 //! ## Front-end entry points
@@ -29,9 +32,11 @@
 
 pub mod ast;
 pub mod diagnostics;
+pub mod ir;
 pub mod lexer;
 pub mod parser;
 pub mod resolve;
+pub mod runtime;
 pub mod types;
 
 #[cfg(feature = "interp")]
@@ -39,7 +44,9 @@ pub mod interp;
 
 pub use ast::Module;
 pub use diagnostics::{Diagnostic, Diagnostics, Severity, Span};
+pub use ir::{LowerError, Program};
 pub use resolve::{Binding, Resolution, ResolveConfig};
+pub use runtime::{Arena, FnAbi, MemorySchema, Repr, Slot};
 pub use types::{FnType, Type, TypeConfig, TypeInfo};
 
 #[cfg(feature = "interp")]
@@ -99,4 +106,32 @@ pub fn analyze(src: &str, cfg: &TypeConfig) -> Result<(Module, Resolution, TypeI
     let resolution = resolve::resolve(&module, &cfg.to_resolve_config())?;
     let info = types::typecheck(&module, &resolution, cfg)?;
     Ok((module, resolution, info))
+}
+
+/// An error from the full compile pipeline: either front-end [`Diagnostics`] or an IR
+/// [`LowerError`].
+#[derive(Debug, thiserror::Error)]
+pub enum CompileError {
+    #[error("{0}")]
+    Check(#[from] Diagnostics),
+    #[error("{0}")]
+    Lower(#[from] LowerError),
+}
+
+/// Parse, resolve, type-check, and lower Grindlang source to verified IR.
+///
+/// This is the full Phase 0–5 pipeline. Returns the lowered [`ir::Program`] (already
+/// passed through [`ir::verify`]) on success.
+///
+/// ```
+/// use grindlang::TypeConfig;
+/// let program = grindlang::compile("function double(x) return x * 2 end", &TypeConfig::default())
+///     .unwrap();
+/// assert!(program.functions.contains_key("double"));
+/// ```
+pub fn compile(src: &str, cfg: &TypeConfig) -> Result<Program, CompileError> {
+    let (module, resolution, info) = analyze(src, cfg)?;
+    let program = ir::lower(&module, &resolution, &info, cfg)?;
+    ir::verify(&program)?;
+    Ok(program)
 }

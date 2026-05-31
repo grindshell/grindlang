@@ -36,6 +36,7 @@ use std::rc::Rc;
 use crate::ast::*;
 use crate::diagnostics::Diagnostics;
 use crate::resolve::{Binding, Resolution, ResolveConfig, SymbolId};
+use crate::runtime::builtins::{field_value, member_call, num_to_string, value_call};
 
 /// An error raised while executing a Grindlang program.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -183,15 +184,6 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Function(x), Value::Function(y)) => Rc::ptr_eq(x, y),
         (Value::Native(x), Value::Native(y)) => Rc::ptr_eq(x, y),
         _ => false,
-    }
-}
-
-/// Format a number the way `tostring` does: integral values without a trailing `.0`.
-fn num_to_string(n: f64) -> String {
-    if n.is_finite() && n == n.trunc() && n.abs() < 1e15 {
-        format!("{}", n as i64)
-    } else {
-        format!("{n}")
     }
 }
 
@@ -781,7 +773,7 @@ impl<'a> Interpreter<'a> {
 
     fn eval_field(&mut self, base: &Expr, name: &Ident) -> Result<Value, RunError> {
         if let Some(ns) = self.builtin_namespace(base) {
-            return builtin_namespace_field(ns, &name.node);
+            return field_value(ns, &name.node);
         }
         let base_v = self.eval_expr(base)?;
         match base_v {
@@ -822,14 +814,14 @@ impl<'a> Interpreter<'a> {
             && let Some(Binding::Builtin(ns)) = self.res.binding(callee.span)
         {
             let argv = self.eval_list(args)?;
-            return builtin_value_call(ns, &argv);
+            return value_call(ns, &argv);
         }
         // Builtin namespace member call: `math.floor(...)`, `string.sub(...)`.
         if let ExprKind::Field { base, name } = &callee.kind
             && let Some(ns) = self.builtin_namespace(base)
         {
             let argv = self.eval_list(args)?;
-            return builtin_member_call(ns, &name.node, &argv);
+            return member_call(ns, &name.node, &argv);
         }
         let func = self.eval_expr(callee)?;
         let argv = self.eval_list(args)?;
@@ -995,145 +987,6 @@ fn compare(l: &Value, r: &Value) -> Result<std::cmp::Ordering, RunError> {
             r.type_name()
         ))),
     }
-}
-
-fn builtin_namespace_field(ns: &str, field: &str) -> Result<Value, RunError> {
-    match (ns, field) {
-        ("math", "pi") => Ok(Value::Number(std::f64::consts::PI)),
-        ("math", "huge") => Ok(Value::Number(f64::INFINITY)),
-        _ => Err(RunError::Internal(format!(
-            "`{ns}.{field}` is not a builtin constant"
-        ))),
-    }
-}
-
-fn builtin_value_call(ns: &str, args: &[Value]) -> Result<Value, RunError> {
-    match ns {
-        "tostring" => {
-            let v = args.first().unwrap_or(&Value::Nil);
-            Ok(Value::string(match v {
-                Value::Str(s) => s.to_string(),
-                Value::Number(n) => num_to_string(*n),
-                Value::Bool(b) => b.to_string(),
-                other => other.to_string(),
-            }))
-        }
-        "tonumber" => {
-            let v = args.first().unwrap_or(&Value::Nil);
-            match v {
-                Value::Str(s) => Ok(s
-                    .trim()
-                    .parse::<f64>()
-                    .map(Value::Number)
-                    .unwrap_or(Value::Nil)),
-                Value::Number(n) => Ok(Value::Number(*n)),
-                _ => Ok(Value::Nil),
-            }
-        }
-        _ => Err(RunError::Internal(format!("unknown builtin `{ns}`"))),
-    }
-}
-
-fn builtin_member_call(ns: &str, name: &str, args: &[Value]) -> Result<Value, RunError> {
-    let num = |i: usize| -> Result<f64, RunError> { number(args.get(i).unwrap_or(&Value::Nil)) };
-    let string =
-        |i: usize| -> Result<String, RunError> { string_of(args.get(i).unwrap_or(&Value::Nil)) };
-    match (ns, name) {
-        ("math", "floor") => Ok(Value::Number(num(0)?.floor())),
-        ("math", "ceil") => Ok(Value::Number(num(0)?.ceil())),
-        ("math", "abs") => Ok(Value::Number(num(0)?.abs())),
-        ("math", "sqrt") => Ok(Value::Number(num(0)?.sqrt())),
-        ("math", "min") => Ok(Value::Number(num(0)?.min(num(1)?))),
-        ("math", "max") => Ok(Value::Number(num(0)?.max(num(1)?))),
-        ("math", "pow") => Ok(Value::Number(num(0)?.powf(num(1)?))),
-        ("string", "len") => Ok(Value::Number(string(0)?.len() as f64)),
-        ("string", "upper") => Ok(Value::string(string(0)?.to_uppercase())),
-        ("string", "lower") => Ok(Value::string(string(0)?.to_lowercase())),
-        ("string", "sub") => {
-            let s = string(0)?;
-            let i = num(1)? as isize;
-            let j = num(2)? as isize;
-            Ok(Value::string(lua_sub(&s, i, j)))
-        }
-        ("string", "find") => {
-            let s = string(0)?;
-            let pat = string(1)?;
-            match s.find(pat.as_str()) {
-                // 1-based start index of a plain (non-pattern) match.
-                Some(byte_idx) => Ok(Value::Number((byte_idx + 1) as f64)),
-                None => Ok(Value::Nil),
-            }
-        }
-        ("string", "format") => Ok(Value::string(lua_format(&string(0)?, &args[1..])?)),
-        _ => Err(RunError::Internal(format!(
-            "unknown builtin member `{ns}.{name}`"
-        ))),
-    }
-}
-
-/// Lua-style `string.sub`: 1-based, inclusive, with negative indices counting from the end.
-fn lua_sub(s: &str, i: isize, j: isize) -> String {
-    let bytes = s.as_bytes();
-    let len = bytes.len() as isize;
-    let norm = |x: isize| -> isize {
-        if x < 0 {
-            (len + x + 1).max(1)
-        } else {
-            x.max(1)
-        }
-    };
-    let start = norm(i);
-    let end = if j < 0 { len + j + 1 } else { j.min(len) };
-    if start > end || start > len {
-        return String::new();
-    }
-    let a = (start - 1) as usize;
-    let b = end as usize;
-    String::from_utf8_lossy(&bytes[a..b]).into_owned()
-}
-
-/// Minimal `string.format`: supports `%d`/`%i`, `%f`, `%s`, `%g`, and `%%`. Each verb
-/// consumes the next argument in order. Width/precision modifiers are not supported (v1).
-fn lua_format(fmt: &str, args: &[Value]) -> Result<String, RunError> {
-    let mut out = String::new();
-    let mut arg_i = 0;
-    let mut chars = fmt.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '%' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('%') => out.push('%'),
-            Some('d') | Some('i') => {
-                let n = number(args.get(arg_i).unwrap_or(&Value::Nil))?;
-                arg_i += 1;
-                out.push_str(&format!("{}", n as i64));
-            }
-            Some('f') => {
-                let n = number(args.get(arg_i).unwrap_or(&Value::Nil))?;
-                arg_i += 1;
-                out.push_str(&format!("{n:.6}"));
-            }
-            Some('g') => {
-                let n = number(args.get(arg_i).unwrap_or(&Value::Nil))?;
-                arg_i += 1;
-                out.push_str(&num_to_string(n));
-            }
-            Some('s') => {
-                let v = args.get(arg_i).unwrap_or(&Value::Nil);
-                arg_i += 1;
-                out.push_str(&v.to_string());
-            }
-            Some(other) => {
-                return Err(RunError::Runtime(format!(
-                    "unsupported string.format verb `%{other}`"
-                )));
-            }
-            None => return Err(RunError::Runtime("trailing `%` in format string".into())),
-        }
-    }
-    Ok(out)
 }
 
 /// Convenience: parse, resolve, and interpret a call against a fresh interpreter with no

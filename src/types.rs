@@ -145,11 +145,20 @@ impl TypeConfig {
     }
 }
 
-/// The result of type checking: the module's export signature.
+/// The result of type checking: the module's export signature plus the resolved types of
+/// every in-function symbol and every top-level declaration. Later phases (the IR lowering
+/// in Phase 5, codegen in Phase 7) consume the per-symbol/declaration types so they don't
+/// re-run inference.
 #[derive(Clone, Debug)]
 pub struct TypeInfo {
     /// Each exported name mapped to its (fully resolved) type.
     pub exports: BTreeMap<String, Type>,
+    /// Resolved type of each in-function symbol, indexed by [`crate::resolve::SymbolId`].
+    pub symbol_types: Vec<Type>,
+    /// Resolved signature of each top-level function, by declared name.
+    pub functions: BTreeMap<String, FnType>,
+    /// Resolved type of each top-level constant, by declared name.
+    pub constants: BTreeMap<String, Type>,
 }
 
 /// Type-check `module` (already resolved into `resolution`) against `cfg`.
@@ -161,10 +170,33 @@ pub fn typecheck(
     let mut c = Checker::new(module, resolution, cfg);
     let exports = c.run(module);
     if c.diags.has_errors() {
-        Err(c.diags)
-    } else {
-        Ok(TypeInfo { exports })
+        return Err(c.diags);
     }
+
+    let symbol_types = c.sym_types.iter().map(|t| c.u.deep(t)).collect();
+    let functions = c
+        .func_sigs
+        .iter()
+        .map(|(name, sig)| {
+            let deep = match c.u.deep(&Type::Function(sig.clone())) {
+                Type::Function(ft) => ft,
+                _ => unreachable!("deep of a function type is a function type"),
+            };
+            (name.clone(), deep)
+        })
+        .collect();
+    let constants = c
+        .const_types
+        .iter()
+        .map(|(name, t)| (name.clone(), c.u.deep(t)))
+        .collect();
+
+    Ok(TypeInfo {
+        exports,
+        symbol_types,
+        functions,
+        constants,
+    })
 }
 
 // ---- unification ------------------------------------------------------------
@@ -571,7 +603,14 @@ impl<'a> Checker<'a> {
                 let at = self.check_expr(arg);
                 let elem = match self.u.shallow(&at) {
                     Type::Array(e) => *e,
-                    Type::Error | Type::Var(_) => Type::Error,
+                    Type::Error => Type::Error,
+                    // The arg type is still unknown — `ipairs` forces it to be an array,
+                    // so unify it with `array<fresh>` and adopt the fresh element type.
+                    Type::Var(_) => {
+                        let e = self.u.fresh();
+                        let _ = self.u.unify(&at, &Type::array(e.clone()));
+                        e
+                    }
                     other => {
                         self.error(
                             "E0415",
@@ -587,7 +626,13 @@ impl<'a> Checker<'a> {
                 let at = self.check_expr(arg);
                 let val = match self.u.shallow(&at) {
                     Type::Map(v) => *v,
-                    Type::Error | Type::Var(_) => Type::Error,
+                    Type::Error => Type::Error,
+                    // Unknown arg type — `pairs` forces a map; unify with `map<fresh>`.
+                    Type::Var(_) => {
+                        let v = self.u.fresh();
+                        let _ = self.u.unify(&at, &Type::map(v.clone()));
+                        v
+                    }
                     other => {
                         self.error(
                             "E0415",
@@ -678,11 +723,12 @@ impl<'a> Checker<'a> {
     }
 
     fn check_field(&mut self, base: &Expr, name: &Ident) -> Type {
-        // Builtin namespace value-fields (`math.pi`, `math.huge`).
+        // Builtin namespace value-fields (`math.pi`, `math.huge`) — catalogued in the
+        // runtime builtin catalog (single source of truth).
         if let Some(ns) = self.builtin_namespace(base) {
-            return match (ns, name.node.as_str()) {
-                ("math", "pi") | ("math", "huge") => Type::Number,
-                _ => {
+            return match crate::runtime::builtins::namespace_field_type(ns, &name.node) {
+                Some(ty) => ty,
+                None => {
                     self.error(
                         "E0419",
                         format!("`{ns}.{}` must be called", name.node),
@@ -1087,80 +1133,71 @@ impl<'a> Checker<'a> {
         args: &[Expr],
         span: Span,
     ) -> Type {
-        // (param types, return type). `string.format` is handled specially below.
-        let sig: Option<(&[Type], Type)> = match (ns, name.node.as_str()) {
-            ("math", "floor") | ("math", "ceil") | ("math", "abs") | ("math", "sqrt") => {
-                Some((&[Type::Number], Type::Number))
+        // The signature table is owned by the runtime builtin catalog (single source of
+        // truth, shared with IR lowering and Phase 7 codegen). `string.format` is variadic
+        // and handled specially.
+        use crate::runtime::builtins::ArgRule;
+        let Some(sig) = crate::runtime::builtins::member_sig(ns, &name.node) else {
+            self.error(
+                "E0462",
+                format!("`{ns}` has no builtin member `{}`", name.node),
+                name.span,
+            );
+            for a in args {
+                self.check_expr(a);
             }
-            ("math", "min") | ("math", "max") | ("math", "pow") => {
-                Some((&[Type::Number, Type::Number], Type::Number))
-            }
-            ("string", "len") => Some((&[Type::String], Type::Number)),
-            ("string", "upper") | ("string", "lower") => Some((&[Type::String], Type::String)),
-            ("string", "sub") => Some((&[Type::String, Type::Number, Type::Number], Type::String)),
-            ("string", "find") => Some((
-                &[Type::String, Type::String],
-                Type::Optional(Box::new(Type::Number)),
-            )),
-            ("string", "format") => None,
-            _ => {
-                self.error(
-                    "E0462",
-                    format!("`{ns}` has no builtin member `{}`", name.node),
-                    name.span,
-                );
-                for a in args {
-                    self.check_expr(a);
-                }
-                return Type::Error;
-            }
+            return Type::Error;
         };
 
-        if ns == "string" && name.node == "format" {
-            // format(fmt: string, ...any) -> string.
-            if args.is_empty() {
-                self.error(
-                    "E0463",
-                    "`string.format` requires at least a format string",
-                    span,
-                );
-            } else {
-                let ft = self.check_expr(&args[0]);
-                self.require(
-                    args[0].span,
-                    &ft,
-                    &Type::String,
-                    "E0463",
-                    "format string must be a string",
-                );
-                for a in args.iter().skip(1) {
-                    self.check_expr(a);
+        match sig.rule {
+            ArgRule::FormatVariadic => {
+                // format(fmt: string, ...any) -> string.
+                if args.is_empty() {
+                    self.error(
+                        "E0463",
+                        "`string.format` requires at least a format string",
+                        span,
+                    );
+                } else {
+                    let ft = self.check_expr(&args[0]);
+                    self.require(
+                        args[0].span,
+                        &ft,
+                        &Type::String,
+                        "E0463",
+                        "format string must be a string",
+                    );
+                    for a in args.iter().skip(1) {
+                        self.check_expr(a);
+                    }
                 }
+                sig.ret
             }
-            return Type::String;
+            // No namespace member uses the `Scalar` rule (that's `tostring`, a value
+            // builtin); treat anything non-variadic as a fixed positional signature.
+            ArgRule::Fixed | ArgRule::Scalar => {
+                if args.len() != sig.params.len() {
+                    self.error(
+                        "E0430",
+                        format!(
+                            "`{ns}.{}` takes {} argument(s) but {} were supplied",
+                            name.node,
+                            sig.params.len(),
+                            args.len()
+                        ),
+                        span,
+                    );
+                }
+                for (arg, pt) in args.iter().zip(&sig.params) {
+                    let at = self.check_expr(arg);
+                    self.require_assignable(arg.span, &at, pt, "argument type mismatch");
+                }
+                for arg in args.iter().skip(sig.params.len()) {
+                    self.check_expr(arg);
+                }
+                sig.ret
+            }
         }
-
-        let (params, ret) = sig.expect("non-format builtin has a signature");
-        if args.len() != params.len() {
-            self.error(
-                "E0430",
-                format!(
-                    "`{ns}.{}` takes {} argument(s) but {} were supplied",
-                    name.node,
-                    params.len(),
-                    args.len()
-                ),
-                span,
-            );
-        }
-        for (arg, pt) in args.iter().zip(params) {
-            let at = self.check_expr(arg);
-            self.require_assignable(arg.span, &at, pt, "argument type mismatch");
-        }
-        for arg in args.iter().skip(params.len()) {
-            self.check_expr(arg);
-        }
-        ret
     }
 
     fn expect_arity(&mut self, name: &str, args: &[Expr], n: usize, span: Span) {
