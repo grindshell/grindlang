@@ -11,6 +11,10 @@
 //! oracle just needs to be *correct*). Closures own a cloned [`crate::ast::FuncBody`] via
 //! `Rc`, so [`Value`] carries no lifetime and host code can hold values freely.
 //!
+//! The runtime [`Value`] and [`RunError`] themselves live in [`crate::value`] (shared with
+//! the JIT and the embedding API); this module owns only the tree-walking [`Interpreter`]
+//! plus the interpreter-only callable variants ([`Value::Function`] / [`Value::Native`]).
+//!
 //! ## Execution model
 //!
 //! * A [`Value`] is `nil`, a bool, an `f64` number, an immutable string, a mutable array,
@@ -30,52 +34,13 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::fmt;
 use std::rc::Rc;
 
 use crate::ast::*;
 use crate::diagnostics::Diagnostics;
 use crate::resolve::{Binding, Resolution, ResolveConfig, SymbolId};
 use crate::runtime::builtins::{field_value, member_call, num_to_string, value_call};
-
-/// An error raised while executing a Grindlang program.
-#[derive(Clone, Debug, thiserror::Error)]
-pub enum RunError {
-    /// A host-registered function returned an error.
-    #[error("host error: {0}")]
-    Host(String),
-    /// A runtime fault that should have been impossible after type checking (e.g. an
-    /// out-of-range array write). Indicates either a script edge case or a checker gap.
-    #[error("runtime error: {0}")]
-    Runtime(String),
-    /// An invariant the resolver/checker should have guaranteed was violated.
-    #[error("internal interpreter error: {0}")]
-    Internal(String),
-    /// A function was requested by a name the module does not export.
-    #[error("no exported function named `{0}`")]
-    UnknownExport(String),
-}
-
-/// A runtime value.
-#[derive(Clone)]
-pub enum Value {
-    Nil,
-    Bool(bool),
-    Number(f64),
-    Str(Rc<str>),
-    /// A 1-based, mutable, homogeneous array.
-    Array(Rc<RefCell<Vec<Value>>>),
-    /// A mutable string-keyed table — the runtime representation of records, maps, and
-    /// host memory alike.
-    Table(Rc<RefCell<BTreeMap<String, Value>>>),
-    /// A script function or closure.
-    Function(Rc<Func>),
-    /// A host-registered native function.
-    Native(NativeFn),
-}
-
-/// A host-registered native function: takes the evaluated arguments and returns a value.
-pub type NativeFn = Rc<dyn Fn(&[Value]) -> Result<Value, RunError>>;
+use crate::value::{RunError, Value};
 
 /// A script function: its parameter symbols, body, and (for closures) the captured frame
 /// chain. Top-level functions capture nothing.
@@ -98,80 +63,6 @@ enum Flow {
     Return(Value),
 }
 
-impl Value {
-    pub fn string(s: impl Into<String>) -> Value {
-        Value::Str(Rc::from(s.into().as_str()))
-    }
-
-    pub fn array(items: Vec<Value>) -> Value {
-        Value::Array(Rc::new(RefCell::new(items)))
-    }
-
-    pub fn table(entries: BTreeMap<String, Value>) -> Value {
-        Value::Table(Rc::new(RefCell::new(entries)))
-    }
-
-    /// An empty mutable table — convenient for building host memory.
-    pub fn empty_table() -> Value {
-        Value::table(BTreeMap::new())
-    }
-
-    pub fn as_f64(&self) -> Option<f64> {
-        match self {
-            Value::Number(n) => Some(*n),
-            _ => None,
-        }
-    }
-
-    pub fn as_bool(&self) -> Option<bool> {
-        match self {
-            Value::Bool(b) => Some(*b),
-            _ => None,
-        }
-    }
-
-    /// The string contents, if this is a string value.
-    pub fn as_string(&self) -> Option<String> {
-        match self {
-            Value::Str(s) => Some(s.to_string()),
-            _ => None,
-        }
-    }
-
-    /// A clone of the elements, if this is an array.
-    pub fn as_array(&self) -> Option<Vec<Value>> {
-        match self {
-            Value::Array(a) => Some(a.borrow().clone()),
-            _ => None,
-        }
-    }
-
-    /// Read a field/key, if this is a table. Returns `None` for a missing key.
-    pub fn field(&self, key: &str) -> Option<Value> {
-        match self {
-            Value::Table(t) => t.borrow().get(key).cloned(),
-            _ => None,
-        }
-    }
-
-    /// Lua-style truthiness: only `nil` and `false` are falsy.
-    fn is_truthy(&self) -> bool {
-        !matches!(self, Value::Nil | Value::Bool(false))
-    }
-
-    fn type_name(&self) -> &'static str {
-        match self {
-            Value::Nil => "nil",
-            Value::Bool(_) => "bool",
-            Value::Number(_) => "number",
-            Value::Str(_) => "string",
-            Value::Array(_) => "array",
-            Value::Table(_) => "table",
-            Value::Function(_) | Value::Native(_) => "function",
-        }
-    }
-}
-
 /// Structural-by-value for scalars, identity-by-`Rc` for reference types (Lua semantics).
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
@@ -184,44 +75,6 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Function(x), Value::Function(y)) => Rc::ptr_eq(x, y),
         (Value::Native(x), Value::Native(y)) => Rc::ptr_eq(x, y),
         _ => false,
-    }
-}
-
-impl fmt::Display for Value {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Value::Nil => f.write_str("nil"),
-            Value::Bool(b) => write!(f, "{b}"),
-            Value::Number(n) => f.write_str(&num_to_string(*n)),
-            Value::Str(s) => f.write_str(s),
-            Value::Array(a) => {
-                f.write_str("[")?;
-                for (i, v) in a.borrow().iter().enumerate() {
-                    if i > 0 {
-                        f.write_str(", ")?;
-                    }
-                    write!(f, "{v}")?;
-                }
-                f.write_str("]")
-            }
-            Value::Table(t) => {
-                f.write_str("{")?;
-                for (i, (k, v)) in t.borrow().iter().enumerate() {
-                    if i > 0 {
-                        f.write_str(", ")?;
-                    }
-                    write!(f, "{k} = {v}")?;
-                }
-                f.write_str("}")
-            }
-            Value::Function(_) | Value::Native(_) => f.write_str("function"),
-        }
-    }
-}
-
-impl fmt::Debug for Value {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}({})", self.type_name(), self)
     }
 }
 

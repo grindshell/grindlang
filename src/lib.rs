@@ -39,6 +39,7 @@ pub mod parser;
 pub mod resolve;
 pub mod runtime;
 pub mod types;
+pub mod value;
 
 #[cfg(feature = "interp")]
 pub mod interp;
@@ -46,18 +47,25 @@ pub mod interp;
 #[cfg(feature = "jit")]
 pub mod codegen;
 
+#[cfg(feature = "jit")]
+pub mod api;
+
 pub use ast::Module;
 pub use diagnostics::{Diagnostic, Diagnostics, Severity, Span};
 pub use ir::{LowerError, Program};
 pub use resolve::{Binding, Resolution, ResolveConfig};
 pub use runtime::{Arena, FnAbi, MemorySchema, Repr, Slot};
 pub use types::{FnType, Type, TypeConfig, TypeInfo};
+pub use value::{RunError, Value};
 
 #[cfg(feature = "interp")]
-pub use interp::{Interpreter, RunError, Value};
+pub use interp::Interpreter;
 
 #[cfg(feature = "jit")]
 pub use codegen::{JitError, JitModule};
+
+#[cfg(feature = "jit")]
+pub use api::{Engine, Module as HostModule};
 
 /// Lex and parse Grindlang source into an untyped [`ast::Module`].
 ///

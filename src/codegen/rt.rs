@@ -7,7 +7,7 @@
 //! *reference* value (`string`, `array`, `map`, `record`, optionals, `nil`) flows as an
 //! `i64` **handle** — an index into the per-call [`RtCtx`] value table, which stores the
 //! actual [`Value`]s. This delegates heap correctness to the already-proven runtime
-//! ([`crate::interp::Value`] + [`crate::runtime::builtins`]) while the calc/decision core
+//! ([`crate::value::Value`] + [`crate::runtime::builtins`]) while the calc/decision core
 //! (arithmetic, comparisons, control flow) is genuinely native.
 //!
 //! Every shim takes the context pointer as its first argument. A reference op (build an
@@ -26,8 +26,8 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::interp::{NativeFn, RunError, Value};
 use crate::runtime::builtins;
+use crate::value::{NativeFn, RunError, Value};
 
 /// A reference-value handle: an index into [`RtCtx::values`]. Handle `0` is always `nil`.
 pub type Handle = u64;

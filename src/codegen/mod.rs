@@ -4,7 +4,7 @@
 //! **hybrid value model** (see [`rt`]): numbers and bools flow through compiled code as
 //! unboxed `f64`/`i8`; reference values flow as `i64` handles into a per-call [`rt::RtCtx`],
 //! and reference ops call back into the shared runtime ([`crate::runtime`] +
-//! [`crate::interp::Value`]). So the calc/decision core is genuinely native while heap
+//! [`crate::value::Value`]). So the calc/decision core is genuinely native while heap
 //! correctness is delegated to the already-proven runtime.
 //!
 //! [`JitModule`] mirrors the [`crate::ir::Vm`] / [`crate::interp::Interpreter`] surface
@@ -30,9 +30,9 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 
-use crate::interp::{NativeFn, RunError, Value};
 use crate::ir::{ExportTarget, Program};
 use crate::runtime::repr::Repr;
+use crate::value::{NativeFn, RunError, Value};
 
 use rt::Pools;
 use translate::{Context, Translator, build_trampoline, trampoline_signature, typed_signature};
@@ -208,6 +208,12 @@ impl JitModule {
         F: Fn(&[Value]) -> Result<Value, RunError> + 'static,
     {
         self.host.insert(name.into(), std::rc::Rc::new(f));
+    }
+
+    /// Install a pre-built native host function. Used by the embedding API ([`crate::api`]),
+    /// which type-erases typed host closures into a [`NativeFn`] before compilation.
+    pub fn set_host_fn(&mut self, name: impl Into<String>, f: NativeFn) {
+        self.host.insert(name.into(), f);
     }
 
     /// Bind a host memory handle (typically a [`Value::table`]).

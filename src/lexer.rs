@@ -718,6 +718,11 @@ mod tests {
         assert_eq!(kinds(".5"), vec![TokenKind::Number(0.5)]);
         assert_eq!(kinds("1e3"), vec![TokenKind::Number(1000.0)]);
         assert_eq!(kinds("0xFF"), vec![TokenKind::Number(255.0)]);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn lexes_numbers_with_slight_floating_point_error() {
         assert_eq!(kinds("0x1p4"), vec![TokenKind::Number(16.0)]);
     }
 

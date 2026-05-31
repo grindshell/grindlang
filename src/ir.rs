@@ -1193,8 +1193,8 @@ mod vm {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::interp::{RunError, Value};
     use crate::runtime::builtins::{field_value, member_call, value_call};
+    use crate::value::{RunError, Value};
 
     type Native = std::rc::Rc<dyn Fn(&[Value]) -> Result<Value, RunError>>;
 

@@ -3,7 +3,7 @@
 //! These describe exactly how a `string`, `array`, `map`, and `record` are laid out in the
 //! [arena](super::arena), so the (Phase 7) JIT can emit direct loads/stores against the
 //! header fields and payloads. They are *specifications* with `#[repr(C)]` headers and
-//! offset/size constants; the reference interpreters still use [`crate::interp::Value`], but
+//! offset/size constants; the reference interpreters still use [`crate::value::Value`], but
 //! the layouts here are what native code will materialize.
 //!
 //! All payload cells are [`Slot`](super::repr::Slot)-sized (8 bytes), so element and field

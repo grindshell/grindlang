@@ -40,3 +40,9 @@ cranelift-jit = { version = "0.132", optional = true }
 cranelift-native = { version = "0.132", optional = true }
 
 [dev-dependencies]
+# For the `serde` round-trip test (gated on the `serde` feature in the test itself).
+serde_json = "1"
+
+[[example]]
+name = "embed"
+required-features = ["jit"]

@@ -21,7 +21,7 @@ use super::repr::Repr;
 
 /// An error raised by a host-registered function across the ABI boundary. The JIT translates
 /// a returned error into the engine's `Err` channel (the interpreters surface it as
-/// [`crate::interp::RunError::Host`]).
+/// [`crate::value::RunError::Host`]).
 #[derive(Clone, Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct HostError(pub String);

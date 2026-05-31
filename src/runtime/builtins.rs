@@ -9,7 +9,7 @@
 //!     the IR lowering ([`crate::ir`]) both consult it, so a builtin's type lives in exactly
 //!     one place. It is always compiled (no `interp`/`jit` feature needed).
 //!   * The **implementations** (behind the `interp` feature) evaluate a builtin over runtime
-//!     [`Value`](crate::interp::Value)s. Both the AST interpreter and the IR `Vm` call into
+//!     [`Value`](crate::value::Value)s. Both the AST interpreter and the IR `Vm` call into
 //!     them, so the builtins also have a single executable definition. The (Phase 7) JIT
 //!     will lower calls to the same catalog entries (emitting native code or runtime calls).
 
@@ -109,7 +109,7 @@ pub fn namespace_field_type(ns: &str, field: &str) -> Option<Type> {
 }
 
 /// Format a number the way `tostring` does: integral values without a trailing `.0`. Shared
-/// with [`crate::interp::Value`]'s `Display`. Kept feature-free since it only touches `f64`.
+/// with [`crate::value::Value`]'s `Display`. Kept feature-free since it only touches `f64`.
 pub fn num_to_string(n: f64) -> String {
     if n.is_finite() && n == n.trunc() && n.abs() < 1e15 {
         format!("{}", n as i64)
@@ -126,7 +126,7 @@ pub use imp::{field_value, member_call, value_call};
 #[cfg(feature = "interp")]
 mod imp {
     use super::num_to_string;
-    use crate::interp::{RunError, Value};
+    use crate::value::{RunError, Value};
 
     fn number(v: &Value) -> Result<f64, RunError> {
         v.as_f64()
