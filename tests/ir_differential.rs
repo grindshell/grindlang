@@ -302,3 +302,74 @@ fn host_function_matches() {
 
     assert_eq!(format!("{ar}"), format!("{br}"));
 }
+
+// ---- closures (upvalues) ----
+
+#[test]
+fn closure_captures_upvalue() {
+    assert_same(
+        "function make(base)\n\
+           local add = function(x) return x + base end\n\
+           return add(10)\n\
+         end",
+        "make",
+        vec![Value::Number(5.0)],
+    );
+}
+
+#[test]
+fn closure_writes_propagate_through_shared_upvalue() {
+    assert_same(
+        "function counter()\n\
+           local n = 0\n\
+           local inc = function() n = n + 1 return n end\n\
+           local a = inc()\n\
+           local b = inc()\n\
+           return a + b\n\
+         end",
+        "counter",
+        vec![],
+    );
+}
+
+#[test]
+fn returned_closure_escapes_and_runs() {
+    assert_same(
+        "function make_adder(n)\n\
+           return function(x) return x + n end\n\
+         end\n\
+         function use()\n\
+           local add5 = make_adder(5)\n\
+           return add5(10)\n\
+         end",
+        "use",
+        vec![],
+    );
+}
+
+#[test]
+fn recursive_local_function_closure() {
+    assert_same(
+        "function run(n)\n\
+           local function fact(k) if k <= 1 then return 1 end return k * fact(k - 1) end\n\
+           return fact(n)\n\
+         end",
+        "run",
+        vec![Value::Number(5.0)],
+    );
+}
+
+#[test]
+fn nested_closures_capture_through_layers() {
+    assert_same(
+        "function outer(a)\n\
+           local mid = function(b)\n\
+             return function(c) return a + b + c end\n\
+           end\n\
+           local f = mid(20)\n\
+           return f(300)\n\
+         end",
+        "outer",
+        vec![Value::Number(1.0)],
+    );
+}

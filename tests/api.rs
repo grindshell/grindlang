@@ -218,3 +218,31 @@ fn optional_result() {
     let none: Option<f64> = m.call_typed("parse", ("nope".to_string(),)).unwrap();
     assert_eq!(none, None);
 }
+
+#[test]
+fn returns_and_invokes_closure() {
+    let mut m = Engine::new()
+        .compile("function make_adder(n) return function(x) return x + n end end")
+        .unwrap();
+    // Obtain the closure as an opaque value, then host-invoke it with typed marshaling.
+    let adder = m.call("make_adder", vec![Value::Number(10.0)]).unwrap();
+    let sum: f64 = m.call_value_typed(adder, (5.0,)).unwrap();
+    assert_eq!(sum, 15.0);
+}
+
+#[test]
+fn host_held_counter_persists_upvalue() {
+    let mut m = Engine::new()
+        .compile(
+            "function make_counter()\n\
+               local n = 0\n\
+               return function() n = n + 1 return n end\n\
+             end",
+        )
+        .unwrap();
+    let counter = m.call("make_counter", vec![]).unwrap();
+    let a: f64 = m.call_value_typed(counter.clone(), ()).unwrap();
+    let b: f64 = m.call_value_typed(counter.clone(), ()).unwrap();
+    let c: f64 = m.call_value_typed(counter, ()).unwrap();
+    assert_eq!((a, b, c), (1.0, 2.0, 3.0));
+}

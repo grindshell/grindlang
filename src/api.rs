@@ -524,6 +524,39 @@ impl Module {
         self.jit.call(name, args)
     }
 
+    /// Invoke a closure value previously returned by [`call`](Self::call_typed) (or by another
+    /// `call_value`), at the raw [`Value`] level. The closure carries its captured upvalues,
+    /// so mutations persist across host calls, and it keeps its backing code alive — so it
+    /// remains callable even after the originating [`Module`] is dropped.
+    ///
+    /// `callee` must be a function value (`Type::Function(..)`); anything else is a runtime
+    /// error. Closures cannot be persisted into host memory or serialized.
+    pub fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RunError> {
+        self.jit.call_value(callee, args)
+    }
+
+    /// Invoke a returned closure with typed Rust arguments and marshal its typed result —
+    /// the [`call_typed`](Self::call_typed) analog for a first-class function value.
+    ///
+    /// ```
+    /// use grindlang::api::Engine;
+    /// let mut m = Engine::new()
+    ///     .compile("function make_adder(n) return function(x) return x + n end end")
+    ///     .unwrap();
+    /// // The closure is an opaque function value; obtain it via the raw `call`.
+    /// let adder = m.call("make_adder", vec![grindlang::Value::Number(10.0)]).unwrap();
+    /// let sum: f64 = m.call_value_typed(adder, (5.0,)).unwrap();
+    /// assert_eq!(sum, 15.0);
+    /// ```
+    pub fn call_value_typed<Args, R>(&mut self, callee: Value, args: Args) -> Result<R, CallError>
+    where
+        Args: IntoArgs,
+        R: FromValue,
+    {
+        let v = self.jit.call_value(callee, args.into_args())?;
+        R::from_value(v).map_err(CallError::Result)
+    }
+
     /// The module's export signature: each exported name → its Grindlang [`Type`].
     pub fn exports(&self) -> &BTreeMap<String, Type> {
         &self.exports

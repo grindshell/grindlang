@@ -21,6 +21,7 @@ mod translate;
 pub use rt::{Handle, RtCtx};
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use cranelift_codegen::ir::{AbiParam, Signature, types};
@@ -35,7 +36,10 @@ use crate::runtime::repr::Repr;
 use crate::value::{NativeFn, RunError, Value};
 
 use rt::Pools;
-use translate::{Context, Translator, build_trampoline, trampoline_signature, typed_signature};
+use translate::{
+    Context, Translator, build_env_trampoline, build_trampoline, env_trampoline_signature,
+    trampoline_signature, typed_signature,
+};
 
 /// An error from JIT compilation.
 #[derive(Debug, thiserror::Error)]
@@ -51,10 +55,15 @@ pub enum JitError {
 /// The uniform trampoline ABI the driver invokes: `(ctx, argv, argc) -> handle`.
 type TrampFn = unsafe extern "C" fn(*mut RtCtx, *const Handle, u32) -> Handle;
 
+/// The env-trampoline ABI for host-invoking a returned closure: `(ctx, env, argv, argc) ->
+/// handle`, where `env` is the closure value handle.
+type EnvTrampFn = unsafe extern "C" fn(*mut RtCtx, Handle, *const Handle, u32) -> Handle;
+
 /// A compiled module: native code plus the machinery to call it.
 pub struct JitModule {
-    /// Keeps the executable memory mapped; dropped last.
-    _module: JITModule,
+    /// Keeps the executable memory mapped. Shared (by [`Rc`]) into any closure that escapes to
+    /// the host, so a returned closure stays callable even if this `JitModule` is dropped.
+    module: Rc<JITModule>,
     pools: Arc<Pools>,
     /// export name → its target (function or constant).
     exports: std::collections::BTreeMap<String, ExportTarget>,
@@ -62,6 +71,10 @@ pub struct JitModule {
     fn_tramps: HashMap<String, TrampFn>,
     /// constant name → trampoline.
     const_tramps: HashMap<String, TrampFn>,
+    /// lifted-closure name → env-trampoline (for host [`JitModule::call_value`]).
+    closure_tramps: HashMap<String, EnvTrampFn>,
+    /// function name → finalized native address (resolves indirect closure calls).
+    code_addrs: Arc<HashMap<String, u64>>,
     /// Registered host functions and memory, by name.
     host: HashMap<String, NativeFn>,
     memory: HashMap<String, Value>,
@@ -96,6 +109,9 @@ impl JitModule {
         let mut const_ids: HashMap<String, FuncId> = HashMap::new();
         let mut fn_tramp_ids: HashMap<String, FuncId> = HashMap::new();
         let mut const_tramp_ids: HashMap<String, FuncId> = HashMap::new();
+        // Lifted closures get an env-trampoline (not a plain one): they are never exported and
+        // are reached only indirectly (in-script) or via the host `call_value` path.
+        let mut closure_tramp_ids: HashMap<String, FuncId> = HashMap::new();
 
         for (name, f) in &program.functions {
             let params: Vec<Repr> = f.params.iter().map(|p| Repr::of(&f.locals[p])).collect();
@@ -106,11 +122,19 @@ impl JitModule {
                 .map_err(|e| JitError::Cranelift(e.to_string()))?;
             typed_ids.insert(name.clone(), id);
 
-            let tsig = trampoline_signature(call_conv);
-            let tid = module
-                .declare_function(&format!("tr_{name}"), Linkage::Export, &tsig)
-                .map_err(|e| JitError::Cranelift(e.to_string()))?;
-            fn_tramp_ids.insert(name.clone(), tid);
+            if f.is_closure {
+                let tsig = env_trampoline_signature(call_conv);
+                let tid = module
+                    .declare_function(&format!("et_{name}"), Linkage::Export, &tsig)
+                    .map_err(|e| JitError::Cranelift(e.to_string()))?;
+                closure_tramp_ids.insert(name.clone(), tid);
+            } else {
+                let tsig = trampoline_signature(call_conv);
+                let tid = module
+                    .declare_function(&format!("tr_{name}"), Linkage::Export, &tsig)
+                    .map_err(|e| JitError::Cranelift(e.to_string()))?;
+                fn_tramp_ids.insert(name.clone(), tid);
+            }
         }
         for (name, c) in &program.constants {
             let ret = Repr::of(&c.ret);
@@ -146,17 +170,36 @@ impl JitModule {
 
         // Trampolines (declared functions whose only job is arg/result marshaling).
         for (name, f) in &program.functions {
-            let params: Vec<Repr> = f.params.iter().map(|p| Repr::of(&f.locals[p])).collect();
             let ret = Repr::of(&f.ret);
-            define_trampoline(
-                &mut module,
-                &shims,
-                &mut fbctx,
-                fn_tramp_ids[name],
-                typed_ids[name],
-                &params,
-                ret,
-            )?;
+            if f.is_closure {
+                // Source-level params exclude the hidden env (params[0]); the env-trampoline
+                // threads the closure value through separately.
+                let real: Vec<Repr> = f.params[1..]
+                    .iter()
+                    .map(|p| Repr::of(&f.locals[p]))
+                    .collect();
+                define_env_trampoline(
+                    &mut module,
+                    &shims,
+                    &mut fbctx,
+                    closure_tramp_ids[name],
+                    typed_ids[name],
+                    &real,
+                    ret,
+                )?;
+            } else {
+                let params: Vec<Repr> =
+                    f.params.iter().map(|p| Repr::of(&f.locals[p])).collect();
+                define_trampoline(
+                    &mut module,
+                    &shims,
+                    &mut fbctx,
+                    fn_tramp_ids[name],
+                    typed_ids[name],
+                    &params,
+                    ret,
+                )?;
+            }
         }
         for (name, c) in &program.constants {
             let ret = Repr::of(&c.ret);
@@ -190,13 +233,30 @@ impl JitModule {
             let f: TrampFn = unsafe { std::mem::transmute::<*const u8, TrampFn>(ptr) };
             const_tramps.insert(name.clone(), f);
         }
+        let mut closure_tramps = HashMap::new();
+        for (name, &tid) in &closure_tramp_ids {
+            let ptr = module.get_finalized_function(tid);
+            // SAFETY: `tid` was defined with `env_trampoline_signature`, matching `EnvTrampFn`.
+            let f: EnvTrampFn = unsafe { std::mem::transmute::<*const u8, EnvTrampFn>(ptr) };
+            closure_tramps.insert(name.clone(), f);
+        }
+
+        // Native address of every typed function, by name — the target table for indirect
+        // closure calls (`rt_closure_code_addr`).
+        let mut code_addrs = HashMap::new();
+        for (name, &id) in &typed_ids {
+            let ptr = module.get_finalized_function(id);
+            code_addrs.insert(name.clone(), ptr as u64);
+        }
 
         Ok(JitModule {
-            _module: module,
+            module: Rc::new(module),
             pools: Arc::new(pools),
             exports: program.exports.clone(),
             fn_tramps,
             const_tramps,
+            closure_tramps,
+            code_addrs: Arc::new(code_addrs),
             host: HashMap::new(),
             memory: HashMap::new(),
         })
@@ -243,7 +303,55 @@ impl JitModule {
                 .ok_or_else(|| RunError::Internal(format!("missing const trampoline `{n}`")))?,
         };
 
-        // Resolve host/memory bindings into pool-id order for this invocation.
+        let mut ctx = self.make_ctx();
+        let argv: Vec<Handle> = args.into_iter().map(|a| ctx.intern(a)).collect();
+        // SAFETY: `tramp` has the `TrampFn` ABI; `ctx` outlives the call; `argv` is valid for
+        // `argv.len()` handles.
+        let result = unsafe { tramp(&mut ctx as *mut RtCtx, argv.as_ptr(), argv.len() as u32) };
+
+        if let Some(e) = ctx.error.take() {
+            return Err(e);
+        }
+        Ok(ctx.value(result))
+    }
+
+    /// Host-invoke a closure value previously returned by [`call`](Self::call) (or by another
+    /// `call_value`). The closure carries its captured cells, so upvalue mutations persist
+    /// across host calls. The closure also keeps this module's native code mapped, so it stays
+    /// callable even after the originating `JitModule` is dropped.
+    pub fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RunError> {
+        let code = match &callee {
+            Value::Closure(c) => c.code.clone(),
+            other => {
+                return Err(RunError::Internal(format!(
+                    "call_value on a {} value",
+                    other.type_name()
+                )));
+            }
+        };
+        let tramp = *self
+            .closure_tramps
+            .get(&code)
+            .ok_or_else(|| RunError::Internal(format!("missing closure trampoline `{code}`")))?;
+
+        let mut ctx = self.make_ctx();
+        // The closure itself is the env argument (it carries the captured cells).
+        let env = ctx.intern(callee);
+        let argv: Vec<Handle> = args.into_iter().map(|a| ctx.intern(a)).collect();
+        // SAFETY: `tramp` has the `EnvTrampFn` ABI; `ctx` outlives the call; `argv` is valid
+        // for `argv.len()` handles.
+        let result =
+            unsafe { tramp(&mut ctx as *mut RtCtx, env, argv.as_ptr(), argv.len() as u32) };
+
+        if let Some(e) = ctx.error.take() {
+            return Err(e);
+        }
+        Ok(ctx.value(result))
+    }
+
+    /// Build a fresh per-invocation [`RtCtx`], resolving host/memory bindings into pool-id
+    /// order and threading the indirect-call address table plus a code keepalive.
+    fn make_ctx(&self) -> RtCtx {
         let host: Vec<Option<NativeFn>> = self
             .pools
             .host_fns
@@ -256,17 +364,14 @@ impl JitModule {
             .iter()
             .map(|n| self.memory.get(n).cloned().unwrap_or(Value::Nil))
             .collect();
-
-        let mut ctx = RtCtx::new(self.pools.clone(), host, memory);
-        let argv: Vec<Handle> = args.into_iter().map(|a| ctx.intern(a)).collect();
-        // SAFETY: `tramp` has the `TrampFn` ABI; `ctx` outlives the call; `argv` is valid for
-        // `argv.len()` handles.
-        let result = unsafe { tramp(&mut ctx as *mut RtCtx, argv.as_ptr(), argv.len() as u32) };
-
-        if let Some(e) = ctx.error.take() {
-            return Err(e);
-        }
-        Ok(ctx.value(result))
+        let keepalive: Rc<dyn std::any::Any> = self.module.clone();
+        RtCtx::new(
+            self.pools.clone(),
+            host,
+            memory,
+            self.code_addrs.clone(),
+            Some(keepalive),
+        )
     }
 }
 
@@ -317,6 +422,12 @@ fn declare_shims(
         ("rt_call_host", &[I64, I32, I64, I32], &[I64]),
         ("rt_call_builtin_value", &[I64, I32, I64, I32], &[I64]),
         ("rt_call_builtin_member", &[I64, I32, I64, I32], &[I64]),
+        ("rt_cell_new", &[I64, I64], &[I64]),
+        ("rt_cell_get", &[I64, I64], &[I64]),
+        ("rt_cell_set", &[I64, I64, I64], &[]),
+        ("rt_closure_new", &[I64, I32, I64, I32], &[I64]),
+        ("rt_closure_env_get", &[I64, I64, I32], &[I64]),
+        ("rt_closure_code_addr", &[I64, I64], &[I64]),
     ];
     let mut ids = HashMap::new();
     for (name, params, rets) in table {
@@ -372,6 +483,37 @@ fn define_trampoline(
     {
         let builder = FunctionBuilder::new(&mut ctx.func, fbctx);
         build_trampoline(
+            builder,
+            module as &mut dyn Module,
+            shims,
+            typed_id,
+            params,
+            ret,
+        );
+    }
+    module
+        .define_function(tramp_id, &mut ctx)
+        .map_err(|e| JitError::Cranelift(e.to_string()))?;
+    module.clear_context(&mut ctx);
+    Ok(())
+}
+
+/// Build one env-trampoline (for a lifted closure) into `tramp_id`. `params` are the
+/// source-level parameters, excluding the hidden env.
+fn define_env_trampoline(
+    module: &mut JITModule,
+    shims: &HashMap<&'static str, FuncId>,
+    fbctx: &mut FunctionBuilderContext,
+    tramp_id: FuncId,
+    typed_id: FuncId,
+    params: &[Repr],
+    ret: Repr,
+) -> Result<(), JitError> {
+    let mut ctx = module.make_context();
+    ctx.func.signature = env_trampoline_signature(module.isa().default_call_conv());
+    {
+        let builder = FunctionBuilder::new(&mut ctx.func, fbctx);
+        build_env_trampoline(
             builder,
             module as &mut dyn Module,
             shims,

@@ -23,11 +23,13 @@
 //! error-exit. Script-to-script calls can't carry the sentinel in a scalar return, so the
 //! callee sets [`RtCtx::error`] and the caller checks it via [`rt_errored`].
 
+use std::any::Any;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::runtime::builtins;
-use crate::value::{NativeFn, RunError, Value};
+use crate::value::{ClosureObj, NativeFn, RunError, Value};
 
 /// A reference-value handle: an index into [`RtCtx::values`]. Handle `0` is always `nil`.
 pub type Handle = u64;
@@ -57,6 +59,8 @@ pub struct Pools {
     pub namespace_fields: Vec<(String, String)>,
     /// Host memory binding names, by memory id.
     pub memories: Vec<String>,
+    /// Lifted-closure function names (`MakeClosure`), by closure id.
+    pub closure_names: Vec<String>,
 }
 
 impl Pools {
@@ -96,6 +100,9 @@ impl Pools {
     pub fn intern_memory(&mut self, name: &str) -> u32 {
         Self::intern(&mut self.memories, name)
     }
+    pub fn intern_closure_name(&mut self, name: &str) -> u32 {
+        Self::intern(&mut self.closure_names, name)
+    }
 }
 
 /// One invocation's runtime state. Created fresh per top-level call (this *is* the per-call
@@ -112,6 +119,13 @@ pub struct RtCtx {
     host: Vec<Option<NativeFn>>,
     /// Memory bindings resolved by id (parallel to [`Pools::memories`]).
     memory: Vec<Value>,
+    /// Finalized native address of every compiled function, by name. Used to resolve the
+    /// callee of an indirect closure call ([`rt_closure_code_addr`]).
+    code_addrs: Arc<HashMap<String, u64>>,
+    /// Keeps the compiled module's native code mapped for any closure created during this
+    /// invocation that escapes to the host. Stamped into each [`Value::Closure`] by
+    /// [`rt_closure_new`] so a returned closure outlives the call without dangling.
+    keepalive: Option<Rc<dyn Any>>,
     /// The first error raised during this invocation, if any.
     pub error: Option<RunError>,
 }
@@ -119,12 +133,20 @@ pub struct RtCtx {
 impl RtCtx {
     /// Build a context for one invocation. `host`/`memory` are resolved into id order by the
     /// caller (the compiled module) from the user-registered bindings.
-    pub fn new(pools: Arc<Pools>, host: Vec<Option<NativeFn>>, memory: Vec<Value>) -> Self {
+    pub fn new(
+        pools: Arc<Pools>,
+        host: Vec<Option<NativeFn>>,
+        memory: Vec<Value>,
+        code_addrs: Arc<HashMap<String, u64>>,
+        keepalive: Option<Rc<dyn Any>>,
+    ) -> Self {
         RtCtx {
             values: vec![Value::Nil],
             pools,
             host,
             memory,
+            code_addrs,
+            keepalive,
             error: None,
         }
     }
@@ -463,6 +485,85 @@ pub unsafe extern "C" fn rt_call_builtin_member(
     }
 }
 
+// ---- closures (upvalues) ----------------------------------------------------
+
+/// Box a value into a fresh shared upvalue cell; returns its handle.
+pub unsafe extern "C" fn rt_cell_new(ctx: *mut RtCtx, val: Handle) -> Handle {
+    let ctx = ctx!(ctx);
+    let v = ctx.value(val);
+    ctx.intern(Value::Cell(Rc::new(std::cell::RefCell::new(v))))
+}
+
+/// Read the value currently held in a cell.
+pub unsafe extern "C" fn rt_cell_get(ctx: *mut RtCtx, cell: Handle) -> Handle {
+    let ctx = ctx!(ctx);
+    let v = match ctx.get(cell) {
+        Value::Cell(c) => c.borrow().clone(),
+        _ => Value::Nil,
+    };
+    ctx.intern(v)
+}
+
+/// Write a value into a cell.
+pub unsafe extern "C" fn rt_cell_set(ctx: *mut RtCtx, cell: Handle, val: Handle) {
+    let ctx = ctx!(ctx);
+    let v = ctx.value(val);
+    if let Value::Cell(c) = ctx.get(cell) {
+        *c.borrow_mut() = v;
+    }
+}
+
+/// Build a closure value: the lifted function named by `name_id` plus its captured cells
+/// (`argc` handles at `argv`, each a cell). The closure carries the module keepalive so it
+/// stays callable if it escapes to the host.
+pub unsafe extern "C" fn rt_closure_new(
+    ctx: *mut RtCtx,
+    name_id: u32,
+    argv: *const Handle,
+    argc: u32,
+) -> Handle {
+    let ctx = ctx!(ctx);
+    let env = unsafe { collect_args(ctx, argv, argc) };
+    let code = ctx.pools.closure_names[name_id as usize].clone();
+    let keepalive = ctx.keepalive.clone();
+    ctx.intern(Value::Closure(Rc::new(ClosureObj {
+        code,
+        env,
+        keepalive,
+    })))
+}
+
+/// Read the i-th captured cell from a closure's environment.
+pub unsafe extern "C" fn rt_closure_env_get(ctx: *mut RtCtx, clo: Handle, i: u32) -> Handle {
+    let ctx = ctx!(ctx);
+    let cell = match ctx.get(clo) {
+        Value::Closure(c) => c.env.get(i as usize).cloned(),
+        _ => None,
+    };
+    match cell {
+        Some(v) => ctx.intern(v),
+        None => NIL,
+    }
+}
+
+/// Resolve the native code address of a closure's lifted function, for an indirect call.
+pub unsafe extern "C" fn rt_closure_code_addr(ctx: *mut RtCtx, clo: Handle) -> i64 {
+    let ctx = ctx!(ctx);
+    let addr = match ctx.get(clo) {
+        Value::Closure(c) => ctx.code_addrs.get(&c.code).copied(),
+        _ => None,
+    };
+    match addr {
+        Some(a) => a as i64,
+        None => {
+            ctx.fail(RunError::Internal(
+                "indirect call to an unknown closure".into(),
+            ));
+            0
+        }
+    }
+}
+
 /// Local re-implementation of [`Value`] equality (the interpreter's is private): scalars by
 /// value, reference types by `Rc` identity (Lua semantics).
 fn value_eq(a: &Value, b: &Value) -> bool {
@@ -475,6 +576,8 @@ fn value_eq(a: &Value, b: &Value) -> bool {
         (Value::Table(x), Value::Table(y)) => Rc::ptr_eq(x, y),
         (Value::Function(x), Value::Function(y)) => Rc::ptr_eq(x, y),
         (Value::Native(x), Value::Native(y)) => Rc::ptr_eq(x, y),
+        (Value::Cell(x), Value::Cell(y)) => Rc::ptr_eq(x, y),
+        (Value::Closure(x), Value::Closure(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -513,5 +616,11 @@ pub fn shim_symbols() -> Vec<(&'static str, *const u8)> {
             "rt_call_builtin_member",
             rt_call_builtin_member as *const u8,
         ),
+        ("rt_cell_new", rt_cell_new as *const u8),
+        ("rt_cell_get", rt_cell_get as *const u8),
+        ("rt_cell_set", rt_cell_set as *const u8),
+        ("rt_closure_new", rt_closure_new as *const u8),
+        ("rt_closure_env_get", rt_closure_env_get as *const u8),
+        ("rt_closure_code_addr", rt_closure_code_addr as *const u8),
     ]
 }

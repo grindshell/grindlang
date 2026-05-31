@@ -35,7 +35,7 @@
 //! errors, since the checker should have rejected them.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use crate::ast::*;
@@ -95,6 +95,8 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Table(x), Value::Table(y)) => Rc::ptr_eq(x, y),
         (Value::Function(x), Value::Function(y)) => Rc::ptr_eq(x, y),
         (Value::Native(x), Value::Native(y)) => Rc::ptr_eq(x, y),
+        (Value::Cell(x), Value::Cell(y)) => Rc::ptr_eq(x, y),
+        (Value::Closure(x), Value::Closure(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -203,6 +205,13 @@ impl<'a> Interpreter<'a> {
             .cloned()
             .ok_or_else(|| RunError::UnknownExport(name.to_string()))?;
         self.call_value(&func, args)
+    }
+
+    /// Host-invoke a function value previously returned by [`call`](Self::call) (e.g. a
+    /// closure). Mirrors the JIT's `call_value`, so the differential harness can validate
+    /// host-invoke across all three backends.
+    pub fn call_value_public(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RunError> {
+        self.call_value(&callee, args)
     }
 
     fn param_ids(&self, body: &FuncBody) -> Vec<SymbolId> {
@@ -513,9 +522,8 @@ impl<'a> Interpreter<'a> {
     /// params/locals (and those of nested closures) are not in scope yet, so they are
     /// naturally excluded and materialized later when their defining call runs.
     fn capture_env(&self, body: &FuncBody) -> Frame {
-        let mut ids = HashSet::new();
-        collect_body_ids(self.res, body, &mut ids);
-        ids.into_iter()
+        crate::capture::referenced_symbols(self.res, body)
+            .into_iter()
             .filter_map(|id| self.find_slot(id).map(|slot| (id, slot)))
             .collect()
     }
@@ -862,152 +870,6 @@ impl<'a> Interpreter<'a> {
             return Some(ns);
         }
         None
-    }
-}
-
-// ---- free-variable collection (closure capture) -----------------------------
-//
-// Walk a function body and gather every in-function [`SymbolId`] it references — both its
-// own locals/params and its upvalues, *including* those reached only through nested
-// function literals (a nested closure's upvalues must flow through the enclosing closure's
-// capture). `capture_env` then keeps just the ids that currently resolve to a live slot,
-// which are precisely this closure's upvalues.
-
-fn collect_body_ids(res: &Resolution, body: &FuncBody, out: &mut HashSet<SymbolId>) {
-    collect_block_ids(res, &body.block, out);
-}
-
-fn collect_block_ids(res: &Resolution, block: &Block, out: &mut HashSet<SymbolId>) {
-    for stat in &block.stats {
-        collect_stat_ids(res, stat, out);
-    }
-    if let Some(ret) = &block.ret {
-        for e in &ret.exprs {
-            collect_expr_ids(res, e, out);
-        }
-    }
-}
-
-fn collect_stat_ids(res: &Resolution, stat: &Stat, out: &mut HashSet<SymbolId>) {
-    match &stat.kind {
-        StatKind::Empty | StatKind::Break => {}
-        StatKind::Local { exprs, .. } => {
-            for e in exprs {
-                collect_expr_ids(res, e, out);
-            }
-        }
-        StatKind::LocalFunction { body, .. } => collect_block_ids(res, &body.block, out),
-        StatKind::Assign { targets, exprs } => {
-            for t in targets {
-                collect_target_ids(res, t, out);
-            }
-            for e in exprs {
-                collect_expr_ids(res, e, out);
-            }
-        }
-        StatKind::Call(e) => collect_expr_ids(res, e, out),
-        StatKind::Do(block) => collect_block_ids(res, block, out),
-        StatKind::While { cond, body } => {
-            collect_expr_ids(res, cond, out);
-            collect_block_ids(res, body, out);
-        }
-        StatKind::If { arms, else_block } => {
-            for (cond, block) in arms {
-                collect_expr_ids(res, cond, out);
-                collect_block_ids(res, block, out);
-            }
-            if let Some(block) = else_block {
-                collect_block_ids(res, block, out);
-            }
-        }
-        StatKind::NumericFor {
-            start,
-            end,
-            step,
-            body,
-            ..
-        } => {
-            collect_expr_ids(res, start, out);
-            collect_expr_ids(res, end, out);
-            if let Some(step) = step {
-                collect_expr_ids(res, step, out);
-            }
-            collect_block_ids(res, body, out);
-        }
-        StatKind::GenericFor { iter, body, .. } => {
-            match iter {
-                IterExpr::IPairs { arg, .. } | IterExpr::Pairs { arg, .. } => {
-                    collect_expr_ids(res, arg, out)
-                }
-            }
-            collect_block_ids(res, body, out);
-        }
-    }
-}
-
-/// An assignment target: a name write (whose symbol must be captured so the write reaches
-/// the shared slot) or a field/index whose base is an ordinary expression.
-fn collect_target_ids(res: &Resolution, expr: &Expr, out: &mut HashSet<SymbolId>) {
-    match &expr.kind {
-        ExprKind::Name(_) => collect_name_id(res, expr, out),
-        ExprKind::Field { base, .. } => collect_expr_ids(res, base, out),
-        ExprKind::Index { base, index } => {
-            collect_expr_ids(res, base, out);
-            collect_expr_ids(res, index, out);
-        }
-        _ => collect_expr_ids(res, expr, out),
-    }
-}
-
-fn collect_expr_ids(res: &Resolution, expr: &Expr, out: &mut HashSet<SymbolId>) {
-    match &expr.kind {
-        ExprKind::Nil | ExprKind::Bool(_) | ExprKind::Number(_) | ExprKind::Str(_) => {}
-        ExprKind::Name(_) => collect_name_id(res, expr, out),
-        // Recurse into nested functions: their upvalues are this closure's responsibility
-        // to carry, so they must be captured here too.
-        ExprKind::Function(body) => collect_block_ids(res, &body.block, out),
-        ExprKind::Index { base, index } => {
-            collect_expr_ids(res, base, out);
-            collect_expr_ids(res, index, out);
-        }
-        ExprKind::Field { base, .. } => collect_expr_ids(res, base, out),
-        ExprKind::Call { callee, args } => {
-            collect_expr_ids(res, callee, out);
-            for a in args {
-                collect_expr_ids(res, a, out);
-            }
-        }
-        ExprKind::MethodCall { receiver, args, .. } => {
-            collect_expr_ids(res, receiver, out);
-            for a in args {
-                collect_expr_ids(res, a, out);
-            }
-        }
-        ExprKind::Table(fields) => {
-            for field in fields {
-                match field {
-                    Field::Positional(e) => collect_expr_ids(res, e, out),
-                    Field::Named { value, .. } => collect_expr_ids(res, value, out),
-                    Field::Keyed { key, value } => {
-                        collect_expr_ids(res, key, out);
-                        collect_expr_ids(res, value, out);
-                    }
-                }
-            }
-        }
-        ExprKind::Binary { lhs, rhs, .. } => {
-            collect_expr_ids(res, lhs, out);
-            collect_expr_ids(res, rhs, out);
-        }
-        ExprKind::Unary { operand, .. } => collect_expr_ids(res, operand, out),
-        ExprKind::Paren(inner) => collect_expr_ids(res, inner, out),
-    }
-}
-
-/// Record the symbol id of a name use if it resolves to an in-function binding.
-fn collect_name_id(res: &Resolution, expr: &Expr, out: &mut HashSet<SymbolId>) {
-    if let Some(Binding::Local(id) | Binding::Upvalue(id)) = res.binding(expr.span) {
-        out.insert(*id);
     }
 }
 

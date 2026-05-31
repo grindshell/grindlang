@@ -414,3 +414,200 @@ fn host_error_propagates() {
     let err = jit.call("f", vec![]).unwrap_err();
     assert!(matches!(err, grindlang::RunError::Host(m) if m == "kaboom"));
 }
+
+// ---- closures (upvalues) ----
+
+#[test]
+fn closure_captures_upvalue() {
+    assert_same(
+        "function make(base)\n\
+           local add = function(x) return x + base end\n\
+           return add(10)\n\
+         end",
+        "make",
+        vec![Value::Number(5.0)],
+    );
+}
+
+#[test]
+fn closure_shared_mutable_upvalue() {
+    assert_same(
+        "function counter()\n\
+           local n = 0\n\
+           local inc = function() n = n + 1 return n end\n\
+           local a = inc()\n\
+           local b = inc()\n\
+           return a + b\n\
+         end",
+        "counter",
+        vec![],
+    );
+}
+
+#[test]
+fn returned_closure_called_in_script() {
+    assert_same(
+        "function make_adder(n)\n\
+           return function(x) return x + n end\n\
+         end\n\
+         function use()\n\
+           local add5 = make_adder(5)\n\
+           return add5(10)\n\
+         end",
+        "use",
+        vec![],
+    );
+}
+
+#[test]
+fn recursive_local_function_closure() {
+    assert_same(
+        "function run(n)\n\
+           local function fact(k) if k <= 1 then return 1 end return k * fact(k - 1) end\n\
+           return fact(n)\n\
+         end",
+        "run",
+        vec![Value::Number(6.0)],
+    );
+}
+
+#[test]
+fn nested_closures_through_layers() {
+    assert_same(
+        "function outer(a)\n\
+           local mid = function(b)\n\
+             return function(c) return a + b + c end\n\
+           end\n\
+           local f = mid(20)\n\
+           return f(300)\n\
+         end",
+        "outer",
+        vec![Value::Number(1.0)],
+    );
+}
+
+// ---- host boundary: return a closure, then re-invoke it via call_value ----
+
+/// Render a call result deterministically so the three backends can be compared (including
+/// the error case).
+fn render(r: Result<Value, grindlang::RunError>) -> String {
+    match r {
+        Ok(v) => format!("ok:{v}"),
+        Err(e) => format!("err:{e}"),
+    }
+}
+
+/// Compile a module, call `func` to obtain a closure, then host-invoke that closure with
+/// `inner` on each backend; assert all three agree.
+fn agree_return_then_invoke(src: &str, func: &str, outer: Vec<Value>, inner: Vec<Value>) -> String {
+    let cfg = TypeConfig::default();
+    let (module, res, info) = grindlang::analyze(src, &cfg).expect("analyze");
+    let program = grindlang::ir::lower(&module, &res, &info, &cfg).expect("lower");
+    grindlang::ir::verify(&program).expect("verify");
+
+    let mut interp = Interpreter::new(&module, &res).expect("interp");
+    let mut vm = Vm::new(&program);
+    let mut jit = JitModule::compile(&program).expect("jit compile");
+
+    let ci = interp.call(func, outer.clone()).expect("interp closure");
+    let cv = vm.call(func, outer.clone()).expect("vm closure");
+    let cj = jit.call(func, outer.clone()).expect("jit closure");
+
+    let ri = interp.call_value_public(ci, inner.clone());
+    let rv = vm.call_value(cv, inner.clone());
+    let rj = jit.call_value(cj, inner.clone());
+
+    let si = render(ri);
+    let sv = render(rv);
+    let sj = render(rj);
+    assert_eq!(si, sv, "interp vs vm host-invoke mismatch:\n{src}");
+    assert_eq!(sv, sj, "vm vs jit host-invoke mismatch:\n{src}");
+    si
+}
+
+#[test]
+fn host_invokes_returned_closure() {
+    assert_eq!(
+        agree_return_then_invoke(
+            "function make_adder(n)\n\
+               return function(x) return x + n end\n\
+             end",
+            "make_adder",
+            vec![Value::Number(100.0)],
+            vec![Value::Number(7.0)],
+        ),
+        "ok:107"
+    );
+}
+
+#[test]
+fn host_invokes_counter_twice_persisting_upvalue() {
+    // Build a counter closure, then host-invoke it twice; the upvalue must persist between
+    // host calls (the JIT shares the captured cell across invocations).
+    let cfg = TypeConfig::default();
+    let src = "function make_counter()\n\
+                 local n = 0\n\
+                 return function() n = n + 1 return n end\n\
+               end";
+    let (module, res, info) = grindlang::analyze(src, &cfg).expect("analyze");
+    let program = grindlang::ir::lower(&module, &res, &info, &cfg).expect("lower");
+    grindlang::ir::verify(&program).expect("verify");
+    let mut jit = JitModule::compile(&program).expect("jit compile");
+    let c = jit.call("make_counter", vec![]).expect("counter");
+    let r1 = jit.call_value(c.clone(), vec![]).expect("call 1");
+    let r2 = jit.call_value(c, vec![]).expect("call 2");
+    assert_eq!(format!("{r1}"), "1");
+    assert_eq!(format!("{r2}"), "2");
+}
+
+#[test]
+fn closure_survives_origin_module_drop() {
+    // A returned closure carries its captured cells (and a keepalive to its native code), so
+    // it remains a valid value after the module that produced it is dropped. Here it is then
+    // host-invoked through a second module compiled from the same program.
+    let cfg = TypeConfig::default();
+    let src = "function make_adder(n) return function(x) return x + n end end";
+    let (module, res, info) = grindlang::analyze(src, &cfg).expect("analyze");
+    let program = grindlang::ir::lower(&module, &res, &info, &cfg).expect("lower");
+
+    let mut jit2 = JitModule::compile(&program).expect("jit compile 2");
+    let closure = {
+        let mut jit1 = JitModule::compile(&program).expect("jit compile 1");
+        jit1.call("make_adder", vec![Value::Number(40.0)])
+            .expect("closure")
+        // jit1 dropped here; `closure` lives on via its keepalive.
+    };
+    let r = jit2
+        .call_value(closure, vec![Value::Number(2.0)])
+        .expect("invoke");
+    assert_eq!(format!("{r}"), "42");
+}
+
+#[test]
+fn closures_fixture_matches() {
+    let path = format!("{}/tests/fixtures/closures.lua", env!("CARGO_MANIFEST_DIR"));
+    let src = std::fs::read_to_string(path).unwrap();
+    // `factorial` exercises a recursive `local function` closure end-to-end on all 3 oracles.
+    for n in [1.0, 5.0, 8.0] {
+        assert_same(&src, "factorial", vec![Value::Number(n)]);
+    }
+}
+
+#[test]
+fn closures_fixture_host_returns_and_invokes() {
+    // `make_adder` returns a closure the host then re-invokes via call_value.
+    let src = std::fs::read_to_string(format!(
+        "{}/tests/fixtures/closures.lua",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    assert_eq!(
+        agree_return_then_invoke(
+            &src,
+            "make_adder",
+            vec![Value::Number(100.0)],
+            vec![Value::Number(8.0)],
+        ),
+        "ok:108"
+    );
+}

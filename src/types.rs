@@ -28,7 +28,7 @@
 //!   narrowing (fields, early-return flow) is future work.
 //! * **Method calls** (`recv:m(...)`) and **`pairs` over records** are not yet typed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, Diagnostics, Span};
@@ -159,6 +159,11 @@ pub struct TypeInfo {
     pub functions: BTreeMap<String, FnType>,
     /// Resolved type of each top-level constant, by declared name.
     pub constants: BTreeMap<String, Type>,
+    /// Resolved signature of each nested function literal (anonymous `function … end` and
+    /// `local function`), keyed by its [`FuncBody`] span. IR lowering reads these to recover
+    /// a closure's parameter/return types (the checker computes them but, unlike top-level
+    /// functions, they aren't otherwise persisted).
+    pub function_literals: HashMap<Span, FnType>,
 }
 
 /// Type-check `module` (already resolved into `resolution`) against `cfg`.
@@ -190,12 +195,24 @@ pub fn typecheck(
         .iter()
         .map(|(name, t)| (name.clone(), c.u.deep(t)))
         .collect();
+    let function_literals = c
+        .func_literals
+        .iter()
+        .map(|(span, sig)| {
+            let deep = match c.u.deep(&Type::Function(sig.clone())) {
+                Type::Function(ft) => ft,
+                _ => unreachable!("deep of a function type is a function type"),
+            };
+            (*span, deep)
+        })
+        .collect();
 
     Ok(TypeInfo {
         exports,
         symbol_types,
         functions,
         constants,
+        function_literals,
     })
 }
 
@@ -324,6 +341,8 @@ struct Checker<'a> {
     func_sigs: BTreeMap<String, FnType>,
     /// Top-level constant types, by name.
     const_types: BTreeMap<String, Type>,
+    /// Nested function-literal signatures, by [`FuncBody`] span (deep-resolved at the end).
+    func_literals: HashMap<Span, FnType>,
     return_stack: Vec<ReturnFrame>,
     diags: Diagnostics,
 }
@@ -339,6 +358,7 @@ impl<'a> Checker<'a> {
             narrowed: BTreeMap::new(),
             func_sigs: BTreeMap::new(),
             const_types: BTreeMap::new(),
+            func_literals: HashMap::new(),
             return_stack: Vec::new(),
             diags: Diagnostics::new(),
         }
@@ -507,6 +527,7 @@ impl<'a> Checker<'a> {
                 if let Some(id) = self.res.def(name.span) {
                     self.sym_types[id as usize] = Type::Function(sig.clone());
                 }
+                self.func_literals.insert(body.span, sig.clone());
                 self.check_func_body(body, &sig);
             }
             StatKind::Assign { targets, exprs } => self.check_assign(targets, exprs, stat.span),
@@ -677,6 +698,7 @@ impl<'a> Checker<'a> {
             ExprKind::Name(_) => self.check_name(expr),
             ExprKind::Function(body) => {
                 let sig = self.make_sig(&body.params);
+                self.func_literals.insert(body.span, sig.clone());
                 self.check_func_body(body, &sig);
                 Type::Function(sig)
             }

@@ -32,6 +32,7 @@
 //! surface a batch of [`Diagnostics`] on failure.
 
 pub mod ast;
+mod capture;
 pub mod diagnostics;
 pub mod ir;
 pub mod lexer;

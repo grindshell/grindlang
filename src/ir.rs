@@ -21,21 +21,28 @@
 //! same program through both the AST interpreter ([`crate::interp`]) and the IR interpreter
 //! and asserting equal results (see the differential tests).
 //!
+//! ## Closures
+//!
+//! Anonymous `function … end` and `local function` literals are lowered by **closure
+//! conversion**: each is lifted into its own top-level [`Function`] taking the closure value
+//! as a hidden first (env) parameter, and the literal site emits an [`Op::MakeClosure`].
+//! Captured variables (upvalues) become shared **cells** ([`Op::MakeCell`] / [`Op::CellGet`]
+//! / [`Op::CellSet`]) so writes are observed across the enclosing scope and sibling closures,
+//! matching the interpreter. A first-class function value is called with [`Op::CallValue`].
+//!
 //! ## Deliberately deferred (documented gaps)
 //!
-//! * **Nested functions / closures.** Only top-level functions and constants are lowered.
-//!   A nested `function ... end` or `local function` raises [`LowerError::Unsupported`].
-//!   (The AST interpreter still handles closures; the IR path simply doesn't yet.)
-//! * **Calling a function *value*.** Calls must target a named top-level or host function.
+//! * **Named functions as first-class values.** Using a *named* top-level or host function as
+//!   a value (rather than calling it directly) raises [`LowerError::Unsupported`].
 //! * **Method calls** (`recv:m(...)`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::ast::{
     self, BinOp, Expr, ExprKind, Field, FuncBody, Ident, IterExpr, Module, Stat, StatKind, TopDecl,
     UnOp,
 };
-use crate::resolve::{Binding, Resolution};
+use crate::resolve::{Binding, Resolution, SymbolId};
 use crate::types::{Type, TypeConfig, TypeInfo};
 
 /// An SSA temporary holding the result of one instruction.
@@ -80,7 +87,9 @@ pub enum ExportTarget {
 #[derive(Clone, Debug)]
 pub struct Function {
     pub name: String,
-    /// Parameter locals, in order.
+    /// Parameter locals, in order. For a lifted closure (`is_closure`), the first entry is the
+    /// hidden environment parameter (the closure value carrying the captured cells); the rest
+    /// are the source-level parameters.
     pub params: Vec<LocalId>,
     pub ret: Type,
     /// Type of every local (parameters, source locals, synthetic temporaries).
@@ -89,6 +98,9 @@ pub struct Function {
     pub values: Vec<Type>,
     pub blocks: Vec<Block>,
     pub entry: BlockId,
+    /// Whether this is a lifted closure body (its first parameter is the env). Top-level
+    /// functions and constant initializers are `false`.
+    pub is_closure: bool,
 }
 
 impl Function {
@@ -169,6 +181,22 @@ pub enum Op {
     MemoryRef(String),
     /// A builtin namespace value field (`math.pi`, `math.huge`).
     NamespaceField(String, String),
+
+    // ---- closures (upvalues) ----
+    /// Box a value into a fresh shared upvalue cell. Result is the cell (a `Ptr`).
+    MakeCell(ValueId),
+    /// Read the value currently held in a cell.
+    CellGet(ValueId),
+    /// Write a value into a cell (no result).
+    CellSet(ValueId, ValueId),
+    /// Read the i-th captured cell from a closure's environment. The operand is the closure
+    /// value passed as the lifted function's hidden first parameter; the result is the cell.
+    ClosureEnvGet(ValueId, u32),
+    /// Build a closure value: a lifted function (by its synthetic name) plus its captured
+    /// cells, in env order.
+    MakeClosure(String, Vec<ValueId>),
+    /// Call a closure value with `args`.
+    CallValue(ValueId, Vec<ValueId>),
 }
 
 /// How a basic block ends.
@@ -188,6 +216,22 @@ pub enum Terminator {
     Unreachable,
 }
 
+/// A nested function literal discovered during lowering, queued to be lifted into its own
+/// top-level [`Function`]. The body is cloned (cheap, compile-time only) so no AST lifetime
+/// threads through the lowerer; spans are preserved, so resolver/type lookups still work.
+struct Pending {
+    name: String,
+    body: FuncBody,
+    depth: usize,
+    upvalues: Vec<SymbolId>,
+}
+
+/// The IR type used for an upvalue cell / closure handle: any `Repr::Ptr` type works, since
+/// the handle is opaque (its element type is never inspected).
+fn cell_type() -> Type {
+    Type::array(Type::Nil)
+}
+
 /// Lower a checked module into IR.
 pub fn lower(
     module: &Module,
@@ -197,18 +241,29 @@ pub fn lower(
 ) -> Result<Program, LowerError> {
     let mut functions = BTreeMap::new();
     let mut constants = BTreeMap::new();
+    // Nested closures discovered while lowering are lifted into their own functions; lifting
+    // one may discover more, so drain a work queue until it is empty.
+    let mut queue: Vec<Pending> = Vec::new();
 
     for decl in &module.decls {
         match decl {
             TopDecl::Function(f) => {
-                let lowered = lower_function(&f.name.node, &f.body, res, types, cfg)?;
+                let (lowered, discovered) =
+                    lower_function(&f.name.node, &f.body, res, types, cfg)?;
                 functions.insert(f.name.node.clone(), lowered);
+                queue.extend(discovered);
             }
             TopDecl::Const(c) => {
                 let lowered = lower_const(&c.name.node, &c.value, res, types, cfg)?;
                 constants.insert(c.name.node.clone(), lowered);
             }
         }
+    }
+
+    while let Some(p) = queue.pop() {
+        let (lowered, discovered) = lower_closure(&p, res, types, cfg)?;
+        functions.insert(p.name.clone(), lowered);
+        queue.extend(discovered);
     }
 
     let exports = lower_exports(module, res)?;
@@ -277,19 +332,56 @@ fn lower_function(
     res: &Resolution,
     types: &TypeInfo,
     cfg: &TypeConfig,
-) -> Result<Function, LowerError> {
+) -> Result<(Function, Vec<Pending>), LowerError> {
     let ret = types
         .functions
         .get(name)
         .map(|ft| (*ft.ret).clone())
         .unwrap_or(Type::Unit);
     let mut fl = FnLowerer::new(name.to_string(), ret, res, types, cfg);
+    fl.set_boxed(crate::capture::boxed_locals(res, body, 0));
     fl.lower_params(&body.params)?;
     let terminated = fl.lower_block(&body.block)?;
     if !terminated {
         fl.terminate(Terminator::Return(None));
     }
-    Ok(fl.finish())
+    let discovered = std::mem::take(&mut fl.discovered);
+    Ok((fl.finish(), discovered))
+}
+
+/// Lower a lifted closure: a function literal hoisted to top level with an explicit env
+/// parameter (the closure value, carrying the captured cells) as its hidden first parameter.
+fn lower_closure(
+    p: &Pending,
+    res: &Resolution,
+    types: &TypeInfo,
+    cfg: &TypeConfig,
+) -> Result<(Function, Vec<Pending>), LowerError> {
+    let ret = types
+        .function_literals
+        .get(&p.body.span)
+        .map(|ft| (*ft.ret).clone())
+        .unwrap_or(Type::Unit);
+    let mut fl = FnLowerer::new(p.name.clone(), ret, res, types, cfg);
+    fl.depth = p.depth;
+    fl.set_boxed(crate::capture::boxed_locals(res, &p.body, p.depth));
+    fl.upvalue_index = p
+        .upvalues
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (s, i as u32))
+        .collect();
+    // The hidden env parameter (params[0]) carries the closure value.
+    let env_l = fl.fresh_temp(cell_type());
+    fl.env_local = Some(env_l);
+    fl.params.push(env_l);
+    fl.lower_params(&p.body.params)?;
+    let terminated = fl.lower_block(&p.body.block)?;
+    if !terminated {
+        fl.terminate(Terminator::Return(None));
+    }
+    let discovered = std::mem::take(&mut fl.discovered);
+    Ok((fl.finish(), discovered))
 }
 
 fn lower_const(
@@ -321,6 +413,21 @@ struct FnLowerer<'a> {
     next_temp: LocalId,
     /// Stack of loop-exit blocks for `break`.
     loop_exits: Vec<BlockId>,
+
+    // ---- closure conversion ----
+    /// Nesting depth of the function being lowered (0 = top-level).
+    depth: usize,
+    /// This function's own params/locals that are captured by a nested closure, so they are
+    /// stored as shared cells rather than plain values.
+    boxed: HashSet<SymbolId>,
+    /// For a lifted closure, each captured upvalue symbol → its index in the env.
+    upvalue_index: HashMap<SymbolId, u32>,
+    /// For a lifted closure, the local holding the env (closure value) — params[0].
+    env_local: Option<LocalId>,
+    /// Nested function literals discovered here, to be lifted into their own functions.
+    discovered: Vec<Pending>,
+    /// Per-function counter for minting unique lifted-closure names.
+    closure_counter: u32,
 }
 
 impl<'a> FnLowerer<'a> {
@@ -345,10 +452,25 @@ impl<'a> FnLowerer<'a> {
             current: 0,
             next_temp,
             loop_exits: Vec::new(),
+            depth: 0,
+            boxed: HashSet::new(),
+            upvalue_index: HashMap::new(),
+            env_local: None,
+            discovered: Vec::new(),
+            closure_counter: 0,
         };
         let entry = fl.new_block();
         fl.current = entry as usize;
         fl
+    }
+
+    /// Record which of this function's own symbols are captured (boxed). Pre-types their
+    /// locals as cell handles so later `ensure_local` calls don't overwrite the type.
+    fn set_boxed(&mut self, boxed: HashSet<SymbolId>) {
+        for &id in &boxed {
+            self.locals.insert(id, cell_type());
+        }
+        self.boxed = boxed;
     }
 
     fn finish(self) -> Function {
@@ -360,6 +482,7 @@ impl<'a> FnLowerer<'a> {
             values: self.values,
             blocks: self.blocks,
             entry: 0,
+            is_closure: self.env_local.is_some(),
         }
     }
 
@@ -427,13 +550,117 @@ impl<'a> FnLowerer<'a> {
             .ok_or_else(|| LowerError::Internal("missing symbol id for local".into()))
     }
 
+    // ---- closure conversion helpers ------------------------------------------
+
+    /// The inferred type of an in-function symbol.
+    fn symbol_type(&self, id: SymbolId) -> Type {
+        self.types
+            .symbol_types
+            .get(id as usize)
+            .cloned()
+            .unwrap_or(Type::Error)
+    }
+
+    /// Whether `id` is accessed through a cell (it is one of this function's boxed own locals,
+    /// or an upvalue captured from an enclosing scope).
+    fn is_captured(&self, id: SymbolId) -> bool {
+        self.boxed.contains(&id) || self.upvalue_index.contains_key(&id)
+    }
+
+    /// Produce the cell holding captured symbol `id`, from this function's perspective — from
+    /// the env if it's an upvalue, or from the symbol's own (cell-holding) local otherwise.
+    fn cell_of(&mut self, id: SymbolId) -> ValueId {
+        if let Some(&idx) = self.upvalue_index.get(&id) {
+            let env_l = self.env_local.expect("upvalue access in a function without an env");
+            let env = self.emit_value(Op::LocalGet(env_l), cell_type());
+            self.emit_value(Op::ClosureEnvGet(env, idx), cell_type())
+        } else {
+            self.ensure_local(id);
+            self.emit_value(Op::LocalGet(id), cell_type())
+        }
+    }
+
+    /// Read symbol `id`, routing through its cell when captured.
+    fn read_symbol(&mut self, id: SymbolId) -> ValueId {
+        if self.is_captured(id) {
+            let cell = self.cell_of(id);
+            let ty = self.symbol_type(id);
+            self.emit_value(Op::CellGet(cell), ty)
+        } else {
+            self.ensure_local(id);
+            let ty = self.locals[&id].clone();
+            self.emit_value(Op::LocalGet(id), ty)
+        }
+    }
+
+    /// Write `v` to an *existing* symbol `id`, routing through its cell when captured.
+    fn write_symbol(&mut self, id: SymbolId, v: ValueId) {
+        if self.is_captured(id) {
+            let cell = self.cell_of(id);
+            self.emit_stmt(Op::CellSet(cell, v));
+        } else {
+            self.ensure_local(id);
+            self.emit_stmt(Op::LocalSet(id, v));
+        }
+    }
+
+    /// Bind `v` to symbol `id` at its declaration, creating a fresh cell if `id` is a boxed
+    /// own local.
+    fn bind_local(&mut self, id: SymbolId, v: ValueId) {
+        if self.boxed.contains(&id) {
+            let cell = self.emit_value(Op::MakeCell(v), cell_type());
+            self.ensure_local(id);
+            self.emit_stmt(Op::LocalSet(id, cell));
+        } else {
+            self.ensure_local(id);
+            self.emit_stmt(Op::LocalSet(id, v));
+        }
+    }
+
+    /// Lower a nested function literal: gather its upvalue cells, queue it for lifting under a
+    /// fresh unique name, and emit a `MakeClosure` producing the closure value.
+    fn lower_closure_literal(&mut self, body: &FuncBody) -> Result<ValueId, LowerError> {
+        let child_depth = self.depth + 1;
+        let ups = crate::capture::upvalues(self.res, body, child_depth);
+        let cells: Vec<ValueId> = ups.iter().map(|&u| self.cell_of(u)).collect();
+        let n = self.closure_counter;
+        self.closure_counter += 1;
+        let name = format!("{}$c{}", self.name, n);
+        let fty = self
+            .types
+            .function_literals
+            .get(&body.span)
+            .cloned()
+            .map(Type::Function)
+            .unwrap_or(Type::Error);
+        self.discovered.push(Pending {
+            name: name.clone(),
+            body: body.clone(),
+            depth: child_depth,
+            upvalues: ups,
+        });
+        Ok(self.emit_value(Op::MakeClosure(name, cells), fty))
+    }
+
     // ---- declarations --------------------------------------------------------
 
     fn lower_params(&mut self, params: &[Ident]) -> Result<(), LowerError> {
         for p in params {
             let id = self.local_id(p.span)?;
-            self.ensure_local(id);
-            self.params.push(id);
+            if self.boxed.contains(&id) {
+                // A captured parameter: keep the raw incoming value in a fresh param local,
+                // then box it into the symbol's cell at function entry.
+                let ty = self.symbol_type(id);
+                let raw = self.fresh_temp(ty.clone());
+                self.params.push(raw);
+                self.ensure_local(id);
+                let rawv = self.emit_value(Op::LocalGet(raw), ty);
+                let cell = self.emit_value(Op::MakeCell(rawv), cell_type());
+                self.emit_stmt(Op::LocalSet(id, cell));
+            } else {
+                self.ensure_local(id);
+                self.params.push(id);
+            }
         }
         Ok(())
     }
@@ -479,18 +706,32 @@ impl<'a> FnLowerer<'a> {
                     .collect();
                 for (i, name) in names.iter().enumerate() {
                     let id = self.local_id(name.span)?;
-                    self.ensure_local(id);
                     let v = match vals.get(i).copied().flatten() {
                         Some(v) => v,
                         None => self.emit_value(Op::ConstNil, Type::Nil),
                     };
-                    self.emit_stmt(Op::LocalSet(id, v));
+                    self.bind_local(id, v);
                 }
                 Ok(false)
             }
-            StatKind::LocalFunction { .. } => Err(LowerError::Unsupported(
-                "nested `local function` declarations are not lowered to IR yet".into(),
-            )),
+            StatKind::LocalFunction { name, body } => {
+                let id = self.local_id(name.span)?;
+                if self.boxed.contains(&id) {
+                    // Recursion-safe: create the cell first so the closure can capture it,
+                    // build the closure, then store it into that same cell.
+                    let nil = self.emit_value(Op::ConstNil, Type::Nil);
+                    let cell = self.emit_value(Op::MakeCell(nil), cell_type());
+                    self.ensure_local(id);
+                    self.emit_stmt(Op::LocalSet(id, cell));
+                    let clo = self.lower_closure_literal(body)?;
+                    self.write_symbol(id, clo);
+                } else {
+                    let clo = self.lower_closure_literal(body)?;
+                    self.ensure_local(id);
+                    self.emit_stmt(Op::LocalSet(id, clo));
+                }
+                Ok(false)
+            }
             StatKind::Assign { targets, exprs } => {
                 let vals = exprs
                     .iter()
@@ -531,8 +772,7 @@ impl<'a> FnLowerer<'a> {
                         ));
                     }
                 };
-                self.ensure_local(id);
-                self.emit_stmt(Op::LocalSet(id, v));
+                self.write_symbol(id, v);
                 Ok(())
             }
             ExprKind::Field { base, name } => {
@@ -656,7 +896,9 @@ impl<'a> FnLowerer<'a> {
             None => self.emit_value(Op::ConstNumber(1.0), Type::Number),
         };
         self.emit_stmt(Op::LocalSet(step_l, step_v));
-        self.emit_stmt(Op::LocalSet(var_id, start_v));
+        // Create the loop variable's cell once (if captured), matching the interpreter's
+        // single-slot reuse across iterations.
+        self.bind_local(var_id, start_v);
 
         let header = self.new_block();
         let pos_check = self.new_block();
@@ -680,7 +922,7 @@ impl<'a> FnLowerer<'a> {
 
         // pos_check: i <= end ?
         self.switch(pos_check);
-        let i1 = self.emit_value(Op::LocalGet(var_id), Type::Number);
+        let i1 = self.read_symbol(var_id);
         let e1 = self.emit_value(Op::LocalGet(end_l), Type::Number);
         let le = self.emit_value(Op::Binary(BinOp::Le, i1, e1), Type::Bool);
         self.terminate(Terminator::Branch {
@@ -691,7 +933,7 @@ impl<'a> FnLowerer<'a> {
 
         // neg_check: i >= end ?
         self.switch(neg_check);
-        let i2 = self.emit_value(Op::LocalGet(var_id), Type::Number);
+        let i2 = self.read_symbol(var_id);
         let e2 = self.emit_value(Op::LocalGet(end_l), Type::Number);
         let ge = self.emit_value(Op::Binary(BinOp::Ge, i2, e2), Type::Bool);
         self.terminate(Terminator::Branch {
@@ -711,10 +953,10 @@ impl<'a> FnLowerer<'a> {
 
         // latch: i = i + step; back to header.
         self.switch(latch);
-        let i3 = self.emit_value(Op::LocalGet(var_id), Type::Number);
+        let i3 = self.read_symbol(var_id);
         let s3 = self.emit_value(Op::LocalGet(step_l), Type::Number);
         let next = self.emit_value(Op::Binary(BinOp::Add, i3, s3), Type::Number);
-        self.emit_stmt(Op::LocalSet(var_id, next));
+        self.write_symbol(var_id, next);
         self.terminate(Terminator::Jump(header));
 
         self.switch(exit);
@@ -769,6 +1011,16 @@ impl<'a> FnLowerer<'a> {
         let one = self.emit_value(Op::ConstNumber(1.0), Type::Number);
         self.emit_stmt(Op::LocalSet(idx_l, one));
 
+        // Captured loop variables share a single cell, created once before the loop (matching
+        // the interpreter's slot reuse), then written each iteration.
+        for name in names {
+            let id = self.local_id(name.span)?;
+            if self.boxed.contains(&id) {
+                let nil = self.emit_value(Op::ConstNil, Type::Nil);
+                self.bind_local(id, nil);
+            }
+        }
+
         let header = self.new_block();
         let body_b = self.new_block();
         let latch = self.new_block();
@@ -809,7 +1061,7 @@ impl<'a> FnLowerer<'a> {
                 self.emit_value(Op::LocalGet(idx_l), Type::Number)
             };
             let _ = &key_ty;
-            self.emit_stmt(Op::LocalSet(kid, key_v));
+            self.write_symbol(kid, key_v);
         }
         // value binding
         if let Some(vname) = names.get(1) {
@@ -824,7 +1076,7 @@ impl<'a> FnLowerer<'a> {
             } else {
                 elem
             };
-            self.emit_stmt(Op::LocalSet(vid, value_v));
+            self.write_symbol(vid, value_v);
         }
 
         self.loop_exits.push(exit);
@@ -856,9 +1108,7 @@ impl<'a> FnLowerer<'a> {
             ExprKind::Str(s) => Ok(self.emit_value(Op::ConstString(s.clone()), Type::String)),
             ExprKind::Paren(inner) => self.lower_expr(inner),
             ExprKind::Name(_) => self.lower_name(expr),
-            ExprKind::Function(_) => Err(LowerError::Unsupported(
-                "anonymous functions / closures are not lowered to IR yet".into(),
-            )),
+            ExprKind::Function(body) => self.lower_closure_literal(body),
             ExprKind::Field { base, name } => self.lower_field(base, name),
             ExprKind::Index { base, index } => self.lower_index(base, index),
             ExprKind::Call { callee, args } => self.lower_call(callee, args),
@@ -886,11 +1136,7 @@ impl<'a> FnLowerer<'a> {
             .binding(expr.span)
             .ok_or_else(|| LowerError::Internal("unresolved name".into()))?;
         match binding.clone() {
-            Binding::Local(id) | Binding::Upvalue(id) => {
-                self.ensure_local(id);
-                let ty = self.locals[&id].clone();
-                Ok(self.emit_value(Op::LocalGet(id), ty))
-            }
+            Binding::Local(id) | Binding::Upvalue(id) => Ok(self.read_symbol(id)),
             Binding::TopConst(n) => {
                 let ty = self.types.constants.get(&n).cloned().unwrap_or(Type::Error);
                 Ok(self.emit_value(Op::ConstRef(n), ty))
@@ -900,7 +1146,9 @@ impl<'a> FnLowerer<'a> {
                 Ok(self.emit_value(Op::MemoryRef(n), ty))
             }
             Binding::TopFunction(_) | Binding::HostFunction(_) => Err(LowerError::Unsupported(
-                "using a function as a value (not directly calling it) is not lowered yet".into(),
+                "using a named top-level or host function as a first-class value is not \
+                 supported; only anonymous and `local function` closures are first-class"
+                    .into(),
             )),
             Binding::Builtin(ns) => Err(LowerError::Internal(format!(
                 "builtin namespace `{ns}` used as a value"
@@ -968,36 +1216,41 @@ impl<'a> FnLowerer<'a> {
                 ty,
             ));
         }
-        // Direct call of a named top-level / host function.
-        let ExprKind::Name(_) = &callee.kind else {
-            return Err(LowerError::Unsupported(
-                "only calls to named top-level or host functions are lowered to IR".into(),
-            ));
+        // Direct call of a named top-level / host function keeps the fast (typed) path.
+        if let ExprKind::Name(_) = &callee.kind {
+            match self.res.binding(callee.span).cloned() {
+                Some(Binding::TopFunction(n)) => {
+                    let argv = self.lower_args(args)?;
+                    let ty = self
+                        .types
+                        .functions
+                        .get(&n)
+                        .map(|ft| (*ft.ret).clone())
+                        .unwrap_or(Type::Error);
+                    return Ok(self.emit_value(Op::CallScript(n, argv), ty));
+                }
+                Some(Binding::HostFunction(n)) => {
+                    let argv = self.lower_args(args)?;
+                    let ty = self
+                        .cfg
+                        .host_functions
+                        .get(&n)
+                        .map(|ft| (*ft.ret).clone())
+                        .unwrap_or(Type::Error);
+                    return Ok(self.emit_value(Op::CallHost(n, argv), ty));
+                }
+                _ => {}
+            }
+        }
+        // Otherwise the callee is a first-class function value (a closure, or a fn-typed
+        // local/param/upvalue): evaluate it and call it indirectly.
+        let cv = self.lower_expr(callee)?;
+        let ret = match self.values[cv as usize].clone() {
+            Type::Function(ft) => (*ft.ret).clone(),
+            _ => Type::Error,
         };
         let argv = self.lower_args(args)?;
-        match self.res.binding(callee.span).cloned() {
-            Some(Binding::TopFunction(n)) => {
-                let ty = self
-                    .types
-                    .functions
-                    .get(&n)
-                    .map(|ft| (*ft.ret).clone())
-                    .unwrap_or(Type::Error);
-                Ok(self.emit_value(Op::CallScript(n, argv), ty))
-            }
-            Some(Binding::HostFunction(n)) => {
-                let ty = self
-                    .cfg
-                    .host_functions
-                    .get(&n)
-                    .map(|ft| (*ft.ret).clone())
-                    .unwrap_or(Type::Error);
-                Ok(self.emit_value(Op::CallHost(n, argv), ty))
-            }
-            _ => Err(LowerError::Unsupported(
-                "calling a local function value is not lowered to IR yet".into(),
-            )),
-        }
+        Ok(self.emit_value(Op::CallValue(cv, argv), ret))
     }
 
     fn lower_args(&mut self, args: &[Expr]) -> Result<Vec<ValueId>, LowerError> {
@@ -1252,6 +1505,25 @@ mod vm {
             }
         }
 
+        /// Host-invoke a closure value previously returned by a call. The closure's captured
+        /// cells are shared (by `Rc`), so upvalue writes persist across host calls.
+        pub fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RunError> {
+            let code = match &callee {
+                Value::Closure(c) => c.code.clone(),
+                other => {
+                    return Err(RunError::Internal(format!(
+                        "call_value on a {} value",
+                        other.type_name()
+                    )));
+                }
+            };
+            let func = self.lookup_function(&code)?;
+            let mut argv = Vec::with_capacity(args.len() + 1);
+            argv.push(callee);
+            argv.extend(args);
+            self.run_function(func, argv)
+        }
+
         fn lookup_function(&self, name: &str) -> Result<&'a Function, RunError> {
             self.program
                 .functions
@@ -1424,6 +1696,76 @@ mod vm {
                     .cloned()
                     .ok_or_else(|| RunError::Runtime(format!("memory `{name}` not set")))?,
                 Op::NamespaceField(ns, field) => field_value(ns, field)?,
+
+                Op::MakeCell(v) => {
+                    let val = self.val(act, *v)?;
+                    Value::Cell(std::rc::Rc::new(std::cell::RefCell::new(val)))
+                }
+                Op::CellGet(cell) => match self.val(act, *cell)? {
+                    Value::Cell(c) => c.borrow().clone(),
+                    other => {
+                        return Err(RunError::Internal(format!(
+                            "CellGet on a {} value",
+                            other.type_name()
+                        )));
+                    }
+                },
+                Op::CellSet(cell, v) => {
+                    let val = self.val(act, *v)?;
+                    match self.val(act, *cell)? {
+                        Value::Cell(c) => *c.borrow_mut() = val,
+                        other => {
+                            return Err(RunError::Internal(format!(
+                                "CellSet on a {} value",
+                                other.type_name()
+                            )));
+                        }
+                    }
+                    Value::Nil
+                }
+                Op::ClosureEnvGet(clo, i) => match self.val(act, *clo)? {
+                    Value::Closure(c) => c.env.get(*i as usize).cloned().ok_or_else(|| {
+                        RunError::Internal(format!("upvalue {i} out of range"))
+                    })?,
+                    other => {
+                        return Err(RunError::Internal(format!(
+                            "ClosureEnvGet on a {} value",
+                            other.type_name()
+                        )));
+                    }
+                },
+                Op::MakeClosure(code, cells) => {
+                    let env = cells
+                        .iter()
+                        .map(|c| self.val(act, *c))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Value::Closure(std::rc::Rc::new(crate::value::ClosureObj {
+                        code: code.clone(),
+                        env,
+                        keepalive: None,
+                    }))
+                }
+                Op::CallValue(callee, args) => {
+                    let cv = self.val(act, *callee)?;
+                    let code = match &cv {
+                        Value::Closure(c) => c.code.clone(),
+                        other => {
+                            return Err(RunError::Internal(format!(
+                                "CallValue on a {} value",
+                                other.type_name()
+                            )));
+                        }
+                    };
+                    let func = self.lookup_function(&code)?;
+                    // The closure itself is the hidden env parameter (params[0]); real args
+                    // follow.
+                    let mut argv = Vec::with_capacity(args.len() + 1);
+                    argv.push(cv);
+                    for a in args {
+                        argv.push(self.val(act, *a)?);
+                    }
+                    self.run_function(func, argv)?
+                }
             })
         }
 
@@ -1640,14 +1982,19 @@ mod tests {
     }
 
     #[test]
-    fn closures_are_rejected_by_lowering() {
-        let module =
-            crate::parse("function make(b) local f = function(x) return x + b end return f(1) end")
-                .unwrap();
-        let cfg = TypeConfig::default();
-        let res = crate::resolve::resolve(&module, &cfg.to_resolve_config()).unwrap();
-        let types = crate::types::typecheck(&module, &res, &cfg).unwrap();
-        let err = lower(&module, &res, &types, &cfg).unwrap_err();
-        assert!(matches!(err, LowerError::Unsupported(_)));
+    fn closures_are_lowered_and_lifted() {
+        let p = build(
+            "function make(b) local f = function(x) return x + b end return f(1) end",
+            &TypeConfig::default(),
+        );
+        // The anonymous function was lifted into its own IR function (synthetic `$c` name),
+        // and `make` itself verifies.
+        assert!(
+            p.functions.keys().any(|k| k.contains("$c")),
+            "expected a lifted closure function, got {:?}",
+            p.functions.keys().collect::<Vec<_>>()
+        );
+        let lifted = p.functions.values().find(|f| f.is_closure).expect("a closure fn");
+        assert!(lifted.is_closure);
     }
 }

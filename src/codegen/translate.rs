@@ -70,6 +70,36 @@ pub fn trampoline_signature(call_conv: CallConv) -> Signature {
     sig
 }
 
+/// The typed signature of a *lifted closure*: `(ctx, env, params...) -> ret`. The `env`
+/// (a `Ptr` handle to the closure value carrying the captured cells) is the closure's hidden
+/// first parameter. Used to build the `SigRef` for an indirect `call_indirect`.
+pub fn closure_signature(call_conv: CallConv, params: &[Repr], ret: Repr) -> Signature {
+    let mut sig = Signature::new(call_conv);
+    sig.params.push(AbiParam::new(types::I64)); // ctx
+    sig.params.push(AbiParam::new(types::I64)); // env (closure value handle)
+    for &p in params {
+        if let Some(t) = clif_ty(p) {
+            sig.params.push(AbiParam::new(t));
+        }
+    }
+    if let Some(t) = clif_ty(ret) {
+        sig.returns.push(AbiParam::new(t));
+    }
+    sig
+}
+
+/// The uniform env-trampoline signature: `(ctx, env, argv, argc) -> handle`. Used by the host
+/// to invoke a returned closure value ([`crate::codegen::JitModule::call_value`]).
+pub fn env_trampoline_signature(call_conv: CallConv) -> Signature {
+    let mut sig = Signature::new(call_conv);
+    sig.params.push(AbiParam::new(types::I64)); // ctx
+    sig.params.push(AbiParam::new(types::I64)); // env (closure value handle)
+    sig.params.push(AbiParam::new(types::I64)); // argv: *const u64
+    sig.params.push(AbiParam::new(types::I32)); // argc
+    sig.returns.push(AbiParam::new(types::I64)); // result handle
+    sig
+}
+
 /// Shared lookups the translator needs: shim and script-function ids.
 pub struct Context<'a> {
     pub call_conv: CallConv,
@@ -465,7 +495,64 @@ impl<'a, 'b> Translator<'a, 'b> {
                     .unwrap();
                 Some(self.unbox_handle(h, self.dest_repr(dest)))
             }
+            Op::MakeCell(v) => {
+                let h = self.box_handle(*v);
+                self.call_shim("rt_cell_new", &[self.ctx_val, h])
+            }
+            Op::CellGet(cell) => {
+                let c = self.val(*cell);
+                let h = self.call_shim("rt_cell_get", &[self.ctx_val, c]).unwrap();
+                Some(self.unbox_handle(h, self.dest_repr(dest)))
+            }
+            Op::CellSet(cell, v) => {
+                let c = self.val(*cell);
+                let h = self.box_handle(*v);
+                self.call_shim("rt_cell_set", &[self.ctx_val, c, h]);
+                None
+            }
+            Op::ClosureEnvGet(clo, i) => {
+                let c = self.val(*clo);
+                let idx = self.iconst32(*i);
+                // The result is a cell handle (a `Ptr`); never unbox it.
+                self.call_shim("rt_closure_env_get", &[self.ctx_val, c, idx])
+            }
+            Op::MakeClosure(name, cells) => Some(self.translate_make_closure(name, cells)),
+            Op::CallValue(callee, args) => self.translate_call_value(*callee, args),
         }
+    }
+
+    fn translate_make_closure(&mut self, name: &str, cells: &[ValueId]) -> ClifValue {
+        let id = self.pools.intern_closure_name(name);
+        let idc = self.iconst32(id);
+        let handles: Vec<ClifValue> = cells.iter().map(|&c| self.val(c)).collect();
+        let (base, argc) = self.arg_array(&handles);
+        self.call_shim("rt_closure_new", &[self.ctx_val, idc, base, argc])
+            .unwrap()
+    }
+
+    /// Call a closure value indirectly: resolve its lifted function's native address, then
+    /// `call_indirect` with the closure as the hidden env argument followed by the (typed)
+    /// real arguments. Mirrors [`Self::translate_call_script`]'s typed ABI.
+    fn translate_call_value(&mut self, callee: ValueId, args: &[ValueId]) -> Option<ClifValue> {
+        let clo = self.val(callee);
+        let addr = self
+            .call_shim("rt_closure_code_addr", &[self.ctx_val, clo])
+            .unwrap();
+        let (param_reprs, ret_repr) = match self.func.value_type(callee).clone() {
+            Type::Function(ft) => (
+                ft.params.iter().map(repr_of).collect::<Vec<_>>(),
+                repr_of(&ft.ret),
+            ),
+            _ => (Vec::new(), Repr::Ptr),
+        };
+        let sig = closure_signature(self.cx.call_conv, &param_reprs, ret_repr);
+        let sigref = self.builder.import_signature(sig);
+        let mut call_args = vec![self.ctx_val, clo];
+        for &a in args {
+            call_args.push(self.val(a));
+        }
+        let call = self.builder.ins().call_indirect(sigref, addr, &call_args);
+        self.builder.inst_results(call).first().copied()
     }
 
     fn translate_unary(&mut self, op: UnOp, v: ValueId) -> ClifValue {
@@ -675,6 +762,71 @@ pub fn build_trampoline(
     let (ctx, argv) = (bp[0], bp[1]);
 
     let mut call_args = vec![ctx];
+    for (i, &r) in params.iter().enumerate() {
+        let h = builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), argv, (i * 8) as i32);
+        let a = match r {
+            Repr::Number => {
+                let f = module.declare_func_in_func(shims["rt_unbox_number"], builder.func);
+                let c = builder.ins().call(f, &[ctx, h]);
+                builder.inst_results(c)[0]
+            }
+            Repr::Bool => {
+                let f = module.declare_func_in_func(shims["rt_unbox_bool"], builder.func);
+                let c = builder.ins().call(f, &[ctx, h]);
+                builder.inst_results(c)[0]
+            }
+            Repr::Ptr => h,
+            Repr::Unit => continue,
+        };
+        call_args.push(a);
+    }
+
+    let fref = module.declare_func_in_func(typed_id, builder.func);
+    let call = builder.ins().call(fref, &call_args);
+    let res = builder.inst_results(call).first().copied();
+
+    let out = match ret {
+        Repr::Number => {
+            let f = module.declare_func_in_func(shims["rt_box_number"], builder.func);
+            let c = builder.ins().call(f, &[ctx, res.unwrap()]);
+            builder.inst_results(c)[0]
+        }
+        Repr::Bool => {
+            let f = module.declare_func_in_func(shims["rt_box_bool"], builder.func);
+            let c = builder.ins().call(f, &[ctx, res.unwrap()]);
+            builder.inst_results(c)[0]
+        }
+        Repr::Ptr => res.unwrap(),
+        Repr::Unit => builder.ins().iconst(types::I64, 0),
+    };
+    builder.ins().return_(&[out]);
+    builder.seal_all_blocks();
+    builder.finalize();
+}
+
+/// Build an env-trampoline `(ctx, env, argv, argc) -> handle` for a lifted closure: like
+/// [`build_trampoline`] but threading the closure value `env` through as the typed function's
+/// hidden first argument. Used by the host to invoke a returned closure
+/// ([`crate::codegen::JitModule::call_value`]). `params` are the *source-level* parameters
+/// (excluding the env).
+#[allow(clippy::too_many_arguments)]
+pub fn build_env_trampoline(
+    mut builder: FunctionBuilder<'_>,
+    module: &mut dyn Module,
+    shims: &HashMap<&'static str, FuncId>,
+    typed_id: FuncId,
+    params: &[Repr],
+    ret: Repr,
+) {
+    let entry = builder.create_block();
+    builder.append_block_params_for_function_params(entry);
+    builder.switch_to_block(entry);
+    let bp = builder.block_params(entry).to_vec();
+    let (ctx, env, argv) = (bp[0], bp[1], bp[2]);
+
+    let mut call_args = vec![ctx, env];
     for (i, &r) in params.iter().enumerate() {
         let h = builder
             .ins()

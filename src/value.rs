@@ -25,6 +25,8 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::rc::Rc;
+#[cfg(feature = "interp")]
+use std::any::Any;
 
 use crate::runtime::builtins::num_to_string;
 
@@ -74,6 +76,32 @@ pub enum Value {
     /// A host-registered native function captured as a value (interpreter only).
     #[cfg(feature = "interp")]
     Native(NativeFn),
+    /// A boxed, shared, mutable cell — the runtime form of a captured upvalue used by the IR
+    /// VM and the JIT. (The tree-walking interpreter uses its own `Slot` type instead and
+    /// never produces this variant.) Sharing the `Rc<RefCell<_>>` is what makes upvalue
+    /// writes visible to the enclosing scope and to sibling closures.
+    #[cfg(feature = "interp")]
+    Cell(Rc<RefCell<Value>>),
+    /// A closure value produced by the IR VM / JIT: a lifted function plus its captured
+    /// upvalue cells. The interpreter represents closures as [`Value::Function`] instead.
+    #[cfg(feature = "interp")]
+    Closure(Rc<ClosureObj>),
+}
+
+/// The payload of a [`Value::Closure`]: which lifted function to run and the cells it
+/// captured. Produced by the IR VM and the JIT (not the tree-walking interpreter).
+#[cfg(feature = "interp")]
+pub struct ClosureObj {
+    /// The lifted top-level function's synthetic name — resolved by the IR VM via
+    /// `Program::functions` and by the JIT via its name → trampoline maps.
+    pub code: String,
+    /// The captured upvalue cells, in the lifted function's env order (each a
+    /// [`Value::Cell`]).
+    pub env: Vec<Value>,
+    /// Keeps the backing native code mapped for as long as this closure is reachable, so a
+    /// closure returned to the host outlives the call that built it without dangling. `None`
+    /// for the IR VM (no native code); `Some` for the JIT (an `Rc` to the compiled module).
+    pub keepalive: Option<Rc<dyn Any>>,
 }
 
 impl Value {
@@ -143,7 +171,9 @@ impl Value {
             Value::Array(_) => "array",
             Value::Table(_) => "table",
             #[cfg(feature = "interp")]
-            Value::Function(_) | Value::Native(_) => "function",
+            Value::Function(_) | Value::Native(_) | Value::Closure(_) => "function",
+            #[cfg(feature = "interp")]
+            Value::Cell(_) => "cell",
         }
     }
 }
@@ -184,7 +214,9 @@ impl fmt::Display for Value {
                 f.write_str("}")
             }
             #[cfg(feature = "interp")]
-            Value::Function(_) | Value::Native(_) => f.write_str("function"),
+            Value::Function(_) | Value::Native(_) | Value::Closure(_) => f.write_str("function"),
+            #[cfg(feature = "interp")]
+            Value::Cell(c) => write!(f, "{}", c.borrow()),
         }
     }
 }
@@ -227,9 +259,11 @@ impl serde::Serialize for Value {
                 map.end()
             }
             #[cfg(feature = "interp")]
-            Value::Function(_) | Value::Native(_) => Err(serde::ser::Error::custom(
-                "cannot serialize a function value",
-            )),
+            Value::Function(_) | Value::Native(_) | Value::Closure(_) => Err(
+                serde::ser::Error::custom("cannot serialize a function value"),
+            ),
+            #[cfg(feature = "interp")]
+            Value::Cell(_) => Err(serde::ser::Error::custom("cannot serialize a cell value")),
         }
     }
 }

@@ -345,8 +345,16 @@ end
   silently truncate extra values or pad missing ones with `nil` — a mismatch is a compile
   error.
 - Anonymous `function … end` expressions (closures) are allowed **inside** function
-  bodies; they may capture enclosing locals. They live in the per-call arena and **cannot
-  be persisted** across invocations or stored into host memory.
+  bodies; they may capture enclosing locals (their *upvalues*). Captured variables are shared
+  mutable cells: a write through one closure is observed by the enclosing scope and by sibling
+  closures.
+- A closure is a **first-class value**: it may be returned (including across the host
+  boundary) and held by the host, which can re-invoke it later — multiple times, observing
+  mutations to its upvalues between calls (`Module::call_value`). A returned closure keeps its
+  backing code and captured state alive for as long as the host holds it.
+- A closure still **cannot be persisted** into host memory or serialized — that would require
+  capturing native-code identity and live captured state; closures are confined to the
+  in-process value graph.
 
 ### 5.6 Annotations (optional)
 
