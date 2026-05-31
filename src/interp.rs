@@ -22,7 +22,9 @@
 //!   callable (a script function/closure or a host native function).
 //! * Each function activation gets a fresh [`Frame`] keyed by [`SymbolId`]. Block scoping
 //!   is already resolved into unique symbol ids, so one flat frame per call is sufficient.
-//!   Closures capture the enclosing frame chain by `Rc`.
+//!   A closure captures the individual [`Slot`]s of its free variables (its upvalues),
+//!   not the enclosing frames — capturing whole frames would create `Rc` reference cycles
+//!   whenever a closure is stored back into a frame it reads an upvalue from.
 //! * `return`/`break` propagate via [`Flow`].
 //! * Host state is injected after construction: [`Interpreter::set_host_function`] and
 //!   [`Interpreter::set_memory`]. Memory tables are shared by `Rc`, so script mutations are
@@ -33,7 +35,7 @@
 //! errors, since the checker should have rejected them.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ast::*;
@@ -42,18 +44,37 @@ use crate::resolve::{Binding, Resolution, ResolveConfig, SymbolId};
 use crate::runtime::builtins::{field_value, member_call, num_to_string, value_call};
 use crate::value::{RunError, Value};
 
-/// A script function: its parameter symbols, body, and (for closures) the captured frame
-/// chain. Top-level functions capture nothing.
+/// A script function: its parameter symbols, body, and (for closures) the captured
+/// upvalue slots. Top-level functions capture nothing.
 pub struct Func {
     params: Vec<SymbolId>,
     body: Rc<FuncBody>,
-    captured: Vec<Frame>,
+    /// The closure's free variables, each captured as the *individual* slot it refers to
+    /// (see [`Slot`]) rather than the whole enclosing frame.
+    captured: Frame,
 }
 
-type Frame = Rc<RefCell<HashMap<SymbolId, Value>>>;
+/// A single variable's storage: a shared, mutable cell.
+///
+/// Closures capture the individual slots of their free variables, *not* the frames those
+/// variables live in. This is what keeps the interpreter leak-free: a closure routinely
+/// gets stored back into a frame it also reads an upvalue from (`local f = function() ...
+/// base ... end`). Capturing the whole frame would make `frame -> f -> frame.clone()` a
+/// reference cycle that `Rc` can never reclaim, so every such closure would leak its
+/// frame (and everything that frame transitively owns). Capturing just the `base` slot
+/// keeps the upvalue shared-by-reference — writes through it are still observed by the
+/// enclosing scope and by sibling closures — while letting the frame and the closure drop
+/// normally once nothing outside still holds them.
+type Slot = Rc<RefCell<Value>>;
+
+/// One activation's variables, keyed by resolved [`SymbolId`]. A call owns one of these
+/// for its params/locals; a closure additionally carries a `captured` frame of the
+/// upvalue slots it uses. Frames are owned outright (not shared) — only the individual
+/// [`Slot`]s inside them are shared, and only with the closures that capture them.
+type Frame = HashMap<SymbolId, Slot>;
 
 fn new_frame() -> Frame {
-    Rc::new(RefCell::new(HashMap::new()))
+    HashMap::new()
 }
 
 /// Control-flow signal threaded out of statement/block execution.
@@ -120,7 +141,7 @@ impl<'a> Interpreter<'a> {
                 let func = Func {
                     params: self.param_ids(&f.body),
                     body: Rc::new(f.body.clone()),
-                    captured: Vec::new(),
+                    captured: Frame::new(),
                 };
                 self.funcs
                     .insert(f.name.node.clone(), Value::Function(Rc::new(func)));
@@ -198,12 +219,15 @@ impl<'a> Interpreter<'a> {
             Value::Native(f) => f(&args),
             Value::Function(func) => {
                 let func = Rc::clone(func);
-                let mut frame_map: HashMap<SymbolId, Value> = HashMap::new();
+                let mut activation: Frame = HashMap::new();
                 for (i, &pid) in func.params.iter().enumerate() {
-                    frame_map.insert(pid, args.get(i).cloned().unwrap_or(Value::Nil));
+                    let arg = args.get(i).cloned().unwrap_or(Value::Nil);
+                    activation.insert(pid, Rc::new(RefCell::new(arg)));
                 }
-                let mut new_env = func.captured.clone();
-                new_env.push(Rc::new(RefCell::new(frame_map)));
+                // The closure's environment is its captured upvalue slots (outer) plus this
+                // call's own activation frame (inner). Cloning `captured` copies the slot
+                // handles, not the cells, so upvalue writes still reach the shared cells.
+                let new_env = vec![func.captured.clone(), activation];
 
                 let saved = std::mem::replace(&mut self.env, new_env);
                 let result = self.exec_block(&func.body.block);
@@ -261,7 +285,7 @@ impl<'a> Interpreter<'a> {
                 let func = Func {
                     params: self.param_ids(body),
                     body: Rc::new(body.clone()),
-                    captured: self.env.clone(),
+                    captured: self.capture_env(body),
                 };
                 let v = Value::Function(Rc::new(func));
                 self.assign_symbol(name.span, v)?;
@@ -413,16 +437,25 @@ impl<'a> Interpreter<'a> {
     // ---- environment ---------------------------------------------------------
 
     /// Introduce or rebind a symbol in the current (innermost) frame.
+    ///
+    /// Re-declaring an existing symbol (a loop variable on each iteration, say) reuses its
+    /// slot rather than allocating a fresh one, so any closure already capturing that slot
+    /// keeps observing the live binding — matching the previous whole-frame behavior.
     fn declare(&mut self, name: &Ident, value: Value) -> Result<(), RunError> {
         let id = self
             .res
             .def(name.span)
             .ok_or_else(|| RunError::Internal(format!("no symbol id for `{}`", name.node)))?;
-        self.env
-            .last()
-            .ok_or_else(|| RunError::Internal("declare with no active frame".into()))?
-            .borrow_mut()
-            .insert(id, value);
+        let frame = self
+            .env
+            .last_mut()
+            .ok_or_else(|| RunError::Internal("declare with no active frame".into()))?;
+        match frame.get(&id).cloned() {
+            Some(slot) => *slot.borrow_mut() = value,
+            None => {
+                frame.insert(id, Rc::new(RefCell::new(value)));
+            }
+        }
         Ok(())
     }
 
@@ -443,27 +476,48 @@ impl<'a> Interpreter<'a> {
             .ok_or_else(|| RunError::Internal("assignment to unresolved symbol".into()))?;
 
         for frame in self.env.iter().rev() {
-            if frame.borrow().contains_key(&id) {
-                frame.borrow_mut().insert(id, value);
+            if let Some(slot) = frame.get(&id) {
+                *slot.borrow_mut() = value;
                 return Ok(());
             }
         }
         // Not yet present (e.g. first assignment to a same-frame local): bind innermost.
         self.env
-            .last()
+            .last_mut()
             .ok_or_else(|| RunError::Internal("assign with no active frame".into()))?
-            .borrow_mut()
-            .insert(id, value);
+            .insert(id, Rc::new(RefCell::new(value)));
         Ok(())
     }
 
     fn lookup_symbol(&self, id: SymbolId) -> Option<Value> {
         for frame in self.env.iter().rev() {
-            if let Some(v) = frame.borrow().get(&id) {
-                return Some(v.clone());
+            if let Some(slot) = frame.get(&id) {
+                return Some(slot.borrow().clone());
             }
         }
         None
+    }
+
+    /// Find the live [`Slot`] for `id` in the current environment, if any.
+    fn find_slot(&self, id: SymbolId) -> Option<Slot> {
+        self.env
+            .iter()
+            .rev()
+            .find_map(|frame| frame.get(&id).map(Rc::clone))
+    }
+
+    /// Build the captured environment for a closure whose body is `body`: the slots of the
+    /// free variables it (or any function nested in it) refers to. We collect every
+    /// in-function symbol id the body mentions and keep those that currently resolve to a
+    /// live slot — i.e. genuine upvalues from the enclosing scope. The closure's own
+    /// params/locals (and those of nested closures) are not in scope yet, so they are
+    /// naturally excluded and materialized later when their defining call runs.
+    fn capture_env(&self, body: &FuncBody) -> Frame {
+        let mut ids = HashSet::new();
+        collect_body_ids(self.res, body, &mut ids);
+        ids.into_iter()
+            .filter_map(|id| self.find_slot(id).map(|slot| (id, slot)))
+            .collect()
     }
 
     // ---- assignment targets --------------------------------------------------
@@ -574,7 +628,7 @@ impl<'a> Interpreter<'a> {
                 let func = Func {
                     params: self.param_ids(body),
                     body: Rc::new(body.clone()),
-                    captured: self.env.clone(),
+                    captured: self.capture_env(body),
                 };
                 Ok(Value::Function(Rc::new(func)))
             }
@@ -811,6 +865,152 @@ impl<'a> Interpreter<'a> {
     }
 }
 
+// ---- free-variable collection (closure capture) -----------------------------
+//
+// Walk a function body and gather every in-function [`SymbolId`] it references — both its
+// own locals/params and its upvalues, *including* those reached only through nested
+// function literals (a nested closure's upvalues must flow through the enclosing closure's
+// capture). `capture_env` then keeps just the ids that currently resolve to a live slot,
+// which are precisely this closure's upvalues.
+
+fn collect_body_ids(res: &Resolution, body: &FuncBody, out: &mut HashSet<SymbolId>) {
+    collect_block_ids(res, &body.block, out);
+}
+
+fn collect_block_ids(res: &Resolution, block: &Block, out: &mut HashSet<SymbolId>) {
+    for stat in &block.stats {
+        collect_stat_ids(res, stat, out);
+    }
+    if let Some(ret) = &block.ret {
+        for e in &ret.exprs {
+            collect_expr_ids(res, e, out);
+        }
+    }
+}
+
+fn collect_stat_ids(res: &Resolution, stat: &Stat, out: &mut HashSet<SymbolId>) {
+    match &stat.kind {
+        StatKind::Empty | StatKind::Break => {}
+        StatKind::Local { exprs, .. } => {
+            for e in exprs {
+                collect_expr_ids(res, e, out);
+            }
+        }
+        StatKind::LocalFunction { body, .. } => collect_block_ids(res, &body.block, out),
+        StatKind::Assign { targets, exprs } => {
+            for t in targets {
+                collect_target_ids(res, t, out);
+            }
+            for e in exprs {
+                collect_expr_ids(res, e, out);
+            }
+        }
+        StatKind::Call(e) => collect_expr_ids(res, e, out),
+        StatKind::Do(block) => collect_block_ids(res, block, out),
+        StatKind::While { cond, body } => {
+            collect_expr_ids(res, cond, out);
+            collect_block_ids(res, body, out);
+        }
+        StatKind::If { arms, else_block } => {
+            for (cond, block) in arms {
+                collect_expr_ids(res, cond, out);
+                collect_block_ids(res, block, out);
+            }
+            if let Some(block) = else_block {
+                collect_block_ids(res, block, out);
+            }
+        }
+        StatKind::NumericFor {
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            collect_expr_ids(res, start, out);
+            collect_expr_ids(res, end, out);
+            if let Some(step) = step {
+                collect_expr_ids(res, step, out);
+            }
+            collect_block_ids(res, body, out);
+        }
+        StatKind::GenericFor { iter, body, .. } => {
+            match iter {
+                IterExpr::IPairs { arg, .. } | IterExpr::Pairs { arg, .. } => {
+                    collect_expr_ids(res, arg, out)
+                }
+            }
+            collect_block_ids(res, body, out);
+        }
+    }
+}
+
+/// An assignment target: a name write (whose symbol must be captured so the write reaches
+/// the shared slot) or a field/index whose base is an ordinary expression.
+fn collect_target_ids(res: &Resolution, expr: &Expr, out: &mut HashSet<SymbolId>) {
+    match &expr.kind {
+        ExprKind::Name(_) => collect_name_id(res, expr, out),
+        ExprKind::Field { base, .. } => collect_expr_ids(res, base, out),
+        ExprKind::Index { base, index } => {
+            collect_expr_ids(res, base, out);
+            collect_expr_ids(res, index, out);
+        }
+        _ => collect_expr_ids(res, expr, out),
+    }
+}
+
+fn collect_expr_ids(res: &Resolution, expr: &Expr, out: &mut HashSet<SymbolId>) {
+    match &expr.kind {
+        ExprKind::Nil | ExprKind::Bool(_) | ExprKind::Number(_) | ExprKind::Str(_) => {}
+        ExprKind::Name(_) => collect_name_id(res, expr, out),
+        // Recurse into nested functions: their upvalues are this closure's responsibility
+        // to carry, so they must be captured here too.
+        ExprKind::Function(body) => collect_block_ids(res, &body.block, out),
+        ExprKind::Index { base, index } => {
+            collect_expr_ids(res, base, out);
+            collect_expr_ids(res, index, out);
+        }
+        ExprKind::Field { base, .. } => collect_expr_ids(res, base, out),
+        ExprKind::Call { callee, args } => {
+            collect_expr_ids(res, callee, out);
+            for a in args {
+                collect_expr_ids(res, a, out);
+            }
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            collect_expr_ids(res, receiver, out);
+            for a in args {
+                collect_expr_ids(res, a, out);
+            }
+        }
+        ExprKind::Table(fields) => {
+            for field in fields {
+                match field {
+                    Field::Positional(e) => collect_expr_ids(res, e, out),
+                    Field::Named { value, .. } => collect_expr_ids(res, value, out),
+                    Field::Keyed { key, value } => {
+                        collect_expr_ids(res, key, out);
+                        collect_expr_ids(res, value, out);
+                    }
+                }
+            }
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_expr_ids(res, lhs, out);
+            collect_expr_ids(res, rhs, out);
+        }
+        ExprKind::Unary { operand, .. } => collect_expr_ids(res, operand, out),
+        ExprKind::Paren(inner) => collect_expr_ids(res, inner, out),
+    }
+}
+
+/// Record the symbol id of a name use if it resolves to an in-function binding.
+fn collect_name_id(res: &Resolution, expr: &Expr, out: &mut HashSet<SymbolId>) {
+    if let Some(Binding::Local(id) | Binding::Upvalue(id)) = res.binding(expr.span) {
+        out.insert(*id);
+    }
+}
+
 // ---- builtin helpers --------------------------------------------------------
 
 fn number(v: &Value) -> Result<f64, RunError> {
@@ -943,6 +1143,38 @@ mod tests {
                    end";
         let v = run_call(src, &empty(), "make", vec![Value::Number(5.0)]).unwrap();
         assert_eq!(v.as_f64(), Some(15.0));
+    }
+
+    #[test]
+    fn closure_escapes_its_defining_frame() {
+        // The closure returned by `make_adder` outlives `make_adder`'s activation, so the
+        // captured `n` slot must stay alive past the inner return. Per-slot capture keeps
+        // exactly that slot reachable (and nothing more) — no leaked frame, no dangling
+        // upvalue.
+        let src = "function make_adder(n)\n\
+                     return function(x) return x + n end\n\
+                   end\n\
+                   function use()\n\
+                     local add5 = make_adder(5)\n\
+                     return add5(10)\n\
+                   end";
+        let v = run_call(src, &empty(), "use", vec![]).unwrap();
+        assert_eq!(v.as_f64(), Some(15.0));
+    }
+
+    #[test]
+    fn closure_writes_propagate_through_shared_upvalue() {
+        // Two calls to the same closure must observe each other's writes to the captured
+        // `n` — capture is by shared slot, not by value snapshot.
+        let src = "function counter()\n\
+                     local n = 0\n\
+                     local inc = function() n = n + 1 return n end\n\
+                     local a = inc()\n\
+                     local b = inc()\n\
+                     return a + b\n\
+                   end";
+        let v = run_call(src, &empty(), "counter", vec![]).unwrap();
+        assert_eq!(v.as_f64(), Some(3.0)); // 1 + 2
     }
 
     #[test]

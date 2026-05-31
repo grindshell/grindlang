@@ -665,7 +665,27 @@ fn parse_hex_number(hex: &str) -> Option<f64> {
         value += hex_val(c) as f64 * scale;
         scale /= 16.0;
     }
-    Some(value * 2f64.powi(exp))
+    Some(scale_pow2(value, exp))
+}
+
+/// Multiply `value` by `2^exp`, exactly.
+///
+/// Doubling or halving an `f64` only shifts its exponent field, so each step is exact and
+/// IEEE-mandated (no rounding until the result over/underflows). We deliberately avoid
+/// `f64::powi`/`powf`, which are documented as *not* guaranteed to be correctly rounded:
+/// `2f64.powi(4)` need not equal exactly `16.0`. That latent dependence is invisible under
+/// native libm but surfaces under Miri, which intentionally perturbs imprecise math
+/// intrinsics by up to 1 ULP — there `0x1p4` would otherwise lex to `16.000000000000007`.
+///
+/// The step count is capped at the `f64` exponent span (~2098): beyond it the result has
+/// already saturated to ±0 or ±∞, so further steps cannot change it (and the cap keeps a
+/// pathologically large exponent from spinning).
+fn scale_pow2(mut value: f64, exp: i32) -> f64 {
+    let factor = if exp >= 0 { 2.0 } else { 0.5 };
+    for _ in 0..exp.unsigned_abs().min(2100) {
+        value *= factor;
+    }
+    value
 }
 
 #[cfg(test)]
@@ -721,9 +741,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
-    fn lexes_numbers_with_slight_floating_point_error() {
+    fn lexes_hex_floats() {
+        // Binary-exponent scaling is exact (no `powi` rounding), so these hold on every
+        // platform and under Miri — `0x1p4` used to lex to 16.000000000000007 under Miri.
         assert_eq!(kinds("0x1p4"), vec![TokenKind::Number(16.0)]);
+        assert_eq!(kinds("0x1.8p1"), vec![TokenKind::Number(3.0)]); // 1.5 * 2
+        assert_eq!(kinds("0x1p-1"), vec![TokenKind::Number(0.5)]);
     }
 
     #[test]
