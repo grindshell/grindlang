@@ -13,9 +13,18 @@ default = ["interp"]
 # Reference tree-walking interpreter (semantics oracle + debug execution).
 interp = []
 
-# Cranelift JIT backend. No-op for now; cranelift-* deps are added in Phase 7 and
-# wired here so the rest of the crate stays insulated from backend churn.
-jit = []
+# Cranelift JIT backend (Phase 7). Compiles the typed IR to native code. The hybrid value
+# model passes numbers/bools as unboxed f64/i8 and reference values as i64 handles into a
+# per-call runtime context, so reference ops call back into the shared runtime — which uses
+# `interp::Value`; hence `jit` implies `interp`.
+jit = [
+    "interp",
+    "dep:cranelift-codegen",
+    "dep:cranelift-frontend",
+    "dep:cranelift-module",
+    "dep:cranelift-jit",
+    "dep:cranelift-native",
+]
 
 # serde marshaling of values / export signatures across process boundaries.
 serde = ["dep:serde"]
@@ -23,5 +32,11 @@ serde = ["dep:serde"]
 [dependencies]
 thiserror = "2"
 serde = { version = "1", features = ["derive"], optional = true }
+
+cranelift-codegen = { version = "0.132", optional = true }
+cranelift-frontend = { version = "0.132", optional = true }
+cranelift-module = { version = "0.132", optional = true }
+cranelift-jit = { version = "0.132", optional = true }
+cranelift-native = { version = "0.132", optional = true }
 
 [dev-dependencies]

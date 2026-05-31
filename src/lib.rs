@@ -16,9 +16,10 @@
 //! * Phase 3: static type inference & checking.
 //! * Phase 4: reference interpreter (semantics oracle).
 //! * Phase 5: mid-level typed IR + lowering.
-//! * **Phase 6 (current):** runtime & host ABI ([`runtime`]) — value representation, arena,
-//!   heap layouts, host calling convention, and the builtin catalog.
-//! * Phase 7: cranelift JIT.
+//! * Phase 6: runtime & host ABI ([`runtime`]) — value representation, arena, heap layouts,
+//!   host calling convention, and the builtin catalog.
+//! * **Phase 7 (current):** cranelift JIT ([`codegen`], `jit` feature) — compiles the IR to
+//!   native code via a hybrid value model (unboxed scalars, handle-based reference values).
 //! * Phase 8–9: host embedding API, hardening, docs.
 //!
 //! ## Front-end entry points
@@ -42,6 +43,9 @@ pub mod types;
 #[cfg(feature = "interp")]
 pub mod interp;
 
+#[cfg(feature = "jit")]
+pub mod codegen;
+
 pub use ast::Module;
 pub use diagnostics::{Diagnostic, Diagnostics, Severity, Span};
 pub use ir::{LowerError, Program};
@@ -51,6 +55,9 @@ pub use types::{FnType, Type, TypeConfig, TypeInfo};
 
 #[cfg(feature = "interp")]
 pub use interp::{Interpreter, RunError, Value};
+
+#[cfg(feature = "jit")]
+pub use codegen::{JitError, JitModule};
 
 /// Lex and parse Grindlang source into an untyped [`ast::Module`].
 ///

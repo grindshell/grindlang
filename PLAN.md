@@ -177,7 +177,7 @@ Each phase is independently testable and leaves the crate green
 - Keep IR backend-agnostic (interpreter can optionally run it too, tightening the oracle).
 - **Exit:** IR builder + verifier; IR-level tests.
 
-### Phase 6 — Runtime & memory model
+### Phase 6 — Runtime & memory model  ✅ done (`src/runtime/`, ABI-first)
 - **Arena allocator** (bump, reset per invocation). String repr (immutable bytes in
   arena; consider interning for constants). Record/array/map memory layouts.
 - **Host ABI:** calling convention for registered Rust functions; the **memory userdata
@@ -186,13 +186,43 @@ Each phase is independently testable and leaves the crate green
   (no global stdlib namespace pollution; deterministic only).
 - **Exit:** runtime callable from the interpreter; ABI documented and tested.
 
-### Phase 7 — Cranelift codegen / JIT
+> **Delivered (ABI-first; raw-pointer/`unsafe` arena addresses deferred to Phase 7).**
+> `src/runtime/` defines the value representation (`repr`: `Slot`/`Repr` — `number→f64`,
+> `bool→i8`, references/optionals→`i64` arena handles), a reset-per-invocation bump `Arena`
+> (offset-based, capacity-retaining), `#[repr(C)]` heap layouts for string/array/map/record
+> (`layout`), the host calling convention `FnAbi` + memory userdata `MemorySchema` (`host`),
+> and the **single-source-of-truth builtin catalog** (`builtins`) — signatures consumed by
+> the checker and IR lowering, reference impls run by both interpreters. The previously
+> duplicated builtin signature tables were collapsed onto the catalog. Tested via the runtime
+> unit tests, `tests/runtime_abi.rs`, and the existing interpreter/differential suites (which
+> now dispatch builtins through the runtime). Documented in the `runtime` module rustdoc.
+
+### Phase 7 — Cranelift codegen / JIT  ✅ done (`src/codegen/`, `jit` feature)
 - Map IR → cranelift IR per function. Value reprs: `f64` for number, `i8` for bool,
   `i64` pointers for string/table/userdata. Wire calling convention, host-fn trampolines,
   memory accessors, builtins, and trap → `Err` translation.
 - `JITModule` build/finalize → native function pointers held by `Module`.
 - **Exit:** JIT path passes the **same** test suite as the interpreter via differential
   testing (interp result == jit result for a large corpus, incl. fuzzed inputs).
+
+> **Delivered (hybrid value model — stakeholder decision).** `src/codegen/` (gated `jit`,
+> cranelift 0.132) compiles the typed IR to native code. Numbers/bools flow **unboxed**
+> (`f64`/`i8`) so arithmetic, comparisons, branches, loops, and numeric-for are genuinely
+> native cranelift; **reference values flow as `i64` handles** into a per-call runtime
+> context (`codegen::rt::RtCtx`) that stores `interp::Value`, and reference ops
+> (MakeArray/FieldGet/MapGet/builtins/host/memory) lower to `extern "C"` calls into `rt_*`
+> shims — heap correctness delegated to the proven runtime. The ctx is a hidden first param;
+> each export gets a uniform `(ctx, argv, argc) -> handle` trampoline. Errors: shims record
+> the first `RunError` in the ctx and return a null/`ERR` sentinel; loop back-edges check
+> `rt_errored` and divert to a per-function error-exit; the driver reports `ctx.error` after
+> the call. `JitModule` mirrors the `Vm`/`Interpreter` surface
+> (`set_host_function`/`set_memory`/`memory`/`call`). **Validated** by
+> `tests/jit_differential.rs` (JIT == AST == IR over the corpus — the third oracle) and
+> `tests/jit_fuzz.rs` (a deterministic LCG drives ~2,500 randomized inputs). Deferred to
+> future work (unchanged): closures/upvalues, calling function values, method calls, and the
+> full native arena (raw-pointer `#[repr(C)]` layouts) — the handle runtime is incrementally
+> upgradable to it later. The ABI/value-model contract is documented in the `codegen` and
+> `runtime` module rustdoc (`SPEC.md` stays the author-facing language contract, §1–§9).
 
 ### Phase 8 — Host embedding API
 - `Engine` (owns cranelift/JIT context, builtin registry), `Module` (compiled script +
