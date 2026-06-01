@@ -353,6 +353,7 @@ impl JitModule {
             };
 
         let argv = encode_args(ctx, params, args);
+        let argv = argv.as_slice();
         // SAFETY: `tramp` has the `TrampFn` ABI; `ctx` outlives the call; `argv` holds one
         // bits-ABI word per declared parameter.
         let result = unsafe { tramp(ctx as *mut RtCtx, argv.as_ptr(), argv.len() as u32) };
@@ -405,6 +406,7 @@ impl JitModule {
         // The closure itself is the env argument (it carries the captured cells).
         let env = ctx.intern(callee);
         let argv = encode_args(ctx, params, args);
+        let argv = argv.as_slice();
         // SAFETY: `tramp` has the `EnvTrampFn` ABI; `ctx` outlives the call; `argv` holds one
         // bits-ABI word per declared (source-level) parameter.
         let result = unsafe { tramp(ctx as *mut RtCtx, env, argv.as_ptr(), argv.len() as u32) };
@@ -473,16 +475,48 @@ impl JitModule {
     }
 }
 
+/// Inline capacity for the argument buffer. Calls with this many parameters or fewer (the
+/// overwhelming majority — calc/decision functions take a handful of args) encode their args
+/// on the stack, avoiding a per-call heap allocation in the hot path.
+const INLINE_ARGS: usize = 8;
+
+/// The bits-ABI argument buffer for one call: stack-resident for small arities, heap-backed
+/// only when a function has more than [`INLINE_ARGS`] parameters. Either way it owns the
+/// storage so its [`as_slice`](Self::as_slice) pointer stays valid for the trampoline call.
+enum ArgBuf {
+    Inline([u64; INLINE_ARGS], usize),
+    Heap(Vec<u64>),
+}
+
+impl ArgBuf {
+    fn as_slice(&self) -> &[u64] {
+        match self {
+            ArgBuf::Inline(a, n) => &a[..*n],
+            ArgBuf::Heap(v) => v,
+        }
+    }
+}
+
 /// Encode call arguments into the bits-ABI buffer the trampolines read: exactly one 64-bit
 /// word per declared parameter (scalars as raw bits via [`RtCtx::encode_arg`], reference
 /// values interned to handles). Surplus arguments are ignored and missing ones default to
 /// `nil`, so the buffer length always matches the parameter count the trampoline expects.
-fn encode_args(ctx: &mut RtCtx, params: &[Repr], args: Vec<Value>) -> Vec<u64> {
+fn encode_args(ctx: &mut RtCtx, params: &[Repr], args: Vec<Value>) -> ArgBuf {
     let mut args = args.into_iter();
-    params
-        .iter()
-        .map(|&r| ctx.encode_arg(args.next().unwrap_or(Value::Nil), r))
-        .collect()
+    if params.len() <= INLINE_ARGS {
+        let mut buf = [0u64; INLINE_ARGS];
+        for (slot, &r) in buf.iter_mut().zip(params) {
+            *slot = ctx.encode_arg(args.next().unwrap_or(Value::Nil), r);
+        }
+        ArgBuf::Inline(buf, params.len())
+    } else {
+        ArgBuf::Heap(
+            params
+                .iter()
+                .map(|&r| ctx.encode_arg(args.next().unwrap_or(Value::Nil), r))
+                .collect(),
+        )
+    }
 }
 
 /// Build a clif [`Signature`] from raw clif types.
