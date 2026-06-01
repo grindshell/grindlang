@@ -9,7 +9,7 @@
 //! exports many times. State persists between calls only through host-provided memory.
 //!
 //! See `SPEC.md` for the language definition and `PLAN.md` for the implementation
-//! roadmap. This crate is being built in phases:
+//! roadmap. The crate was built in phases, all delivered:
 //!
 //! * Phase 0–1: diagnostics, lexer, AST, parser.
 //! * Phase 2: resolver + constraint enforcement.
@@ -18,9 +18,12 @@
 //! * Phase 5: mid-level typed IR + lowering.
 //! * Phase 6: runtime & host ABI ([`runtime`]) — value representation, arena, heap layouts,
 //!   host calling convention, and the builtin catalog.
-//! * **Phase 7 (current):** cranelift JIT ([`codegen`], `jit` feature) — compiles the IR to
-//!   native code via a hybrid value model (unboxed scalars, handle-based reference values).
-//! * Phase 8–9: host embedding API, hardening, docs.
+//! * Phase 7: cranelift JIT ([`codegen`], `jit` feature) — compiles the IR to native code via
+//!   a hybrid value model (unboxed scalars, handle-based reference values). Closures with
+//!   upvalues and calling first-class function values are supported.
+//! * Phase 8: host embedding API ([`api`], `jit` feature).
+//! * Phase 9: hardening, tooling, and docs — differential/fuzz/property tests, benchmarks, the
+//!   `embed` example, and the `grindlang` CLI runner.
 //!
 //! ## Front-end entry points
 //!

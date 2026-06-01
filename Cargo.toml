@@ -27,12 +27,15 @@ jit = [
     "dep:cranelift-native",
 ]
 
-# serde marshaling of values / export signatures across process boundaries.
-serde = ["dep:serde"]
+# serde marshaling of values / export signatures across process boundaries, and serde derives
+# on the IR (`ir::Program`) so a compiled module can be cached to / loaded from disk (the CLI
+# runner's `--cache`). `serde_json` is the on-disk format.
+serde = ["dep:serde", "dep:serde_json"]
 
 [dependencies]
 thiserror = "2"
 serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 cranelift-codegen = { version = "0.132", optional = true }
 cranelift-frontend = { version = "0.132", optional = true }
@@ -41,15 +44,22 @@ cranelift-jit = { version = "0.132", optional = true }
 cranelift-native = { version = "0.132", optional = true }
 
 [dev-dependencies]
-# For the `serde` round-trip test (gated on the `serde` feature in the test itself).
-serde_json = "1"
-# Phase 9 hardening/tooling.
+# Phase 9 hardening/tooling. (`serde_json` is a normal optional dep enabled by the `serde`
+# feature — see `[dependencies]` — and is what the `serde` round-trip test marshals through.)
 criterion = "0.5"           # benchmarks (benches/grindlang.rs)
 proptest = "1"              # property-based differential testing (tests/prop_differential.rs)
 insta = "1"                 # golden snapshots (tests/snapshots.rs)
 # Rough Luau baseline in the benchmarks. Luau (not stock Lua), matching the rest of
 # Grindshell (dialogmark/editor use mlua + Luau).
 mlua = { version = "0.11", features = ["luau-jit"] }
+
+[[bin]]
+# CLI runner: compiles a script and calls an entry export (`main` by default), caching the
+# lowered IR to disk (pyc-style) by default. Needs `jit` (the cranelift backend) and `serde`
+# (the IR's on-disk serialization is intrinsic to the default-on cache), so it is excluded from
+# builds lacking either. Run/build it with `--features serde`.
+name = "grindlang"
+required-features = ["jit", "serde"]
 
 [[example]]
 name = "embed"

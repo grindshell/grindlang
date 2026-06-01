@@ -27,11 +27,13 @@ match Luau's API or semantics.
 
 ## 2. Status
 
-Phases 0–8 are delivered (front end, resolver, type system, reference interpreter, mid-level
-IR, runtime/ABI, cranelift JIT, host embedding API). Phase 9 (hardening, tooling, docs) is in
-progress: differential + fuzz + property tests, criterion benchmarks (incl. a rough Luau
-baseline), this `CLAUDE.md`, and the `SPEC.md`. See `PLAN.md` §4 for per-phase exit criteria
-and what remains deferred (e.g. the full native arena).
+Phases 0–9 are delivered (front end, resolver, type system, reference interpreter, mid-level
+IR, runtime/ABI, cranelift JIT, host embedding API; plus Phase 9 hardening: differential +
+fuzz + property tests, criterion benchmarks with a rough Luau baseline, this `CLAUDE.md`, the
+`SPEC.md`, the `embed` example, and the `grindlang` CLI runner). Closures with upvalues and
+calling first-class function values have landed since the original Phase 7 cut (see
+`src/capture.rs`). See `PLAN.md` §4 for per-phase notes and what remains deferred (method-call
+syntax and the full native arena).
 
 ## 3. Tech stack
 
@@ -39,11 +41,12 @@ and what remains deferred (e.g. the full native arena).
 - `cranelift-*` `0.132` — the JIT backend (`-codegen`, `-frontend`, `-module`, `-jit`,
   `-native`). All cranelift usage is isolated in `src/codegen/` behind the `jit` feature.
 - `thiserror` `2` — error enums (matches the sibling repos' convention).
-- `serde` `1` *(optional, behind the `serde` feature)* — marshaling values / export
-  signatures across process boundaries.
+- `serde` `1` + `serde_json` `1` *(optional, behind the `serde` feature)* — marshaling values /
+  export signatures across process boundaries, and serializing the IR (`ir::Program`) for the
+  CLI runner's on-disk `--cache`. `serde_json` is the on-disk format.
 - Dev-only: `criterion` (benchmarks), `proptest` (property/differential tests), `insta`
-  (golden snapshots), `serde_json` (serde round-trip test), `mlua` with `luau-jit` (the rough
-  Luau baseline in benchmarks — Luau, not stock Lua, matching the rest of Grindshell).
+  (golden snapshots), `mlua` with `luau-jit` (the rough Luau baseline in benchmarks — Luau, not
+  stock Lua, matching the rest of Grindshell).
 
 ### Cargo features
 
@@ -54,7 +57,11 @@ other feature required.
   Self-contained: enabling only `jit` is enough.
 - `interp` — the tree-walking `Interpreter` and the IR `Vm`: the semantics **oracles** and a
   debug execution mode. Independent of `jit`.
-- `serde` — serde marshaling of `Value` and export signatures.
+- `serde` — serde marshaling of `Value` and export signatures, plus serde derives on the IR
+  (`ir::Program` and the `types::Type` / `ast::BinOp`/`UnOp` it references) so a compiled module
+  can be cached to / loaded from disk. Pulls in `serde_json` as the on-disk format. The
+  `grindlang` CLI **requires** this feature (`required-features = ["jit", "serde"]`) because its
+  pyc-style IR cache is default-on; the library itself keeps `serde` optional.
 
 **Gating rule:** items needed by *any* execution backend (the runtime `Value` reference
 variants `Cell`/`Closure`, `NativeFn`, `ClosureObj`, and the builtin reference impls in
@@ -72,6 +79,7 @@ cargo test                           # jit-only: unit + api + doctests + snapsho
 cargo test --features interp         # ALSO runs the interp-vs-jit differential/fuzz/prop suites
 cargo test --all-features            # everything (interp + jit + serde)
 cargo bench                          # criterion: parse/compile/call, JIT vs interp, vs Luau
+cargo run --features serde --bin grindlang -- FILE  # CLI: run FILE's `main` (pyc-style IR cache)
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt
 ```
@@ -97,7 +105,12 @@ source (.lua-syntax text)
        └─ codegen       cranelift IR → native     src/codegen/         (feature: jit)
             └─ runtime  arena, reprs, host ABI, builtins  src/runtime/
   host API: Engine / Module / Value marshaling   src/api.rs           (feature: jit)
+  CLI runner: run a file (pyc-style IR cache)       src/bin/grindlang.rs (features: jit + serde)
 ```
+
+`src/capture.rs` is the shared free-variable / closure-capture analysis (the single source of
+truth for upvalue *ordering*) consumed by both `interp` and `ir` lowering so the interpreters
+and the JIT agree on a closure's environment.
 
 Front-end entry points in `lib.rs` are always available: `parse` (→ AST), `check` (+ resolve),
 `analyze` (+ typecheck → export signature), `compile` (+ lower → verified IR).

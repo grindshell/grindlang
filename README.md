@@ -76,6 +76,44 @@ A runnable version, including a dialog-tree decision driven against host memory,
 cargo run --example embed --features jit
 ```
 
+## Command-line runner
+
+The `grindlang` binary compiles a script file and invokes one of its exports — `main` by
+default, or another with `--call NAME` — calling it with no arguments and printing the
+returned value. Because it binds no host functions or memory, a script run this way may use
+only the in-language builtins; anything needing host capabilities goes through the embedding
+API above. The runner requires the `serde` feature (its disk cache, below, depends on it), so
+build/run it with `--features serde`:
+
+```
+cargo run --features serde --bin grindlang -- script.lua             # run script.lua's `main`
+cargo run --features serde --bin grindlang -- --call total sums.lua  # run the `total` export
+```
+
+Given a script whose `main` returns `fib(10)`, it prints `55`. A missing or unsuitable entry
+export (absent, parameterized, or not a function) is reported to stderr with a non-zero exit.
+
+### Disk cache (pyc-style)
+
+The Cranelift JIT compiles into process memory and cannot be persisted, so there is no
+native-code cache. What the runner caches is the **lowered IR** (`ir::Program`), and — like
+Python's `*.pyc` — it does so **by default**: a normal run reads `<FILE>.glir` when it is present
+and current (deserializing the IR and skipping the front end, still JIT-compiling on load), and
+otherwise compiles the source and writes the cache. It is keyed by a source hash plus the
+binary's version, so editing the script or rebuilding `grindlang` invalidates it automatically.
+
+Two flags adjust this:
+
+- `--cache` compiles and writes the IR cache **without running** the script (a pre-warm step).
+- `--no-cache` runs the script but neither reads nor writes the cache.
+- `--cache-file P` uses path `P` instead of `<FILE>.glir`.
+
+```
+cargo run --features serde --bin grindlang -- script.lua            # run; reuse or write cache
+cargo run --features serde --bin grindlang -- --cache script.lua    # write cache, do not run
+cargo run --features serde --bin grindlang -- --no-cache script.lua # run, ignore the cache
+```
+
 ## Architecture
 
 ```
@@ -124,7 +162,7 @@ The crate is decoupled by backend. The default gives a fully usable JIT crate.
 |---|---|---|
 | `jit` | yes | Cranelift JIT backend — the production execution path. Self-contained. |
 | `interp` | no | Tree-walking interpreter and IR VM — the semantics oracles and a debug execution mode. Independent of `jit`. |
-| `serde` | no | Serde marshaling of `Value` and export signatures across process boundaries. |
+| `serde` | no | Serde marshaling of `Value` and export signatures, plus serde derives on the IR (`ir::Program`) so a compiled module can be cached to disk. Required by the `grindlang` CLI runner (its pyc-style IR cache is default-on). |
 
 ## Commands
 
@@ -134,6 +172,7 @@ cargo test                           # jit-only: unit + api + doctests + snapsho
 cargo test --features interp         # ALSO runs the interp-vs-jit differential/fuzz/property suites
 cargo test --all-features            # everything (interp + jit + serde)
 cargo bench                          # criterion: parse/compile/call, JIT vs interp, vs a Luau baseline
+cargo run --features serde --bin grindlang -- FILE  # CLI runner (caches IR; needs serde)
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt
 ```
@@ -184,10 +223,12 @@ pays repeatedly.
 
 ## Status
 
-Phases 0–8 are delivered: front end, resolver, type system, reference interpreter,
-mid-level IR, runtime/ABI, Cranelift JIT, and the host embedding API. Phase 9 (hardening,
-tooling, and documentation) is in progress. See [`PLAN.md`](PLAN.md) for per-phase exit
-criteria and deferred work.
+Phases 0–9 are delivered: front end, resolver, type system, reference interpreter,
+mid-level IR, runtime/ABI, Cranelift JIT, the host embedding API, and Phase 9 hardening
+(differential/fuzz/property tests, benchmarks, docs, the embedding example, and the CLI
+runner). Closures with upvalues and calling first-class function values are supported.
+Method-call syntax and the full native arena remain deferred. See [`PLAN.md`](PLAN.md) for
+per-phase exit criteria and deferred work.
 
 ## License
 

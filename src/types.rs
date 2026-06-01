@@ -36,6 +36,7 @@ use crate::resolve::{Binding, Resolution, SymbolId};
 
 /// A Grindlang type (`SPEC.md` §5.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Type {
     Number,
     Bool,
@@ -62,6 +63,7 @@ pub enum Type {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FnType {
     pub params: Vec<Type>,
     /// Single return type, or [`Type::Unit`] for a value-less function.

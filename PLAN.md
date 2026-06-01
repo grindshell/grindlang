@@ -219,11 +219,15 @@ Each phase is independently testable and leaves the crate green
 > the call. `JitModule` mirrors the `Vm`/`Interpreter` surface
 > (`set_host_function`/`set_memory`/`memory`/`call`). **Validated** by
 > `tests/jit_differential.rs` (JIT == AST == IR over the corpus — the third oracle) and
-> `tests/jit_fuzz.rs` (a deterministic LCG drives ~2,500 randomized inputs). Deferred to
-> future work (unchanged): closures/upvalues, calling function values, method calls, and the
-> full native arena (raw-pointer `#[repr(C)]` layouts) — the handle runtime is incrementally
-> upgradable to it later. The ABI/value-model contract is documented in the `codegen` and
-> `runtime` module rustdoc (`SPEC.md` stays the author-facing language contract, §1–§9).
+> `tests/jit_fuzz.rs` (a deterministic LCG drives ~2,500 randomized inputs). **Closures with
+> upvalues and calling first-class function values have since landed** (`src/capture.rs` is the
+> single source of truth for upvalue ordering, shared by both interpreters and the JIT;
+> `Module::call_value`/`call_value_typed` invoke a returned closure, which keeps its backing
+> code alive via the closure's `keepalive`). Still deferred to future work: method-call syntax
+> and the full native arena (raw-pointer `#[repr(C)]` layouts) — the handle runtime is
+> incrementally upgradable to it later. The ABI/value-model contract is documented in the
+> `codegen` and `runtime` module rustdoc (`SPEC.md` stays the author-facing language contract,
+> §1–§9).
 
 ### Phase 8 — Host embedding API
 - `Engine` (owns cranelift/JIT context, builtin registry), `Module` (compiled script +
@@ -256,8 +260,19 @@ Each phase is independently testable and leaves the crate green
 > interpreter. Docs: this plan, [`CLAUDE.md`](CLAUDE.md) (agent onboarding, mirroring the
 > sibling repos), and [`SPEC.md`](SPEC.md) (the author-facing language contract). The
 > integration spike ships as `examples/embed.rs` (a stat calc + a dialog decision against host
-> memory, run with `cargo run --example embed`). The differential/fuzz/property suites are
-> gated on `all(feature = "interp", feature = "jit")`; run `cargo test --features interp`.
+> memory, run with `cargo run --example embed`). A small **CLI runner** ships as the
+> `grindlang` binary (`src/bin/grindlang.rs`, `required-features = ["jit", "serde"]`): it
+> compiles a script file and invokes a chosen entry export (`main` by default, or `--call NAME`)
+> with no arguments, printing the returned value — a quick way to exercise a module without
+> writing an embedding harness. It caches the lowered IR (`ir::Program`, serde-derived behind the
+> `serde` feature; `serde_json` on disk) **pyc-style by default**: a run reads `<FILE>.glir` when
+> it is current (keyed by source hash + binary version) and otherwise compiles and writes it,
+> skipping the front end on an unchanged re-run. `--cache` writes the cache without running (a
+> pre-warm step); `--no-cache` runs without touching it. Note this caches the *IR*, not native
+> code (cranelift-jit cannot persist compiled code), and still JIT-compiles on load; the IR
+> round-trip is covered by `tests/serde_ir.rs`. The differential/fuzz/property suites are
+> gated on
+> `all(feature = "interp", feature = "jit")`; run `cargo test --features interp`.
 
 ## 5. Risks & mitigations
 

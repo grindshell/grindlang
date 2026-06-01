@@ -67,6 +67,7 @@ pub enum LowerError {
 
 /// A whole lowered module.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Program {
     /// Top-level functions, by declared name.
     pub functions: BTreeMap<String, Function>,
@@ -78,6 +79,7 @@ pub struct Program {
 
 /// What an exported name refers to within a [`Program`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ExportTarget {
     Function(String),
     Const(String),
@@ -85,6 +87,7 @@ pub enum ExportTarget {
 
 /// A lowered function: a typed CFG.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Function {
     pub name: String,
     /// Parameter locals, in order. For a lifted closure (`is_closure`), the first entry is the
@@ -111,6 +114,7 @@ impl Function {
 
 /// A basic block: a straight-line sequence of instructions ending in a terminator.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Block {
     pub id: BlockId,
     pub instrs: Vec<Instr>,
@@ -120,6 +124,7 @@ pub struct Block {
 /// A single instruction. `dest` is `Some` for value-producing ops and `None` for
 /// effects (stores).
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Instr {
     pub dest: Option<ValueId>,
     pub op: Op,
@@ -127,6 +132,7 @@ pub struct Instr {
 
 /// An IR operation.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Op {
     ConstNil,
     ConstBool(bool),
@@ -201,6 +207,7 @@ pub enum Op {
 
 /// How a basic block ends.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Terminator {
     /// Return `Some(value)` or no value.
     Return(Option<ValueId>),
