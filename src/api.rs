@@ -11,8 +11,8 @@
 //!
 //! Backend: **JIT-only**. The whole module is gated behind the `jit` feature and always
 //! compiles scripts to native code (the tree-walking interpreter remains available as
-//! [`crate::interp`] for debugging / as the differential oracle, but the embedding surface is
-//! the JIT).
+//! `crate::interp`, with the `interp` feature, for debugging / as the differential oracle,
+//! but the embedding surface is the JIT).
 //!
 //! Marshaling: **typed closures with a raw escape hatch**. Host functions are ordinary Rust
 //! closures whose parameter/return types are inferred into the script's type environment

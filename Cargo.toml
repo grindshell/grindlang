@@ -6,19 +6,20 @@ description = "A statically-typed, cranelift-JIT-compiled, Lua-syntax embedded c
 license = "MIT OR Apache-2.0"
 
 [features]
-# Default: the front end plus the reference interpreter. The cranelift JIT backend
-# (Phase 7) is gated behind `jit` and its heavy deps are added when that phase lands.
-default = ["interp"]
+# Default: the cranelift JIT backend — the primary, production execution path. `jit` is
+# self-contained, so enabling only this feature yields a fully usable crate.
+default = ["jit"]
 
-# Reference tree-walking interpreter (semantics oracle + debug execution).
+# Reference tree-walking interpreter + IR VM: the semantics oracles and a debug execution
+# mode. Independent of `jit` — enable it alongside `jit` to run the differential test suite.
 interp = []
 
-# Cranelift JIT backend (Phase 7). Compiles the typed IR to native code. The hybrid value
-# model passes numbers/bools as unboxed f64/i8 and reference values as i64 handles into a
-# per-call runtime context, so reference ops call back into the shared runtime — which uses
-# `interp::Value`; hence `jit` implies `interp`.
+# Cranelift JIT backend. Compiles the typed IR to native code via a hybrid value model:
+# numbers/bools pass as unboxed f64/i8 and reference values as i64 handles into a per-call
+# runtime context. The shared runtime values (`value`) and builtin reference impls
+# (`runtime`) it calls back into are compiled for any backend, so `jit` does NOT depend on
+# `interp`.
 jit = [
-    "interp",
     "dep:cranelift-codegen",
     "dep:cranelift-frontend",
     "dep:cranelift-module",

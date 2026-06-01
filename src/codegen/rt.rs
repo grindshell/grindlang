@@ -574,7 +574,11 @@ fn value_eq(a: &Value, b: &Value) -> bool {
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Array(x), Value::Array(y)) => Rc::ptr_eq(x, y),
         (Value::Table(x), Value::Table(y)) => Rc::ptr_eq(x, y),
+        // The JIT never produces these interpreter-only callables; the arms exist only so a
+        // build with `interp` also enabled still matches them exhaustively by identity.
+        #[cfg(feature = "interp")]
         (Value::Function(x), Value::Function(y)) => Rc::ptr_eq(x, y),
+        #[cfg(feature = "interp")]
         (Value::Native(x), Value::Native(y)) => Rc::ptr_eq(x, y),
         (Value::Cell(x), Value::Cell(y)) => Rc::ptr_eq(x, y),
         (Value::Closure(x), Value::Closure(y)) => Rc::ptr_eq(x, y),

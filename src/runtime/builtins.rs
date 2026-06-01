@@ -118,12 +118,16 @@ pub fn num_to_string(n: f64) -> String {
     }
 }
 
-// ---- reference implementations (interp feature) -----------------------------
+// ---- reference implementations (any backend) --------------------------------
+//
+// The evaluators below are the single source of truth for builtin behavior. Both backends
+// call into them at runtime — the IR VM / tree-walking interpreter directly, and the JIT via
+// its runtime shims (`codegen::rt`) — so they compile whenever a backend is enabled.
 
-#[cfg(feature = "interp")]
+#[cfg(any(feature = "interp", feature = "jit"))]
 pub use imp::{field_value, member_call, value_call};
 
-#[cfg(feature = "interp")]
+#[cfg(any(feature = "interp", feature = "jit"))]
 mod imp {
     use super::num_to_string;
     use crate::value::{RunError, Value};

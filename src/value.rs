@@ -1,22 +1,26 @@
 //! The runtime [`Value`] and [`RunError`] — the values that flow through a running Grindlang
 //! program and across the host boundary.
 //!
-//! This module is **always compiled**, independent of any feature. `Value` is the shared
-//! currency of the whole runtime: the cranelift JIT ([`crate::codegen`]) threads it through
-//! its per-call context, the embedding API ([`crate::api`]) marshals Rust types to and from
-//! it, and the tree-walking interpreter ([`crate::interp`]) evaluates directly over it. It
-//! used to live in `interp`, which made it (and its `serde` impls) require the `interp`
-//! feature even though the JIT — the primary backend — needs it just the same.
+//! The `Value` type itself is **always compiled**, independent of any feature. It is the
+//! shared currency of the whole runtime: the cranelift JIT ([`crate::codegen`]) threads it
+//! through its per-call context, the embedding API ([`crate::api`]) marshals Rust types to
+//! and from it, and the tree-walking interpreter (`crate::interp`) evaluates directly over
+//! it. It used to live in `interp`, which made it (and its `serde` impls) require the
+//! `interp` feature even though the JIT — the primary backend — needs it just the same.
 //!
-//! ## Data values vs. callables
+//! ## Data values, runtime values, and interpreter callables
 //!
-//! The variants split in two:
+//! The variants split in three:
 //!
 //! * **Data values** — `nil`, `bool`, `number`, `string`, `array`, `table` — are the values
 //!   that cross the host boundary (host functions, memory, call arguments/results, `serde`).
 //!   They are always available.
-//! * **Callable values** — [`Value::Function`] (a script closure) and [`Value::Native`] (a
-//!   host function captured *as a value*) — exist only with the `interp` feature. Only the
+//! * **Runtime reference values** — [`Value::Cell`] (a shared mutable upvalue cell) and
+//!   [`Value::Closure`] (a lifted function plus its captured cells) — are produced by either
+//!   backend that executes the IR (the JIT and the IR VM), so they compile whenever a backend
+//!   is enabled (`any(feature = "interp", feature = "jit")`).
+//! * **Interpreter callables** — [`Value::Function`] (a script closure) and [`Value::Native`]
+//!   (a host function captured *as a value*) — exist only with the `interp` feature. Only the
 //!   tree-walking interpreter represents functions as first-class values; the JIT keeps host
 //!   functions out-of-band in its runtime context and never materializes script closures, so
 //!   compiled code never produces these variants.
@@ -25,7 +29,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::rc::Rc;
-#[cfg(feature = "interp")]
+#[cfg(any(feature = "interp", feature = "jit"))]
 use std::any::Any;
 
 use crate::runtime::builtins::num_to_string;
@@ -50,15 +54,16 @@ pub enum RunError {
 }
 
 /// A host-registered native function: takes the evaluated arguments and returns a value.
-/// Only meaningful with the `interp` feature, where a host function can be captured as a
-/// [`Value::Native`]. (The JIT calls host functions through its runtime context instead.)
-#[cfg(feature = "interp")]
+/// Both backends use it — the JIT and embedding API store host functions in their runtime
+/// context as `NativeFn`, and the interpreter additionally captures one as a [`Value::Native`].
+#[cfg(any(feature = "interp", feature = "jit"))]
 pub type NativeFn = Rc<dyn Fn(&[Value]) -> Result<Value, RunError>>;
 
 /// A runtime value.
 ///
-/// The callable variants ([`Value::Function`], [`Value::Native`]) require the `interp`
-/// feature; see the [module docs](self).
+/// The reference variants ([`Value::Cell`], [`Value::Closure`]) compile whenever a backend
+/// is enabled; the interpreter callables ([`Value::Function`], [`Value::Native`]) require the
+/// `interp` feature. See the [module docs](self).
 #[derive(Clone)]
 pub enum Value {
     Nil,
@@ -80,17 +85,18 @@ pub enum Value {
     /// VM and the JIT. (The tree-walking interpreter uses its own `Slot` type instead and
     /// never produces this variant.) Sharing the `Rc<RefCell<_>>` is what makes upvalue
     /// writes visible to the enclosing scope and to sibling closures.
-    #[cfg(feature = "interp")]
+    #[cfg(any(feature = "interp", feature = "jit"))]
     Cell(Rc<RefCell<Value>>),
     /// A closure value produced by the IR VM / JIT: a lifted function plus its captured
-    /// upvalue cells. The interpreter represents closures as [`Value::Function`] instead.
-    #[cfg(feature = "interp")]
+    /// upvalue cells. The tree-walking interpreter represents closures as [`Value::Function`]
+    /// instead.
+    #[cfg(any(feature = "interp", feature = "jit"))]
     Closure(Rc<ClosureObj>),
 }
 
 /// The payload of a [`Value::Closure`]: which lifted function to run and the cells it
 /// captured. Produced by the IR VM and the JIT (not the tree-walking interpreter).
-#[cfg(feature = "interp")]
+#[cfg(any(feature = "interp", feature = "jit"))]
 pub struct ClosureObj {
     /// The lifted top-level function's synthetic name — resolved by the IR VM via
     /// `Program::functions` and by the JIT via its name → trampoline maps.
@@ -170,9 +176,11 @@ impl Value {
             Value::Str(_) => "string",
             Value::Array(_) => "array",
             Value::Table(_) => "table",
+            #[cfg(any(feature = "interp", feature = "jit"))]
+            Value::Closure(_) => "function",
             #[cfg(feature = "interp")]
-            Value::Function(_) | Value::Native(_) | Value::Closure(_) => "function",
-            #[cfg(feature = "interp")]
+            Value::Function(_) | Value::Native(_) => "function",
+            #[cfg(any(feature = "interp", feature = "jit"))]
             Value::Cell(_) => "cell",
         }
     }
@@ -213,9 +221,11 @@ impl fmt::Display for Value {
                 }
                 f.write_str("}")
             }
+            #[cfg(any(feature = "interp", feature = "jit"))]
+            Value::Closure(_) => f.write_str("function"),
             #[cfg(feature = "interp")]
-            Value::Function(_) | Value::Native(_) | Value::Closure(_) => f.write_str("function"),
-            #[cfg(feature = "interp")]
+            Value::Function(_) | Value::Native(_) => f.write_str("function"),
+            #[cfg(any(feature = "interp", feature = "jit"))]
             Value::Cell(c) => write!(f, "{}", c.borrow()),
         }
     }
@@ -258,11 +268,15 @@ impl serde::Serialize for Value {
                 }
                 map.end()
             }
+            #[cfg(any(feature = "interp", feature = "jit"))]
+            Value::Closure(_) => Err(serde::ser::Error::custom(
+                "cannot serialize a function value",
+            )),
             #[cfg(feature = "interp")]
-            Value::Function(_) | Value::Native(_) | Value::Closure(_) => Err(
-                serde::ser::Error::custom("cannot serialize a function value"),
-            ),
-            #[cfg(feature = "interp")]
+            Value::Function(_) | Value::Native(_) => Err(serde::ser::Error::custom(
+                "cannot serialize a function value",
+            )),
+            #[cfg(any(feature = "interp", feature = "jit"))]
             Value::Cell(_) => Err(serde::ser::Error::custom("cannot serialize a cell value")),
         }
     }
