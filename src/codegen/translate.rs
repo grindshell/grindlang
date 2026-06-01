@@ -724,6 +724,25 @@ impl<'a, 'b> Translator<'a, 'b> {
         args: &[ValueId],
         ret: Repr,
     ) -> ClifValue {
+        // Fast path: the common single-argument numeric `math.*` builtins lower to a single
+        // native cranelift float instruction, skipping the box → `extern "C"` shim → unbox
+        // round-trip (which otherwise dominates the cost of an otherwise-trivial call). These
+        // map exactly onto IEEE operations, so the result is bit-identical to the runtime's
+        // reference impl (`builtins::member_call`) that the interpreter and IR VM use.
+        //
+        // `math.min`/`math.max` are deliberately NOT inlined: cranelift `fmin`/`fmax`
+        // propagate NaN and prefer negative zero, whereas the reference impl uses Rust's
+        // `f64::min`/`max` (NaN-ignoring). Keeping them on the shim guarantees the three
+        // oracles stay bit-identical. `pow` has no native cranelift instruction.
+        if ns == "math"
+            && ret == Repr::Number
+            && args.len() == 1
+            && self.value_repr(args[0]) == Repr::Number
+            && let Some(native) = self.try_native_math1(member, args[0])
+        {
+            return native;
+        }
+
         let id = self.pools.intern_builtin_member(ns, member);
         let handles: Vec<ClifValue> = args.iter().map(|&a| self.box_handle(a)).collect();
         let (base, argc) = self.arg_array(&handles);
@@ -732,6 +751,21 @@ impl<'a, 'b> Translator<'a, 'b> {
             .call_shim("rt_call_builtin_member", &[self.ctx_val, idc, base, argc])
             .unwrap();
         self.unbox_handle(result, ret)
+    }
+
+    /// Lower a single-argument `math.*` builtin to a native cranelift float instruction, if one
+    /// exists with matching IEEE semantics. The argument is already an unboxed `f64`
+    /// (`Repr::Number`); the result is an unboxed `f64`. Returns `None` for members without a
+    /// safe native equivalent, so the caller falls back to the runtime shim.
+    fn try_native_math1(&mut self, member: &str, arg: ValueId) -> Option<ClifValue> {
+        let v = self.val(arg);
+        Some(match member {
+            "floor" => self.builder.ins().floor(v),
+            "ceil" => self.builder.ins().ceil(v),
+            "abs" => self.builder.ins().fabs(v),
+            "sqrt" => self.builder.ins().sqrt(v),
+            _ => return None,
+        })
     }
 
     /// The repr of an op's destination value (defaults to `Ptr` for the absent/Unit case).
@@ -743,14 +777,43 @@ impl<'a, 'b> Translator<'a, 'b> {
     }
 }
 
-/// Build a uniform trampoline `(ctx, argv, argc) -> handle` that unboxes `argv` per the
-/// callee's parameter reprs, calls the typed function, and boxes the result into a handle.
-/// Used by the driver, which can't form an arbitrary-arity native call.
-#[allow(clippy::too_many_arguments)]
+/// Decode one ABI argument slot (a raw 64-bit word from the driver's buffer) into the typed
+/// value the callee expects. Scalars are reinterpreted natively — no value-table round-trip:
+/// a `Number` slot holds the `f64` bit pattern, a `Bool` slot holds `0`/`1`, a `Ptr` slot is
+/// already the `i64` handle. Returns `None` for `Unit` (no argument is passed).
+fn decode_param(builder: &mut FunctionBuilder<'_>, r: Repr, slot: ClifValue) -> Option<ClifValue> {
+    Some(match r {
+        Repr::Number => builder.ins().bitcast(types::F64, MemFlags::new(), slot),
+        Repr::Bool => builder.ins().ireduce(types::I8, slot),
+        Repr::Ptr => slot,
+        Repr::Unit => return None,
+    })
+}
+
+/// Encode the typed function result back into a raw 64-bit ABI word for the driver to decode:
+/// an `f64` as its bit pattern, a `bool` zero-extended, a `Ptr` handle as-is, `Unit` as `0`.
+fn encode_ret(builder: &mut FunctionBuilder<'_>, ret: Repr, res: Option<ClifValue>) -> ClifValue {
+    match ret {
+        Repr::Number => builder
+            .ins()
+            .bitcast(types::I64, MemFlags::new(), res.unwrap()),
+        Repr::Bool => builder.ins().uextend(types::I64, res.unwrap()),
+        Repr::Ptr => res.unwrap(),
+        Repr::Unit => builder.ins().iconst(types::I64, 0),
+    }
+}
+
+/// Build a uniform trampoline `(ctx, argv, argc) -> bits` that decodes `argv` per the callee's
+/// parameter reprs, calls the typed function, and re-encodes the result. Used by the driver,
+/// which can't form an arbitrary-arity native call.
+///
+/// The buffer uses the **bits ABI** (see [`decode_param`]/[`encode_ret`]): scalar args and
+/// results cross the boundary as raw native words, so a number/bool call never touches the
+/// value table — only genuine reference values are interned by the driver. (Reference ops
+/// *inside* the body still box/unbox through the runtime as before.)
 pub fn build_trampoline(
     mut builder: FunctionBuilder<'_>,
     module: &mut dyn Module,
-    shims: &HashMap<&'static str, FuncId>,
     typed_id: FuncId,
     params: &[Repr],
     ret: Repr,
@@ -763,59 +826,32 @@ pub fn build_trampoline(
 
     let mut call_args = vec![ctx];
     for (i, &r) in params.iter().enumerate() {
-        let h = builder
+        let slot = builder
             .ins()
             .load(types::I64, MemFlags::trusted(), argv, (i * 8) as i32);
-        let a = match r {
-            Repr::Number => {
-                let f = module.declare_func_in_func(shims["rt_unbox_number"], builder.func);
-                let c = builder.ins().call(f, &[ctx, h]);
-                builder.inst_results(c)[0]
-            }
-            Repr::Bool => {
-                let f = module.declare_func_in_func(shims["rt_unbox_bool"], builder.func);
-                let c = builder.ins().call(f, &[ctx, h]);
-                builder.inst_results(c)[0]
-            }
-            Repr::Ptr => h,
-            Repr::Unit => continue,
-        };
-        call_args.push(a);
+        if let Some(a) = decode_param(&mut builder, r, slot) {
+            call_args.push(a);
+        }
     }
 
     let fref = module.declare_func_in_func(typed_id, builder.func);
     let call = builder.ins().call(fref, &call_args);
     let res = builder.inst_results(call).first().copied();
 
-    let out = match ret {
-        Repr::Number => {
-            let f = module.declare_func_in_func(shims["rt_box_number"], builder.func);
-            let c = builder.ins().call(f, &[ctx, res.unwrap()]);
-            builder.inst_results(c)[0]
-        }
-        Repr::Bool => {
-            let f = module.declare_func_in_func(shims["rt_box_bool"], builder.func);
-            let c = builder.ins().call(f, &[ctx, res.unwrap()]);
-            builder.inst_results(c)[0]
-        }
-        Repr::Ptr => res.unwrap(),
-        Repr::Unit => builder.ins().iconst(types::I64, 0),
-    };
+    let out = encode_ret(&mut builder, ret, res);
     builder.ins().return_(&[out]);
     builder.seal_all_blocks();
     builder.finalize();
 }
 
-/// Build an env-trampoline `(ctx, env, argv, argc) -> handle` for a lifted closure: like
+/// Build an env-trampoline `(ctx, env, argv, argc) -> bits` for a lifted closure: like
 /// [`build_trampoline`] but threading the closure value `env` through as the typed function's
 /// hidden first argument. Used by the host to invoke a returned closure
 /// ([`crate::codegen::JitModule::call_value`]). `params` are the *source-level* parameters
 /// (excluding the env).
-#[allow(clippy::too_many_arguments)]
 pub fn build_env_trampoline(
     mut builder: FunctionBuilder<'_>,
     module: &mut dyn Module,
-    shims: &HashMap<&'static str, FuncId>,
     typed_id: FuncId,
     params: &[Repr],
     ret: Repr,
@@ -828,44 +864,19 @@ pub fn build_env_trampoline(
 
     let mut call_args = vec![ctx, env];
     for (i, &r) in params.iter().enumerate() {
-        let h = builder
+        let slot = builder
             .ins()
             .load(types::I64, MemFlags::trusted(), argv, (i * 8) as i32);
-        let a = match r {
-            Repr::Number => {
-                let f = module.declare_func_in_func(shims["rt_unbox_number"], builder.func);
-                let c = builder.ins().call(f, &[ctx, h]);
-                builder.inst_results(c)[0]
-            }
-            Repr::Bool => {
-                let f = module.declare_func_in_func(shims["rt_unbox_bool"], builder.func);
-                let c = builder.ins().call(f, &[ctx, h]);
-                builder.inst_results(c)[0]
-            }
-            Repr::Ptr => h,
-            Repr::Unit => continue,
-        };
-        call_args.push(a);
+        if let Some(a) = decode_param(&mut builder, r, slot) {
+            call_args.push(a);
+        }
     }
 
     let fref = module.declare_func_in_func(typed_id, builder.func);
     let call = builder.ins().call(fref, &call_args);
     let res = builder.inst_results(call).first().copied();
 
-    let out = match ret {
-        Repr::Number => {
-            let f = module.declare_func_in_func(shims["rt_box_number"], builder.func);
-            let c = builder.ins().call(f, &[ctx, res.unwrap()]);
-            builder.inst_results(c)[0]
-        }
-        Repr::Bool => {
-            let f = module.declare_func_in_func(shims["rt_box_bool"], builder.func);
-            let c = builder.ins().call(f, &[ctx, res.unwrap()]);
-            builder.inst_results(c)[0]
-        }
-        Repr::Ptr => res.unwrap(),
-        Repr::Unit => builder.ins().iconst(types::I64, 0),
-    };
+    let out = encode_ret(&mut builder, ret, res);
     builder.ins().return_(&[out]);
     builder.seal_all_blocks();
     builder.finalize();

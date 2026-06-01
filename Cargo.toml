@@ -43,7 +43,21 @@ cranelift-native = { version = "0.132", optional = true }
 [dev-dependencies]
 # For the `serde` round-trip test (gated on the `serde` feature in the test itself).
 serde_json = "1"
+# Phase 9 hardening/tooling.
+criterion = "0.5"           # benchmarks (benches/grindlang.rs)
+proptest = "1"              # property-based differential testing (tests/prop_differential.rs)
+insta = "1"                 # golden snapshots (tests/snapshots.rs)
+# Rough Luau baseline in the benchmarks. Luau (not stock Lua), matching the rest of
+# Grindshell (dialogmark/editor use mlua + Luau).
+mlua = { version = "0.11", features = ["luau-jit"] }
 
 [[example]]
 name = "embed"
+required-features = ["jit"]
+
+# Phase 9 benchmarks. The interp-vs-jit comparison inside is `#[cfg(feature = "interp")]`;
+# run `cargo bench --features interp` to include it. The Luau baseline always runs.
+[[bench]]
+name = "grindlang"
+harness = false
 required-features = ["jit"]

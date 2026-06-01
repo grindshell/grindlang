@@ -73,11 +73,25 @@ pub struct JitModule {
     const_tramps: HashMap<String, TrampFn>,
     /// lifted-closure name → env-trampoline (for host [`JitModule::call_value`]).
     closure_tramps: HashMap<String, EnvTrampFn>,
+    /// function name → (param reprs, return repr) — the bits-ABI contract the driver uses to
+    /// encode args / decode the result without boxing scalars.
+    fn_sigs: HashMap<String, (Vec<Repr>, Repr)>,
+    /// constant name → return repr (constants take no parameters).
+    const_rets: HashMap<String, Repr>,
+    /// lifted-closure name → (source-param reprs excluding the env, return repr).
+    closure_sigs: HashMap<String, (Vec<Repr>, Repr)>,
     /// function name → finalized native address (resolves indirect closure calls).
     code_addrs: Arc<HashMap<String, u64>>,
     /// Registered host functions and memory, by name.
     host: HashMap<String, NativeFn>,
     memory: HashMap<String, Value>,
+    /// A pooled runtime context, reused across calls to avoid re-allocating the value table
+    /// and re-cloning the shared bindings on every invocation. Taken out for the duration of a
+    /// call (so reentrant calls allocate fresh) and `reset` before reuse.
+    cached_ctx: Option<RtCtx>,
+    /// Set when `host`/`memory` change, so the pooled context's resolved bindings are rebuilt
+    /// on the next call rather than every call.
+    bindings_dirty: bool,
 }
 
 impl JitModule {
@@ -112,6 +126,10 @@ impl JitModule {
         // Lifted closures get an env-trampoline (not a plain one): they are never exported and
         // are reached only indirectly (in-script) or via the host `call_value` path.
         let mut closure_tramp_ids: HashMap<String, FuncId> = HashMap::new();
+        // ABI signatures the driver needs to encode args / decode results at call time.
+        let mut fn_sigs: HashMap<String, (Vec<Repr>, Repr)> = HashMap::new();
+        let mut const_rets: HashMap<String, Repr> = HashMap::new();
+        let mut closure_sigs: HashMap<String, (Vec<Repr>, Repr)> = HashMap::new();
 
         for (name, f) in &program.functions {
             let params: Vec<Repr> = f.params.iter().map(|p| Repr::of(&f.locals[p])).collect();
@@ -128,12 +146,15 @@ impl JitModule {
                     .declare_function(&format!("et_{name}"), Linkage::Export, &tsig)
                     .map_err(|e| JitError::Cranelift(e.to_string()))?;
                 closure_tramp_ids.insert(name.clone(), tid);
+                // Source-level params exclude the hidden env (params[0]).
+                closure_sigs.insert(name.clone(), (params[1..].to_vec(), ret));
             } else {
                 let tsig = trampoline_signature(call_conv);
                 let tid = module
                     .declare_function(&format!("tr_{name}"), Linkage::Export, &tsig)
                     .map_err(|e| JitError::Cranelift(e.to_string()))?;
                 fn_tramp_ids.insert(name.clone(), tid);
+                fn_sigs.insert(name.clone(), (params, ret));
             }
         }
         for (name, c) in &program.constants {
@@ -149,6 +170,7 @@ impl JitModule {
                 .declare_function(&format!("ct_{name}"), Linkage::Export, &tsig)
                 .map_err(|e| JitError::Cranelift(e.to_string()))?;
             const_tramp_ids.insert(name.clone(), tid);
+            const_rets.insert(name.clone(), ret);
         }
 
         // Translate every body, interning constants/names into the shared pools.
@@ -180,7 +202,6 @@ impl JitModule {
                     .collect();
                 define_env_trampoline(
                     &mut module,
-                    &shims,
                     &mut fbctx,
                     closure_tramp_ids[name],
                     typed_ids[name],
@@ -188,11 +209,9 @@ impl JitModule {
                     ret,
                 )?;
             } else {
-                let params: Vec<Repr> =
-                    f.params.iter().map(|p| Repr::of(&f.locals[p])).collect();
+                let params: Vec<Repr> = f.params.iter().map(|p| Repr::of(&f.locals[p])).collect();
                 define_trampoline(
                     &mut module,
-                    &shims,
                     &mut fbctx,
                     fn_tramp_ids[name],
                     typed_ids[name],
@@ -205,7 +224,6 @@ impl JitModule {
             let ret = Repr::of(&c.ret);
             define_trampoline(
                 &mut module,
-                &shims,
                 &mut fbctx,
                 const_tramp_ids[name],
                 const_ids[name],
@@ -256,9 +274,14 @@ impl JitModule {
             fn_tramps,
             const_tramps,
             closure_tramps,
+            fn_sigs,
+            const_rets,
+            closure_sigs,
             code_addrs: Arc::new(code_addrs),
             host: HashMap::new(),
             memory: HashMap::new(),
+            cached_ctx: None,
+            bindings_dirty: false,
         })
     }
 
@@ -268,17 +291,20 @@ impl JitModule {
         F: Fn(&[Value]) -> Result<Value, RunError> + 'static,
     {
         self.host.insert(name.into(), std::rc::Rc::new(f));
+        self.bindings_dirty = true;
     }
 
     /// Install a pre-built native host function. Used by the embedding API ([`crate::api`]),
     /// which type-erases typed host closures into a [`NativeFn`] before compilation.
     pub fn set_host_fn(&mut self, name: impl Into<String>, f: NativeFn) {
         self.host.insert(name.into(), f);
+        self.bindings_dirty = true;
     }
 
     /// Bind a host memory handle (typically a [`Value::table`]).
     pub fn set_memory(&mut self, name: impl Into<String>, value: Value) {
         self.memory.insert(name.into(), value);
+        self.bindings_dirty = true;
     }
 
     /// Read back a memory handle, e.g. to observe mutations after a call.
@@ -288,31 +314,53 @@ impl JitModule {
 
     /// Call an exported function by name with `args`.
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RunError> {
+        let mut ctx = self.take_ctx();
+        let result = self.dispatch(&mut ctx, name, args);
+        self.store_ctx(ctx);
+        result
+    }
+
+    /// Resolve `name`'s trampoline + ABI signature and invoke it against `ctx`. Split out so
+    /// the pooled-context `&mut self` borrow in [`call`](Self::call) doesn't collide with the
+    /// immutable signature lookups here.
+    fn dispatch(&self, ctx: &mut RtCtx, name: &str, args: Vec<Value>) -> Result<Value, RunError> {
         let target = self
             .exports
             .get(name)
             .ok_or_else(|| RunError::UnknownExport(name.to_string()))?;
-        let tramp = match target {
-            ExportTarget::Function(n) => *self
-                .fn_tramps
-                .get(n)
-                .ok_or_else(|| RunError::Internal(format!("missing trampoline `{n}`")))?,
-            ExportTarget::Const(n) => *self
-                .const_tramps
-                .get(n)
-                .ok_or_else(|| RunError::Internal(format!("missing const trampoline `{n}`")))?,
-        };
+        let (tramp, params, ret): (TrampFn, &[Repr], Repr) =
+            match target {
+                ExportTarget::Function(n) => {
+                    let tramp = *self
+                        .fn_tramps
+                        .get(n)
+                        .ok_or_else(|| RunError::Internal(format!("missing trampoline `{n}`")))?;
+                    let (params, ret) = self
+                        .fn_sigs
+                        .get(n)
+                        .ok_or_else(|| RunError::Internal(format!("missing signature `{n}`")))?;
+                    (tramp, params.as_slice(), *ret)
+                }
+                ExportTarget::Const(n) => {
+                    let tramp = *self.const_tramps.get(n).ok_or_else(|| {
+                        RunError::Internal(format!("missing const trampoline `{n}`"))
+                    })?;
+                    let ret = *self.const_rets.get(n).ok_or_else(|| {
+                        RunError::Internal(format!("missing const signature `{n}`"))
+                    })?;
+                    (tramp, &[], ret)
+                }
+            };
 
-        let mut ctx = self.make_ctx();
-        let argv: Vec<Handle> = args.into_iter().map(|a| ctx.intern(a)).collect();
-        // SAFETY: `tramp` has the `TrampFn` ABI; `ctx` outlives the call; `argv` is valid for
-        // `argv.len()` handles.
-        let result = unsafe { tramp(&mut ctx as *mut RtCtx, argv.as_ptr(), argv.len() as u32) };
+        let argv = encode_args(ctx, params, args);
+        // SAFETY: `tramp` has the `TrampFn` ABI; `ctx` outlives the call; `argv` holds one
+        // bits-ABI word per declared parameter.
+        let result = unsafe { tramp(ctx as *mut RtCtx, argv.as_ptr(), argv.len() as u32) };
 
         if let Some(e) = ctx.error.take() {
             return Err(e);
         }
-        Ok(ctx.value(result))
+        Ok(ctx.decode_ret(result, ret))
     }
 
     /// Host-invoke a closure value previously returned by [`call`](Self::call) (or by another
@@ -329,50 +377,112 @@ impl JitModule {
                 )));
             }
         };
+        let mut ctx = self.take_ctx();
+        let result = self.dispatch_value(&mut ctx, &code, callee, args);
+        self.store_ctx(ctx);
+        result
+    }
+
+    /// Resolve a lifted closure's env-trampoline + ABI signature and invoke it against `ctx`,
+    /// threading the closure value as the env argument. Split out for the same borrow reason as
+    /// [`dispatch`](Self::dispatch).
+    fn dispatch_value(
+        &self,
+        ctx: &mut RtCtx,
+        code: &str,
+        callee: Value,
+        args: Vec<Value>,
+    ) -> Result<Value, RunError> {
         let tramp = *self
             .closure_tramps
-            .get(&code)
+            .get(code)
             .ok_or_else(|| RunError::Internal(format!("missing closure trampoline `{code}`")))?;
+        let (params, ret) = self
+            .closure_sigs
+            .get(code)
+            .ok_or_else(|| RunError::Internal(format!("missing closure signature `{code}`")))?;
 
-        let mut ctx = self.make_ctx();
         // The closure itself is the env argument (it carries the captured cells).
         let env = ctx.intern(callee);
-        let argv: Vec<Handle> = args.into_iter().map(|a| ctx.intern(a)).collect();
-        // SAFETY: `tramp` has the `EnvTrampFn` ABI; `ctx` outlives the call; `argv` is valid
-        // for `argv.len()` handles.
-        let result =
-            unsafe { tramp(&mut ctx as *mut RtCtx, env, argv.as_ptr(), argv.len() as u32) };
+        let argv = encode_args(ctx, params, args);
+        // SAFETY: `tramp` has the `EnvTrampFn` ABI; `ctx` outlives the call; `argv` holds one
+        // bits-ABI word per declared (source-level) parameter.
+        let result = unsafe { tramp(ctx as *mut RtCtx, env, argv.as_ptr(), argv.len() as u32) };
 
         if let Some(e) = ctx.error.take() {
             return Err(e);
         }
-        Ok(ctx.value(result))
+        Ok(ctx.decode_ret(result, *ret))
+    }
+
+    /// Resolve registered host functions into pool-id order (parallel to `pools.host_fns`).
+    fn resolve_host(&self) -> Vec<Option<NativeFn>> {
+        self.pools
+            .host_fns
+            .iter()
+            .map(|n| self.host.get(n).cloned())
+            .collect()
+    }
+
+    /// Resolve bound memory handles into pool-id order (parallel to `pools.memories`).
+    fn resolve_memory(&self) -> Vec<Value> {
+        self.pools
+            .memories
+            .iter()
+            .map(|n| self.memory.get(n).cloned().unwrap_or(Value::Nil))
+            .collect()
     }
 
     /// Build a fresh per-invocation [`RtCtx`], resolving host/memory bindings into pool-id
     /// order and threading the indirect-call address table plus a code keepalive.
     fn make_ctx(&self) -> RtCtx {
-        let host: Vec<Option<NativeFn>> = self
-            .pools
-            .host_fns
-            .iter()
-            .map(|n| self.host.get(n).cloned())
-            .collect();
-        let memory: Vec<Value> = self
-            .pools
-            .memories
-            .iter()
-            .map(|n| self.memory.get(n).cloned().unwrap_or(Value::Nil))
-            .collect();
         let keepalive: Rc<dyn std::any::Any> = self.module.clone();
         RtCtx::new(
             self.pools.clone(),
-            host,
-            memory,
+            self.resolve_host(),
+            self.resolve_memory(),
             self.code_addrs.clone(),
             Some(keepalive),
         )
     }
+
+    /// Obtain a ready-to-use context for one invocation: reuse the pooled one (rebuilding its
+    /// host/memory bindings only if they changed since last call), or build a fresh one. The
+    /// caller must return it via [`Self::store_ctx`] after the call so the next call can reuse
+    /// it. Taking it out means a reentrant call gets its own fresh context.
+    fn take_ctx(&mut self) -> RtCtx {
+        let ctx = match self.cached_ctx.take() {
+            Some(mut ctx) => {
+                if self.bindings_dirty {
+                    let host = self.resolve_host();
+                    let memory = self.resolve_memory();
+                    ctx.rebind(host, memory);
+                }
+                ctx.reset();
+                ctx
+            }
+            None => self.make_ctx(),
+        };
+        self.bindings_dirty = false;
+        ctx
+    }
+
+    /// Return a context to the pool for reuse by the next call.
+    fn store_ctx(&mut self, ctx: RtCtx) {
+        self.cached_ctx = Some(ctx);
+    }
+}
+
+/// Encode call arguments into the bits-ABI buffer the trampolines read: exactly one 64-bit
+/// word per declared parameter (scalars as raw bits via [`RtCtx::encode_arg`], reference
+/// values interned to handles). Surplus arguments are ignored and missing ones default to
+/// `nil`, so the buffer length always matches the parameter count the trampoline expects.
+fn encode_args(ctx: &mut RtCtx, params: &[Repr], args: Vec<Value>) -> Vec<u64> {
+    let mut args = args.into_iter();
+    params
+        .iter()
+        .map(|&r| ctx.encode_arg(args.next().unwrap_or(Value::Nil), r))
+        .collect()
 }
 
 /// Build a clif [`Signature`] from raw clif types.
@@ -468,7 +578,6 @@ fn define_body(
 /// Build one trampoline into `tramp_id`.
 fn define_trampoline(
     module: &mut JITModule,
-    shims: &HashMap<&'static str, FuncId>,
     fbctx: &mut FunctionBuilderContext,
     tramp_id: FuncId,
     typed_id: FuncId,
@@ -482,14 +591,7 @@ fn define_trampoline(
     );
     {
         let builder = FunctionBuilder::new(&mut ctx.func, fbctx);
-        build_trampoline(
-            builder,
-            module as &mut dyn Module,
-            shims,
-            typed_id,
-            params,
-            ret,
-        );
+        build_trampoline(builder, module as &mut dyn Module, typed_id, params, ret);
     }
     module
         .define_function(tramp_id, &mut ctx)
@@ -502,7 +604,6 @@ fn define_trampoline(
 /// source-level parameters, excluding the hidden env.
 fn define_env_trampoline(
     module: &mut JITModule,
-    shims: &HashMap<&'static str, FuncId>,
     fbctx: &mut FunctionBuilderContext,
     tramp_id: FuncId,
     typed_id: FuncId,
@@ -513,14 +614,7 @@ fn define_env_trampoline(
     ctx.func.signature = env_trampoline_signature(module.isa().default_call_conv());
     {
         let builder = FunctionBuilder::new(&mut ctx.func, fbctx);
-        build_env_trampoline(
-            builder,
-            module as &mut dyn Module,
-            shims,
-            typed_id,
-            params,
-            ret,
-        );
+        build_env_trampoline(builder, module as &mut dyn Module, typed_id, params, ret);
     }
     module
         .define_function(tramp_id, &mut ctx)

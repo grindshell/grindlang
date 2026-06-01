@@ -1,0 +1,9 @@
+---
+source: tests/snapshots.rs
+expression: "parse_diag(\"function f(t) for x in each(t) do end end\")"
+---
+error[E0203]: generic `for` may only iterate with `ipairs(...)` or `pairs(...)`
+  --> 1:24
+   |
+  1| function f(t) for x in each(t) do end end
+   |                        ^^^^

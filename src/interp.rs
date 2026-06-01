@@ -210,7 +210,11 @@ impl<'a> Interpreter<'a> {
     /// Host-invoke a function value previously returned by [`call`](Self::call) (e.g. a
     /// closure). Mirrors the JIT's `call_value`, so the differential harness can validate
     /// host-invoke across all three backends.
-    pub fn call_value_public(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RunError> {
+    pub fn call_value_public(
+        &mut self,
+        callee: Value,
+        args: Vec<Value>,
+    ) -> Result<Value, RunError> {
         self.call_value(&callee, args)
     }
 

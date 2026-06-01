@@ -1,0 +1,7 @@
+---
+source: tests/snapshots.rs
+expression: "signature(\"K = 7\\nfunction double(x) return x * 2 end\\nfunction is_pos(n) return n > 0 end\",\n&TypeConfig::default())"
+---
+K: number
+double: fn(number) -> number
+is_pos: fn(number) -> bool

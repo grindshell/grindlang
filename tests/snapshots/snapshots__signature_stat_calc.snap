@@ -1,0 +1,7 @@
+---
+source: tests/snapshots.rs
+expression: "signature(&read_fixture(\"stat_calc.lua\"), &TypeConfig::default())"
+---
+ARMOR_K: number
+lethal: fn(number, number, number) -> bool
+mitigated: fn(number, number) -> number

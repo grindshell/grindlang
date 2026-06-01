@@ -1,0 +1,6 @@
+---
+source: tests/snapshots.rs
+expression: "signature(&read_fixture(\"dialog_decision.lua\"), &cfg)"
+---
+choices: fn() -> array<string>
+greeting: fn() -> string

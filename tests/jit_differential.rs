@@ -219,6 +219,71 @@ fn math_builtins_and_const() {
     );
 }
 
+/// The single-argument `math.*` builtins the JIT lowers to native cranelift float ops
+/// (`floor`/`ceil`/`abs`/`sqrt`) must stay bit-identical to the runtime reference impl that
+/// the AST interpreter and IR VM use — across negative, fractional, and integral inputs.
+#[test]
+fn native_math_builtins() {
+    for (call, inputs) in [
+        ("math.floor(x)", [-3.7, -3.0, 0.0, 2.5, 9.0]),
+        ("math.ceil(x)", [-3.7, -3.0, 0.0, 2.5, 9.0]),
+        ("math.abs(x)", [-3.7, -3.0, 0.0, 2.5, 9.0]),
+        ("math.sqrt(x)", [0.0, 2.0, 4.0, 9.0, 16.0]),
+    ] {
+        let src = format!("function f(x) return {call} end");
+        for v in inputs {
+            assert_same(&src, "f", vec![Value::Number(v)]);
+        }
+    }
+}
+
+// ---- pooled runtime context (per-call ctx reuse) ----
+
+/// The JIT pools one runtime context across calls. Repeated calls on the same module must be
+/// independent — no value-table handles leaking from a prior call into the next.
+#[test]
+fn pooled_ctx_no_value_leak_between_calls() {
+    let src = "function f(n)\n  local t = { n }\n  t[#t + 1] = n * 2\n  return t[2]\nend";
+    let cfg = TypeConfig::default();
+    let (module, res, info) = grindlang::analyze(src, &cfg).unwrap();
+    let program = grindlang::ir::lower(&module, &res, &info, &cfg).unwrap();
+    let mut jit = JitModule::compile(&program).unwrap();
+    for n in [1.0, 2.0, 3.0, 4.0] {
+        let r = jit.call("f", vec![Value::Number(n)]).unwrap();
+        assert_eq!(format!("{r}"), format!("{}", n * 2.0));
+    }
+}
+
+/// Re-binding host memory *between* calls on a pooled module must be observed by the next call
+/// (the context's resolved bindings are rebuilt when marked dirty).
+#[test]
+fn pooled_ctx_rebinds_memory_between_calls() {
+    let src = "function get() return mem.x end";
+    let mut rec = BTreeMap::new();
+    rec.insert("x".to_string(), Type::Number);
+    let mut tc_mem = BTreeMap::new();
+    tc_mem.insert("mem".to_string(), Type::Record(rec));
+    let cfg = TypeConfig {
+        host_functions: BTreeMap::new(),
+        memory: tc_mem,
+    };
+    let (module, res, info) = grindlang::analyze(src, &cfg).unwrap();
+    let program = grindlang::ir::lower(&module, &res, &info, &cfg).unwrap();
+    let mut jit = JitModule::compile(&program).unwrap();
+
+    let mk = |x: f64| {
+        let mut m = BTreeMap::new();
+        m.insert("x".to_string(), Value::Number(x));
+        Value::table(m)
+    };
+
+    jit.set_memory("mem", mk(1.0));
+    assert_eq!(format!("{}", jit.call("get", vec![]).unwrap()), "1");
+    // Re-bind to a different table between calls; the pooled ctx must pick it up.
+    jit.set_memory("mem", mk(2.0));
+    assert_eq!(format!("{}", jit.call("get", vec![]).unwrap()), "2");
+}
+
 #[test]
 fn tostring_tonumber() {
     // `n + 0` pins `n` to `number` (a bare `tostring(n)` leaves it ambiguous → no inference).

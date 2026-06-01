@@ -25,12 +25,12 @@
 //!   functions out-of-band in its runtime context and never materializes script closures, so
 //!   compiled code never produces these variants.
 
+#[cfg(any(feature = "interp", feature = "jit"))]
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::rc::Rc;
-#[cfg(any(feature = "interp", feature = "jit"))]
-use std::any::Any;
 
 use crate::runtime::builtins::num_to_string;
 

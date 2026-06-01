@@ -1,0 +1,9 @@
+---
+source: tests/snapshots.rs
+expression: "parse_diag(\"function f(...) end\")"
+---
+error[E0200]: varargs `...` are not supported in Grindlang
+  --> 1:12
+   |
+  1| function f(...) end
+   |            ^^^

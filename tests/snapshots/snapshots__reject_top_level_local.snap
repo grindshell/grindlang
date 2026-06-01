@@ -1,0 +1,9 @@
+---
+source: tests/snapshots.rs
+expression: "parse_diag(\"local g = 1\")"
+---
+error[E0103]: top-level `local` variables are not allowed in Grindlang; declare module functions/constants at the top level and keep mutable locals inside function bodies
+  --> 1:1
+   |
+  1| local g = 1
+   | ^^^^^

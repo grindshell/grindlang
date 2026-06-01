@@ -1,0 +1,9 @@
+---
+source: tests/snapshots.rs
+expression: "analyze_diag(\"function f(b)\\n  if b then return 1 end\\n  return \\\"x\\\"\\nend\")"
+---
+error[E0413]: return type mismatch: expected number, found string
+  --> 3:10
+   |
+  3|   return "x"
+   |          ^^^

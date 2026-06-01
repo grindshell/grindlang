@@ -248,8 +248,7 @@ pub fn lower(
     for decl in &module.decls {
         match decl {
             TopDecl::Function(f) => {
-                let (lowered, discovered) =
-                    lower_function(&f.name.node, &f.body, res, types, cfg)?;
+                let (lowered, discovered) = lower_function(&f.name.node, &f.body, res, types, cfg)?;
                 functions.insert(f.name.node.clone(), lowered);
                 queue.extend(discovered);
             }
@@ -571,7 +570,9 @@ impl<'a> FnLowerer<'a> {
     /// the env if it's an upvalue, or from the symbol's own (cell-holding) local otherwise.
     fn cell_of(&mut self, id: SymbolId) -> ValueId {
         if let Some(&idx) = self.upvalue_index.get(&id) {
-            let env_l = self.env_local.expect("upvalue access in a function without an env");
+            let env_l = self
+                .env_local
+                .expect("upvalue access in a function without an env");
             let env = self.emit_value(Op::LocalGet(env_l), cell_type());
             self.emit_value(Op::ClosureEnvGet(env, idx), cell_type())
         } else {
@@ -1723,17 +1724,19 @@ mod vm {
                     }
                     Value::Nil
                 }
-                Op::ClosureEnvGet(clo, i) => match self.val(act, *clo)? {
-                    Value::Closure(c) => c.env.get(*i as usize).cloned().ok_or_else(|| {
-                        RunError::Internal(format!("upvalue {i} out of range"))
-                    })?,
-                    other => {
-                        return Err(RunError::Internal(format!(
-                            "ClosureEnvGet on a {} value",
-                            other.type_name()
-                        )));
+                Op::ClosureEnvGet(clo, i) => {
+                    match self.val(act, *clo)? {
+                        Value::Closure(c) => c.env.get(*i as usize).cloned().ok_or_else(|| {
+                            RunError::Internal(format!("upvalue {i} out of range"))
+                        })?,
+                        other => {
+                            return Err(RunError::Internal(format!(
+                                "ClosureEnvGet on a {} value",
+                                other.type_name()
+                            )));
+                        }
                     }
-                },
+                }
                 Op::MakeClosure(code, cells) => {
                     let env = cells
                         .iter()
@@ -1994,7 +1997,11 @@ mod tests {
             "expected a lifted closure function, got {:?}",
             p.functions.keys().collect::<Vec<_>>()
         );
-        let lifted = p.functions.values().find(|f| f.is_closure).expect("a closure fn");
+        let lifted = p
+            .functions
+            .values()
+            .find(|f| f.is_closure)
+            .expect("a closure fn");
         assert!(lifted.is_closure);
     }
 }

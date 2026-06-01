@@ -1,0 +1,9 @@
+---
+source: tests/snapshots.rs
+expression: "parse_diag(\"function f() ::lbl:: end\")"
+---
+error[E0202]: labels (`::name::`) and `goto` are not supported in Grindlang
+  --> 1:14
+   |
+  1| function f() ::lbl:: end
+   |              ^^

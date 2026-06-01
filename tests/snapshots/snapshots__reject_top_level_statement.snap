@@ -1,0 +1,9 @@
+---
+source: tests/snapshots.rs
+expression: "parse_diag(\"doThing()\")"
+---
+error[E0104]: unexpected statement at module top level; the top level may only contain `function` declarations, `name = <const>` declarations, and an optional trailing `return { ... }`
+  --> 1:1
+   |
+  1| doThing()
+   | ^^^^^^^

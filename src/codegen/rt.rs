@@ -29,6 +29,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::runtime::builtins;
+use crate::runtime::repr::{Repr, Slot};
 use crate::value::{ClosureObj, NativeFn, RunError, Value};
 
 /// A reference-value handle: an index into [`RtCtx::values`]. Handle `0` is always `nil`.
@@ -163,6 +164,48 @@ impl RtCtx {
     /// Read a handle's value (cloning; reference values clone their `Rc`).
     pub fn value(&self, h: Handle) -> Value {
         self.values.get(h as usize).cloned().unwrap_or(Value::Nil)
+    }
+
+    /// Encode a call argument into a raw ABI word per its declared [`Repr`] (the **bits ABI**
+    /// the trampolines decode). Scalars become raw bits with no value-table entry; only
+    /// reference values are interned to a handle. Mirrors the trampoline's `decode_param`.
+    pub fn encode_arg(&mut self, v: Value, repr: Repr) -> u64 {
+        match repr {
+            Repr::Number => Slot::from_number(v.as_f64().unwrap_or(0.0)).bits(),
+            Repr::Bool => Slot::from_bool(v.as_bool().unwrap_or(false)).bits(),
+            Repr::Ptr => self.intern(v),
+            Repr::Unit => 0,
+        }
+    }
+
+    /// Decode a trampoline's raw ABI result word back into a [`Value`] per the return
+    /// [`Repr`]. Mirrors the trampoline's `encode_ret`.
+    pub fn decode_ret(&self, bits: u64, repr: Repr) -> Value {
+        match repr {
+            Repr::Number => Value::Number(Slot::from_bits(bits).as_number()),
+            Repr::Bool => Value::Bool(Slot::from_bits(bits).as_bool()),
+            Repr::Ptr => self.value(bits),
+            Repr::Unit => Value::Nil,
+        }
+    }
+
+    /// Reset for reuse on the next invocation: drop all interned values (retaining the table's
+    /// capacity, so steady-state calls don't reallocate) and clear any error. The permanent
+    /// `nil` at index 0 is reinstated. Bindings (pools/host/memory/keepalive) are preserved;
+    /// use [`rebind`](Self::rebind) when host/memory change. This keeps the per-call "arena"
+    /// semantics — every invocation still starts with an empty value table — while letting the
+    /// driver pool one context across calls instead of allocating a fresh one each time.
+    pub fn reset(&mut self) {
+        self.values.clear();
+        self.values.push(Value::Nil);
+        self.error = None;
+    }
+
+    /// Replace the host-function and memory bindings, for when the user re-registers them
+    /// between pooled invocations.
+    pub fn rebind(&mut self, host: Vec<Option<NativeFn>>, memory: Vec<Value>) {
+        self.host = host;
+        self.memory = memory;
     }
 
     fn get(&self, h: Handle) -> &Value {

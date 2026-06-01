@@ -1,0 +1,9 @@
+---
+source: tests/snapshots.rs
+expression: "parse_diag(\"function f() repeat until true end\")"
+---
+error[E0201]: `repeat ... until` loops are not supported in Grindlang; use `while`
+  --> 1:14
+   |
+  1| function f() repeat until true end
+   |              ^^^^^^

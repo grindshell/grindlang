@@ -1,7 +1,8 @@
 # Grindlang — Implementation Plan
 
-> Status: planning. Repo is currently the bare `cargo new --lib grindlang` stub
-> (`src/lib.rs` = default `add` fn, empty `Cargo.toml`, edition 2024).
+> Status: Phases 0–8 delivered (front end, resolver, types, interpreter, IR, runtime,
+> cranelift JIT, host embedding API); Phase 9 (hardening, tooling, docs) delivered. See the
+> per-phase "Delivered" notes below and [`CLAUDE.md`](CLAUDE.md) for the current shape.
 
 ## 1. What Grindlang is
 
@@ -105,8 +106,8 @@ src/
   resolve.rs        scope + constraint enforcement
   types/            type lattice, inference, unification, checking
   ir.rs             mid-level typed IR
-  interp.rs         reference interpreter (feature: `interp`, on by default early)
-  codegen/          cranelift lowering (feature: `jit`)
+  interp.rs         reference interpreter + IR VM oracles (feature: `interp`)
+  codegen/          cranelift lowering (feature: `jit`, default)
   runtime/          arena, string/table reprs, host ABI, builtins
   api.rs            Engine, Module, Value, host-fn registration, memory binding
 tests/              golden, differential (interp vs jit), integration
@@ -232,7 +233,7 @@ Each phase is independently testable and leaves the crate green
 - Module caching / recompile-on-change; optional `serde` marshaling behind a feature.
 - **Exit:** a clean, documented embedding API with examples; the API is the tested surface.
 
-### Phase 9 — Hardening, tooling, docs
+### Phase 9 — Hardening, tooling, docs  ✅ done
 - Differential + property + fuzz tests (parser, checker, interp-vs-jit). Golden snapshots.
 - Benchmarks: parse / compile / call latency; JIT vs interpreter; rough vs Luau baseline
   for a representative calc and a dialog-decision script.
@@ -241,6 +242,22 @@ Each phase is independently testable and leaves the crate green
 - A worked **integration spike**: a standalone example embedding Grindlang to make a
   dialog-tree decision and run a stat calculation against host memory — proving the
   coexist-with-Luau story without touching the other repos.
+
+> **Delivered.** Testing now spans the curated differential corpus
+> (`tests/jit_differential.rs`), the deterministic LCG fuzzer (`tests/jit_fuzz.rs`), a
+> **proptest** property suite that generates random expression programs *and* inputs and
+> shrinks any AST==IR==JIT divergence to a minimal case (`tests/prop_differential.rs`), and
+> **insta** golden snapshots pinning rendered diagnostics and inferred export signatures
+> (`tests/snapshots.rs`, `tests/snapshots/`). `benches/grindlang.rs` (criterion) measures
+> front-end parse/analyze/compile latency, backend compile (grindlang JIT vs. Luau), and call
+> latency across all three grindlang executors plus a **Luau baseline** (`mlua`, `luau-jit`)
+> over `fib`/`loopsum`/`mitigated` workloads — on a sample run the cranelift JIT calls a
+> recursive `fib` ~7× faster than Luau and orders of magnitude faster than the tree-walking
+> interpreter. Docs: this plan, [`CLAUDE.md`](CLAUDE.md) (agent onboarding, mirroring the
+> sibling repos), and [`SPEC.md`](SPEC.md) (the author-facing language contract). The
+> integration spike ships as `examples/embed.rs` (a stat calc + a dialog decision against host
+> memory, run with `cargo run --example embed`). The differential/fuzz/property suites are
+> gated on `all(feature = "interp", feature = "jit")`; run `cargo test --features interp`.
 
 ## 5. Risks & mitigations
 
