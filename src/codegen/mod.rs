@@ -59,6 +59,26 @@ type TrampFn = unsafe extern "C" fn(*mut RtCtx, *const Handle, u32) -> Handle;
 /// handle`, where `env` is the closure value handle.
 type EnvTrampFn = unsafe extern "C" fn(*mut RtCtx, Handle, *const Handle, u32) -> Handle;
 
+/// Arity-specialized fn-pointer types for the **direct-call fast path**. An exported function
+/// whose signature is all-`number` is invoked straight at its native typed address as
+/// `(ctx, f64 × N) -> f64`, skipping the trampoline hop and the argument buffer entirely.
+/// Signatures involving `bool`/reference/`unit` keep using the uniform trampoline. Cranelift
+/// lowers the typed function with the platform C ABI (`isa.default_call_conv()`), so these
+/// `extern "C"` pointers match it exactly — the same contract the trampolines already rely on.
+type Direct0 = unsafe extern "C" fn(*mut RtCtx) -> f64;
+type Direct1 = unsafe extern "C" fn(*mut RtCtx, f64) -> f64;
+type Direct2 = unsafe extern "C" fn(*mut RtCtx, f64, f64) -> f64;
+type Direct3 = unsafe extern "C" fn(*mut RtCtx, f64, f64, f64) -> f64;
+type Direct4 = unsafe extern "C" fn(*mut RtCtx, f64, f64, f64, f64) -> f64;
+type Direct5 = unsafe extern "C" fn(*mut RtCtx, f64, f64, f64, f64, f64) -> f64;
+type Direct6 = unsafe extern "C" fn(*mut RtCtx, f64, f64, f64, f64, f64, f64) -> f64;
+type Direct7 = unsafe extern "C" fn(*mut RtCtx, f64, f64, f64, f64, f64, f64, f64) -> f64;
+type Direct8 = unsafe extern "C" fn(*mut RtCtx, f64, f64, f64, f64, f64, f64, f64, f64) -> f64;
+
+/// Maximum arity handled by the direct-call fast path (one arm per arity below). Higher-arity
+/// all-`number` functions fall back to the trampoline.
+const MAX_DIRECT_ARGS: usize = 8;
+
 /// A compiled module: native code plus the machinery to call it.
 pub struct JitModule {
     /// Keeps the executable memory mapped. Shared (by [`Rc`]) into any closure that escapes to
@@ -331,14 +351,23 @@ impl JitModule {
         let (tramp, params, ret): (TrampFn, &[Repr], Repr) =
             match target {
                 ExportTarget::Function(n) => {
-                    let tramp = *self
-                        .fn_tramps
-                        .get(n)
-                        .ok_or_else(|| RunError::Internal(format!("missing trampoline `{n}`")))?;
                     let (params, ret) = self
                         .fn_sigs
                         .get(n)
                         .ok_or_else(|| RunError::Internal(format!("missing signature `{n}`")))?;
+                    // Fast path: an all-`number` export is called directly at its native typed
+                    // address, skipping the trampoline hop and the argument buffer.
+                    if *ret == Repr::Number
+                        && params.len() <= MAX_DIRECT_ARGS
+                        && params.iter().all(|&r| r == Repr::Number)
+                        && let Some(&addr) = self.code_addrs.get(n)
+                    {
+                        return self.call_direct_number(ctx, addr, params.len(), &args);
+                    }
+                    let tramp = *self
+                        .fn_tramps
+                        .get(n)
+                        .ok_or_else(|| RunError::Internal(format!("missing trampoline `{n}`")))?;
                     (tramp, params.as_slice(), *ret)
                 }
                 ExportTarget::Const(n) => {
@@ -362,6 +391,54 @@ impl JitModule {
             return Err(e);
         }
         Ok(ctx.decode_ret(result, ret))
+    }
+
+    /// Direct-call fast path for an all-`number` export: invoke the native typed function at
+    /// `addr` as `(ctx, f64 × arity) -> f64`, skipping the trampoline and the argument buffer.
+    /// `arity` is `<= MAX_DIRECT_ARGS` (guaranteed by the caller). Surplus args are ignored and
+    /// missing ones default to `0.0`, matching the trampoline path's `nil`-to-`0.0` coercion.
+    fn call_direct_number(
+        &self,
+        ctx: &mut RtCtx,
+        addr: u64,
+        arity: usize,
+        args: &[Value],
+    ) -> Result<Value, RunError> {
+        let mut a = [0f64; MAX_DIRECT_ARGS];
+        for (slot, v) in a.iter_mut().zip(args) {
+            *slot = v.as_f64().unwrap_or(0.0);
+        }
+        let p = addr as *const u8;
+        let c = ctx as *mut RtCtx;
+        // SAFETY: `addr` is the finalized native address of the typed function `fn_<name>`,
+        // whose signature the caller verified is `(ctx, f64 × arity) -> f64`. It was compiled
+        // with the platform C ABI, so the matching arity-specialized `extern "C"` pointer is
+        // the same ABI contract the trampolines rely on. `ctx` is a live, exclusive `*mut
+        // RtCtx` that outlives the call.
+        let r = unsafe {
+            match arity {
+                0 => std::mem::transmute::<*const u8, Direct0>(p)(c),
+                1 => std::mem::transmute::<*const u8, Direct1>(p)(c, a[0]),
+                2 => std::mem::transmute::<*const u8, Direct2>(p)(c, a[0], a[1]),
+                3 => std::mem::transmute::<*const u8, Direct3>(p)(c, a[0], a[1], a[2]),
+                4 => std::mem::transmute::<*const u8, Direct4>(p)(c, a[0], a[1], a[2], a[3]),
+                5 => std::mem::transmute::<*const u8, Direct5>(p)(c, a[0], a[1], a[2], a[3], a[4]),
+                6 => std::mem::transmute::<*const u8, Direct6>(p)(
+                    c, a[0], a[1], a[2], a[3], a[4], a[5],
+                ),
+                7 => std::mem::transmute::<*const u8, Direct7>(p)(
+                    c, a[0], a[1], a[2], a[3], a[4], a[5], a[6],
+                ),
+                8 => std::mem::transmute::<*const u8, Direct8>(p)(
+                    c, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+                ),
+                _ => unreachable!("arity > MAX_DIRECT_ARGS is guarded by the caller"),
+            }
+        };
+        if let Some(e) = ctx.error.take() {
+            return Err(e);
+        }
+        Ok(Value::Number(r))
     }
 
     /// Host-invoke a closure value previously returned by [`call`](Self::call) (or by another
