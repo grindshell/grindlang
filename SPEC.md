@@ -410,6 +410,22 @@ The names of injected bindings (`mem`, registered functions) are configured per 
 `mem` is used illustratively. Injected names are reserved within a script — a top-level
 declaration may not shadow them.
 
+### 7.1 Calling exports from the host (arity & marshaling)
+
+The host invokes a compiled module's exports with Rust values and marshals the result back to
+a requested Rust type (`Module::call` / `call_typed`). Two boundary rules mirror the language's
+in-script discipline rather than silently coercing:
+
+- **Exact arity.** A call must supply exactly as many arguments as the export declares — the
+  same rule §5.5 enforces in-script, now enforced at the host boundary too. A mismatch is a
+  call error, not a silent pad-with-`nil` / drop-surplus.
+- **Integer marshaling.** Numbers are `f64`; marshaling a result into an integer Rust type
+  (`i32`/`i64`/`u32`/`usize`) **truncates a finite non-integral value toward zero** — scripts
+  are trusted dev code, so a fractional formula is treated as intentional — but **rejects a
+  non-finite value** (`NaN`, `±∞`) as a marshaling error rather than letting it land silently
+  as `0` / `i*::MAX` via a saturating cast. Marshaling into `f64`/`f32` passes any value
+  through unchanged (non-finite floats are valid).
+
 ## 8. Rejected constructs (diagnostics, not silent)
 
 Each produces a targeted, span-pointing error:

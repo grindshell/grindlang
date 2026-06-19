@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 
 use grindlang::Type;
 use grindlang::Value;
-use grindlang::api::{CallError, Engine};
+use grindlang::api::{CallError, Engine, MarshalError};
+use grindlang::RunError;
 
 /// Typed args in, typed result out, plus a registered infallible host function.
 #[test]
@@ -32,6 +33,78 @@ fn integer_marshaling() {
         .expect("compile");
     let sum: i64 = m.call_typed("add", (40_i64, 2_i64)).expect("call");
     assert_eq!(sum, 42);
+}
+
+/// Marshaling a result into an integer Rust type: a finite non-integral value truncates toward
+/// zero (trusted scripts may intend a fractional formula), but a non-finite value is rejected
+/// rather than letting the saturating `as` cast turn `∞` into `i64::MAX` silently. As an `f64`
+/// the same value passes through unchanged.
+#[test]
+fn integer_marshaling_truncates_finite_rejects_non_finite() {
+    let mut m = Engine::new()
+        .compile("function inf() return math.huge end\nfunction frac() return 3.9 end")
+        .expect("compile");
+    // f64 marshaling passes infinity through.
+    let as_float: f64 = m.call_typed("inf", ()).expect("inf as f64");
+    assert!(as_float.is_infinite());
+    // i64 marshaling rejects it instead of saturating.
+    let err = m
+        .call_typed::<_, i64>("inf", ())
+        .expect_err("inf into i64 must error");
+    assert!(
+        matches!(err, CallError::Result(MarshalError::NonFinite { .. })),
+        "got {err:?}"
+    );
+    // A finite fractional result truncates toward zero.
+    let truncated: i64 = m.call_typed("frac", ()).expect("frac into i64");
+    assert_eq!(truncated, 3);
+}
+
+/// The host call boundary enforces exact arity (SPEC §5.5) rather than padding missing
+/// arguments with `nil` or dropping surplus ones.
+#[test]
+fn call_with_wrong_arity_is_an_error() {
+    let mut m = Engine::new()
+        .compile("function add(a, b) return a + b end")
+        .expect("compile");
+    assert_eq!(m.call_typed::<_, f64>("add", (2.0, 3.0)).unwrap(), 5.0);
+    let too_few = m
+        .call_typed::<_, f64>("add", (2.0,))
+        .expect_err("too few args");
+    assert!(
+        matches!(
+            too_few,
+            CallError::Run(RunError::ArityMismatch { expected: 2, got: 1, .. })
+        ),
+        "got {too_few:?}"
+    );
+    let too_many = m
+        .call_typed::<_, f64>("add", (2.0, 3.0, 4.0))
+        .expect_err("too many args");
+    assert!(
+        matches!(
+            too_many,
+            CallError::Run(RunError::ArityMismatch { expected: 2, got: 3, .. })
+        ),
+        "got {too_many:?}"
+    );
+}
+
+/// A NaN operand to a relational compare must surface as a call error, not a silent `false`.
+/// The JIT lowers `<` to a native `fcmp` (unordered → `false`); the `rt_check_compare` guard
+/// latches the same error the tree-walking interpreter raises, so the divergence can't reach
+/// a host (this runs under the default `jit`-only feature set, which `cargo test` exercises).
+#[test]
+fn nan_comparison_is_a_call_error() {
+    let mut m = Engine::new()
+        .compile("function lt(a, b) return a < b end")
+        .expect("compile");
+    let ok: bool = m.call_typed("lt", (1.0, 2.0)).expect("finite compare");
+    assert!(ok);
+    let err = m
+        .call_typed::<_, bool>("lt", (f64::NAN, 1.0))
+        .expect_err("NaN compare must error");
+    assert!(matches!(err, CallError::Run(_)), "got {err:?}");
 }
 
 /// A bool-returning decision function.

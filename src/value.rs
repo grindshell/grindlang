@@ -51,6 +51,15 @@ pub enum RunError {
     /// A function was requested by a name the module does not export.
     #[error("no exported function named `{0}`")]
     UnknownExport(String),
+    /// An exported function was called with the wrong number of arguments from the host. The
+    /// language requires an exact arity match (SPEC §5.5); the host boundary enforces the same
+    /// rather than silently padding missing args with `nil` or dropping surplus ones.
+    #[error("`{name}` expects {expected} argument(s), got {got}")]
+    ArityMismatch {
+        name: String,
+        expected: usize,
+        got: usize,
+    },
 }
 
 /// A host-registered native function: takes the evaluated arguments and returns a value.

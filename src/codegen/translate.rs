@@ -611,7 +611,13 @@ impl<'a, 'b> Translator<'a, 'b> {
                 BinOp::Ge => FloatCC::GreaterThanOrEqual,
                 _ => unreachable!(),
             };
-            self.builder.ins().fcmp(cc, a, b)
+            let result = self.builder.ins().fcmp(cc, a, b);
+            // The native `fcmp` yields `false` for a NaN operand (IEEE unordered), but both
+            // interpreter oracles error on ordering a NaN. Latch that error so the JIT agrees;
+            // the relational result above stays native. (`==`/`!=` need no guard — IEEE
+            // equality matches the oracles' `partial_cmp`-free `scalar_eq`.)
+            self.call_shim("rt_check_compare", &[self.ctx_val, a, b]);
+            result
         } else {
             // String ordering via the runtime: rt_str_cmp -> {-1,0,1}.
             let ord = self.call_shim("rt_str_cmp", &[self.ctx_val, a, b]).unwrap();

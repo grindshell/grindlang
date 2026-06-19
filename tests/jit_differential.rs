@@ -97,6 +97,26 @@ fn branches_and_comparison() {
 }
 
 #[test]
+fn nan_comparison_agrees_across_oracles() {
+    // Ordering a NaN operand: both interpreters fail (`partial_cmp` → `None`). The JIT lowers
+    // the compare to a native `fcmp`, which silently returns `false` for NaN — so without the
+    // `rt_check_compare` guard this is a silent two-vs-one divergence. `assert_same` treats
+    // (Err, Err, Err) as agreement, so this passes only when the JIT also errors.
+    for cmp in ["<", "<=", ">", ">="] {
+        let src = format!("function f(a, b) return a {cmp} b end");
+        assert_same(&src, "f", vec![Value::Number(f64::NAN), Value::Number(1.0)]);
+        assert_same(&src, "f", vec![Value::Number(1.0), Value::Number(f64::NAN)]);
+    }
+    // `==` / `!=` stay total (no guard): NaN is unequal to everything, all three agree on it.
+    // (`+ 0` pins the params to `number`; a bare `a == b` leaves the type ambiguous.)
+    assert_same(
+        "function f(a, b) return (a + 0) == (b + 0) end",
+        "f",
+        vec![Value::Number(f64::NAN), Value::Number(f64::NAN)],
+    );
+}
+
+#[test]
 fn while_loop_accumulation() {
     let src = "function fact(n)\n\
                  local acc = 1\n\

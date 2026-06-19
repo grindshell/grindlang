@@ -57,6 +57,12 @@ pub enum MarshalError {
         expected: &'static str,
         found: &'static str,
     },
+    /// A non-finite number (`NaN` or `±∞`) was marshaled into an integer Rust type. A finite
+    /// non-integral value is truncated toward zero (a trusted-script authoring choice), but a
+    /// non-finite one has no integer meaning and would otherwise land silently as `0`/`i64::MAX`
+    /// via the saturating `as` cast — so it is rejected instead.
+    #[error("cannot marshal non-finite number {value} into an integer")]
+    NonFinite { value: f64 },
 }
 
 /// A failure from [`Engine::compile`]: a front-end error, an IR lowering error, or a JIT
@@ -117,7 +123,9 @@ where
     })
 }
 
-macro_rules! number_marshal {
+/// Float Rust types: marshal a Grindlang number through unchanged, including non-finite values
+/// (`NaN`/`±∞` are valid `f64`/`f32`).
+macro_rules! float_marshal {
     ($($t:ty),*) => {$(
         impl HostType for $t {
             fn grindlang_type() -> Type { Type::Number }
@@ -135,7 +143,32 @@ macro_rules! number_marshal {
         }
     )*};
 }
-number_marshal!(f64, f32, i64, i32, u32, usize);
+float_marshal!(f64, f32);
+
+/// Integer Rust types: a finite non-integral number is truncated toward zero (scripts are
+/// trusted dev code, so a fractional result is an intentional authoring choice), but a
+/// **non-finite** value is rejected rather than letting Rust's saturating `as` cast turn it
+/// silently into `0` (`NaN`) or `i*::MAX`/`MIN` (`±∞`).
+macro_rules! int_marshal {
+    ($($t:ty),*) => {$(
+        impl HostType for $t {
+            fn grindlang_type() -> Type { Type::Number }
+        }
+        impl IntoValue for $t {
+            fn into_value(self) -> Value { Value::Number(self as f64) }
+        }
+        impl FromValue for $t {
+            fn from_value(v: Value) -> Result<Self, MarshalError> {
+                match v.as_f64() {
+                    Some(n) if n.is_finite() => Ok(n as $t),
+                    Some(n) => Err(MarshalError::NonFinite { value: n }),
+                    None => want("number", &v),
+                }
+            }
+        }
+    )*};
+}
+int_marshal!(i64, i32, u32, usize);
 
 impl HostType for bool {
     fn grindlang_type() -> Type {

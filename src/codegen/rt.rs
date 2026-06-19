@@ -459,6 +459,19 @@ pub unsafe extern "C" fn rt_errored(ctx: *mut RtCtx) -> i8 {
     ctx!(ctx).error.is_some() as i8
 }
 
+/// Reject ordering a NaN operand, matching the interpreter oracles (`interp::compare` and
+/// `ir::Vm::compare`, which fail when `partial_cmp` returns `None`). The JIT lowers `< <= > >=`
+/// on numbers to a native unboxed `fcmp`, but an IEEE *unordered* compare silently yields
+/// `false` for a NaN operand — so without this guard a NaN comparison would diverge from the
+/// two interpreters (which error), breaking the three-oracle invariant. The relational result
+/// is still computed natively; this leaf shim only latches the error, which surfaces as `Err`
+/// at the call boundary (the same latch-and-continue discipline every reference shim uses).
+pub unsafe extern "C" fn rt_check_compare(ctx: *mut RtCtx, a: f64, b: f64) {
+    if a.is_nan() || b.is_nan() {
+        ctx!(ctx).fail(RunError::Runtime("comparison with NaN".into()));
+    }
+}
+
 // ---- calls ------------------------------------------------------------------
 
 /// Collect `argc` argument values from a handle array.
@@ -657,6 +670,7 @@ pub fn shim_symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_truthy", rt_truthy as *const u8),
         ("rt_pow", rt_pow as *const u8),
         ("rt_errored", rt_errored as *const u8),
+        ("rt_check_compare", rt_check_compare as *const u8),
         ("rt_call_host", rt_call_host as *const u8),
         ("rt_call_builtin_value", rt_call_builtin_value as *const u8),
         (

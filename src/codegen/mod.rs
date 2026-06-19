@@ -355,6 +355,13 @@ impl JitModule {
                         .fn_sigs
                         .get(n)
                         .ok_or_else(|| RunError::Internal(format!("missing signature `{n}`")))?;
+                    if args.len() != params.len() {
+                        return Err(RunError::ArityMismatch {
+                            name: name.to_string(),
+                            expected: params.len(),
+                            got: args.len(),
+                        });
+                    }
                     // Fast path: an all-`number` export is called directly at its native typed
                     // address, skipping the trampoline hop and the argument buffer.
                     if *ret == Repr::Number
@@ -371,6 +378,13 @@ impl JitModule {
                     (tramp, params.as_slice(), *ret)
                 }
                 ExportTarget::Const(n) => {
+                    if !args.is_empty() {
+                        return Err(RunError::ArityMismatch {
+                            name: name.to_string(),
+                            expected: 0,
+                            got: args.len(),
+                        });
+                    }
                     let tramp = *self.const_tramps.get(n).ok_or_else(|| {
                         RunError::Internal(format!("missing const trampoline `{n}`"))
                     })?;
@@ -479,6 +493,13 @@ impl JitModule {
             .closure_sigs
             .get(code)
             .ok_or_else(|| RunError::Internal(format!("missing closure signature `{code}`")))?;
+        if args.len() != params.len() {
+            return Err(RunError::ArityMismatch {
+                name: code.to_string(),
+                expected: params.len(),
+                got: args.len(),
+            });
+        }
 
         // The closure itself is the env argument (it carries the captured cells).
         let env = ctx.intern(callee);
@@ -640,6 +661,7 @@ fn declare_shims(
         ("rt_truthy", &[I64, I64], &[I8]),
         ("rt_pow", &[F64, F64], &[F64]),
         ("rt_errored", &[I64], &[I8]),
+        ("rt_check_compare", &[I64, F64, F64], &[]),
         ("rt_call_host", &[I64, I32, I64, I32], &[I64]),
         ("rt_call_builtin_value", &[I64, I32, I64, I32], &[I64]),
         ("rt_call_builtin_member", &[I64, I32, I64, I32], &[I64]),
