@@ -369,8 +369,10 @@ table literal for records). An annotation that contradicts inference is a compil
 A small, pure, deterministic set — no global namespace pollution beyond these names:
 
 - **math** (as a record-like namespace): `math.floor`, `math.ceil`, `math.abs`,
-  `math.min`, `math.max`, `math.sqrt`, `math.pow`, `math.huge`, `math.pi`. All operate on
-  `number`.
+  `math.min`, `math.max`, `math.sqrt`, `math.pow`, `math.log10`, `math.huge`, `math.pi`. All
+  operate on `number`. `math.log10` is base-10 logarithm; like `math.pow` it has no native
+  cranelift instruction, so the JIT routes it through the shared reference impl (`f64::log10`),
+  keeping the three oracles bit-identical.
 - **string**: `string.len`, `string.sub`, `string.upper`, `string.lower`,
   `string.find` _(plain, no patterns in v1)_, `string.format` _(restricted verbs)_.
 - **iteration**: `ipairs(array<T>)`, `pairs(map<string,T> | record)` — usable only in

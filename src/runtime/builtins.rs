@@ -76,9 +76,8 @@ pub fn member_sig(ns: &str, member: &str) -> Option<Sig> {
         rule: ArgRule::Fixed,
     };
     Some(match (ns, member) {
-        ("math", "floor") | ("math", "ceil") | ("math", "abs") | ("math", "sqrt") => {
-            fixed(vec![Type::Number], Type::Number)
-        }
+        ("math", "floor") | ("math", "ceil") | ("math", "abs") | ("math", "sqrt")
+        | ("math", "log10") => fixed(vec![Type::Number], Type::Number),
         ("math", "min") | ("math", "max") | ("math", "pow") => {
             fixed(vec![Type::Number, Type::Number], Type::Number)
         }
@@ -193,6 +192,7 @@ mod imp {
             ("math", "ceil") => Ok(Value::Number(num(0)?.ceil())),
             ("math", "abs") => Ok(Value::Number(num(0)?.abs())),
             ("math", "sqrt") => Ok(Value::Number(num(0)?.sqrt())),
+            ("math", "log10") => Ok(Value::Number(num(0)?.log10())),
             ("math", "min") => Ok(Value::Number(num(0)?.min(num(1)?))),
             ("math", "max") => Ok(Value::Number(num(0)?.max(num(1)?))),
             ("math", "pow") => Ok(Value::Number(num(0)?.powf(num(1)?))),

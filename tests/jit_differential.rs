@@ -257,6 +257,23 @@ fn native_math_builtins() {
     }
 }
 
+/// The `math.*` builtins with **no** native cranelift instruction (`pow`, `log10`) lower on the
+/// JIT through the shared runtime shim calling `f64::powf` / `f64::log10` — the same primitive
+/// the AST interpreter and IR VM use — so they must be bit-identical across the three oracles.
+/// Exercises powers of ten (where `log10` is exactly integral), non-powers, and `< 1` inputs.
+#[test]
+fn shim_math_builtins_pow_and_log10() {
+    for (call, inputs) in [
+        ("math.log10(x)", [1.0, 10.0, 100.0, 1000.0, 11.0, 0.5, 1420.0]),
+        ("math.pow(x, 3.0)", [0.0, 1.0, 2.0, 2.5, 10.0, 0.5, 3.0]),
+    ] {
+        let src = format!("function f(x) return {call} end");
+        for v in inputs {
+            assert_same(&src, "f", vec![Value::Number(v)]);
+        }
+    }
+}
+
 // ---- pooled runtime context (per-call ctx reuse) ----
 
 /// The JIT pools one runtime context across calls. Repeated calls on the same module must be

@@ -360,7 +360,7 @@ impl_host_fn!(A, B, C, D, E, F);
 // ---- call arguments ---------------------------------------------------------
 
 /// A bundle of Rust values usable as the argument list of [`Module::call_typed`]. Implemented
-/// for tuples of arity 0–6 (each element an [`IntoValue`]) and for a raw `Vec<Value>`.
+/// for tuples of arity 0–7 (each element an [`IntoValue`]) and for a raw `Vec<Value>`.
 pub trait IntoArgs {
     fn into_args(self) -> Vec<Value>;
 }
@@ -391,6 +391,7 @@ impl_into_args!(A 0, B 1, C 2);
 impl_into_args!(A 0, B 1, C 2, D 3);
 impl_into_args!(A 0, B 1, C 2, D 3, E 4);
 impl_into_args!(A 0, B 1, C 2, D 3, E 4, F 5);
+impl_into_args!(A 0, B 1, C 2, D 3, E 4, F 5, G 6);
 
 // ---- engine -----------------------------------------------------------------
 
