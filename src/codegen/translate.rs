@@ -233,7 +233,15 @@ impl<'a, 'b> Translator<'a, 'b> {
 
         match &block.term {
             Terminator::Return(Some(v)) => {
+                // Coerce to the function's declared return repr. A narrowed scalar optional
+                // (`number?`/`bool?` refined to `number`/`bool` in a guarded branch) is still
+                // an IR `Ptr` value here, but the signature return is unboxed — unbox it (and
+                // symmetrically box a scalar returned where an optional is declared). Without
+                // this, `if x ~= nil then return x end` fails cranelift verification.
+                let from = self.value_repr(*v);
+                let to = repr_of(&self.func.ret);
                 let val = self.val(*v);
+                let val = self.coerce(val, from, to);
                 self.builder.ins().return_(&[val]);
             }
             Terminator::Return(None) => {

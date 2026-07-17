@@ -331,14 +331,36 @@ struct ReturnFrame {
     saw_value: bool,
 }
 
+/// A **narrowable location**: a bare local/upvalue symbol, a host-memory root, or a field
+/// path rooted at one of those. Keying the narrowing overlay by `Place` (rather than a bare
+/// [`SymbolId`]) is what lets `if p.name ~= nil then … p.name` refine a *field*, not just a
+/// whole variable (`SPEC.md` §5.3).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Place {
+    Symbol(SymbolId),
+    Memory(String),
+    Field(Box<Place>, String),
+}
+
+impl Place {
+    /// Whether `self` is a strict descendant of `prefix` (e.g. `p.name` is under `p`). Used to
+    /// invalidate a field's narrowing when its container is reassigned.
+    fn has_ancestor(&self, prefix: &Place) -> bool {
+        match self {
+            Place::Field(base, _) => base.as_ref() == prefix || base.has_ancestor(prefix),
+            _ => false,
+        }
+    }
+}
+
 struct Checker<'a> {
     res: &'a Resolution,
     cfg: &'a TypeConfig,
     u: Unifier,
     /// Type of each symbol, indexed by [`SymbolId`].
     sym_types: Vec<Type>,
-    /// Narrowing overlay: a symbol temporarily refined to a non-optional type.
-    narrowed: BTreeMap<SymbolId, Type>,
+    /// Narrowing overlay: a [`Place`] temporarily refined to a non-optional type.
+    narrowed: BTreeMap<Place, Type>,
     /// Top-level function signatures, by name.
     func_sigs: BTreeMap<String, FnType>,
     /// Top-level constant types, by name.
@@ -604,6 +626,15 @@ impl<'a> Checker<'a> {
             let place = self.place_type(target);
             self.require_assignable(target.span, &vt, &place, "assignment type mismatch");
         }
+        // A write invalidates any narrowing of the assigned place or a sub-place of it — the
+        // guarded value may no longer hold. Conservative: syntactic only, no alias tracking
+        // (matching the trust model; scripts are trusted dev code).
+        for target in targets {
+            if let Some(place) = self.place_of(target) {
+                self.narrowed
+                    .retain(|k, _| *k != place && !k.has_ancestor(&place));
+            }
+        }
     }
 
     fn check_if(&mut self, arms: &[(Expr, Block)], else_block: &Option<Block>) {
@@ -728,7 +759,7 @@ impl<'a> Checker<'a> {
         match binding.clone() {
             Binding::Local(id) | Binding::Upvalue(id) => self
                 .narrowed
-                .get(&id)
+                .get(&Place::Symbol(id))
                 .cloned()
                 .unwrap_or_else(|| self.sym_types[id as usize].clone()),
             Binding::TopFunction(name) => Type::Function(self.func_sigs[&name].clone()),
@@ -761,6 +792,14 @@ impl<'a> Checker<'a> {
                     Type::Error
                 }
             };
+        }
+        // A narrowed field place (`if p.name ~= nil then … p.name`) reads at its refined,
+        // non-optional type inside the guarded branch (`SPEC.md` §5.3).
+        if let Some(base_place) = self.place_of(base) {
+            let place = Place::Field(Box::new(base_place), name.node.clone());
+            if let Some(t) = self.narrowed.get(&place).cloned() {
+                return t;
+            }
         }
         let bt = self.check_expr(base);
         match self.u.shallow(&bt) {
@@ -1316,9 +1355,45 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Extract a narrowing fact from an `if` condition. Supports `name ~= nil` (refine in
-    /// the then-branch). Returns the symbol and its narrowed (non-optional) type.
-    fn narrowing_from(&self, cond: &Expr) -> Option<(SymbolId, Type)> {
+    /// Map an lvalue-ish expression to the [`Place`] it denotes, if it is a narrowable
+    /// location (a bare local/upvalue, a memory root, or a field path over one). Anything
+    /// else (calls, indexing, literals) is not a place and yields `None`.
+    fn place_of(&self, expr: &Expr) -> Option<Place> {
+        match &expr.kind {
+            ExprKind::Paren(inner) => self.place_of(inner),
+            ExprKind::Name(_) => match self.res.binding(expr.span)? {
+                Binding::Local(id) | Binding::Upvalue(id) => Some(Place::Symbol(*id)),
+                Binding::Memory(name) => Some(Place::Memory(name.clone())),
+                _ => None,
+            },
+            ExprKind::Field { base, name } => {
+                Some(Place::Field(Box::new(self.place_of(base)?), name.node.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The current static type of a [`Place`] — the narrowing overlay if present, else the
+    /// declared type: a symbol's inferred type, a memory root's schema type, or a record
+    /// field of the base's type.
+    fn place_current_type(&self, place: &Place) -> Option<Type> {
+        if let Some(t) = self.narrowed.get(place) {
+            return Some(t.clone());
+        }
+        match place {
+            Place::Symbol(id) => Some(self.sym_types[*id as usize].clone()),
+            Place::Memory(name) => self.cfg.memory.get(name).cloned(),
+            Place::Field(base, field) => match self.u.shallow(&self.place_current_type(base)?) {
+                Type::Record(fields) => fields.get(field).cloned(),
+                _ => None,
+            },
+        }
+    }
+
+    /// Extract a narrowing fact from an `if` condition. Supports `<place> ~= nil` (refine in
+    /// the then-branch), where `<place>` is a bare name **or** a field path (`p.name`).
+    /// Returns the place and its narrowed (non-optional) type.
+    fn narrowing_from(&self, cond: &Expr) -> Option<(Place, Type)> {
         let ExprKind::Binary {
             op: BinOp::Ne,
             lhs,
@@ -1327,40 +1402,36 @@ impl<'a> Checker<'a> {
         else {
             return None;
         };
-        // Match `name ~= nil` or `nil ~= name`.
-        let name = match (&lhs.kind, &rhs.kind) {
-            (ExprKind::Name(_), ExprKind::Nil) => lhs,
-            (ExprKind::Nil, ExprKind::Name(_)) => rhs,
+        // Match `<place> ~= nil` or `nil ~= <place>`.
+        let place_expr = match (&lhs.kind, &rhs.kind) {
+            (_, ExprKind::Nil) => lhs,
+            (ExprKind::Nil, _) => rhs,
             _ => return None,
         };
-        let binding = self.res.binding(name.span)?;
-        let id = match binding {
-            Binding::Local(id) | Binding::Upvalue(id) => *id,
-            _ => return None,
-        };
-        match self.u.shallow(&self.sym_types[id as usize]) {
-            Type::Optional(inner) => Some((id, *inner)),
+        let place = self.place_of(place_expr)?;
+        match self.u.shallow(&self.place_current_type(&place)?) {
+            Type::Optional(inner) => Some((place, *inner)),
             _ => None,
         }
     }
 
     fn apply_narrowing(
         &mut self,
-        narrowing: Option<(SymbolId, Type)>,
-    ) -> Option<(SymbolId, Option<Type>)> {
-        let (id, t) = narrowing?;
-        let prev = self.narrowed.insert(id, t);
-        Some((id, prev))
+        narrowing: Option<(Place, Type)>,
+    ) -> Option<(Place, Option<Type>)> {
+        let (place, t) = narrowing?;
+        let prev = self.narrowed.insert(place.clone(), t);
+        Some((place, prev))
     }
 
-    fn restore_narrowing(&mut self, saved: Option<(SymbolId, Option<Type>)>) {
-        if let Some((id, prev)) = saved {
+    fn restore_narrowing(&mut self, saved: Option<(Place, Option<Type>)>) {
+        if let Some((place, prev)) = saved {
             match prev {
                 Some(t) => {
-                    self.narrowed.insert(id, t);
+                    self.narrowed.insert(place, t);
                 }
                 None => {
-                    self.narrowed.remove(&id);
+                    self.narrowed.remove(&place);
                 }
             }
         }
@@ -1584,6 +1655,57 @@ mod tests {
     fn ambiguous_param_is_rejected() {
         // `x` is passed through without any type-determining use.
         assert_eq!(err_code("function f(x) return x end", &empty()), "E0410");
+    }
+
+    #[test]
+    fn field_narrowing_refines_optional_field() {
+        // `SPEC.md` §5.3: `p.b` is `number?`; the `~= nil` guard refines it to `number` in
+        // the branch, so both returns unify to `number` and the module type-checks.
+        let info = ok(
+            "function f()\n\
+               local p = { b = tonumber(\"5\") }\n\
+               if p.b ~= nil then return p.b end\n\
+               return 0\n\
+             end",
+            &empty(),
+        );
+        assert_eq!(info.exports["f"].to_string(), "fn() -> number");
+    }
+
+    #[test]
+    fn field_without_narrowing_stays_optional() {
+        // Without the guard, `p.b : number?` cannot unify with the `number` return — the
+        // refinement is genuinely what makes the narrowed program check.
+        assert_eq!(
+            err_code(
+                "function f()\n\
+                   local p = { b = tonumber(\"5\") }\n\
+                   return p.b + 0\n\
+                 end",
+                &empty(),
+            ),
+            "E0401",
+        );
+    }
+
+    #[test]
+    fn write_invalidates_field_narrowing() {
+        // Reassigning the narrowed field inside the branch drops the refinement, so the
+        // subsequent use is `number?` again and fails to unify with the `number` return.
+        assert_eq!(
+            err_code(
+                "function f()\n\
+                   local p = { b = tonumber(\"5\") }\n\
+                   if p.b ~= nil then\n\
+                     p.b = tonumber(\"9\")\n\
+                     return p.b\n\
+                   end\n\
+                   return 0\n\
+                 end",
+                &empty(),
+            ),
+            "E0413",
+        );
     }
 
     #[test]

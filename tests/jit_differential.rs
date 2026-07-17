@@ -713,3 +713,47 @@ fn closures_fixture_host_returns_and_invokes() {
         "ok:108"
     );
 }
+
+// ---- field narrowing (`SPEC.md` §5.3) ---------------------------------------------------
+//
+// `if <place> ~= nil then … <place>` refines a *field* (not just a bare local) to its
+// non-optional type inside the guarded branch. These lock the three oracles in agreement,
+// and — for the scalar cases — pin the `Return`-site repr coercion that a narrowed
+// `number?`/`bool?` needs (it is an IR `Ptr` handle but the signature returns unboxed).
+
+#[test]
+fn field_narrowing_reference_optional() {
+    // `p.b : string?` (map read produces an optional), narrowed to `string` and returned.
+    let src = "function f()\n\
+                 local m = { [\"k\"] = \"hi\" }\n\
+                 local p = { b = m[\"k\"] }\n\
+                 if p.b ~= nil then return p.b end\n\
+                 return \"none\"\n\
+               end";
+    assert_same(src, "f", vec![]);
+}
+
+#[test]
+fn field_narrowing_scalar_optional_return() {
+    // `p.b : number?` (from `tonumber`), narrowed to `number` and returned — crosses the
+    // Ptr→f64 boundary at the return, so it exercises the coercion the JIT needs.
+    let src = "function f()\n\
+                 local p = { b = tonumber(\"5\") }\n\
+                 if p.b ~= nil then return p.b end\n\
+                 return 0\n\
+               end";
+    assert_same(src, "f", vec![]);
+}
+
+#[test]
+fn scalar_optional_bare_local_narrowing_return() {
+    // Regression: even *bare-local* scalar narrowing (`SPEC.md` lists it as working) used to
+    // miscompile — the JIT verifier rejected returning the boxed handle where the signature
+    // says f64. The `Return`-site coercion fixes it; all three oracles now agree.
+    let src = "function f()\n\
+                 local x = tonumber(\"7\")\n\
+                 if x ~= nil then return x end\n\
+                 return 0\n\
+               end";
+    assert_same(src, "f", vec![]);
+}
