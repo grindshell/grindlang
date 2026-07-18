@@ -757,3 +757,41 @@ fn scalar_optional_bare_local_narrowing_return() {
                end";
     assert_same(src, "f", vec![]);
 }
+
+// ---- `---@` annotations (`SPEC.md` §5.6) ------------------------------------------------
+//
+// Annotations only *constrain the checker* — they don't change runtime semantics — but they
+// unlock parameter shapes (record/array) that inference alone can't express. These pin the
+// three oracles in agreement on such shapes marshaling in and back out.
+
+#[test]
+fn annotated_record_param_runs() {
+    let src = "---@param p { hp: number, atk: number }\n\
+               function dmg(p) return p.hp + p.atk * 2 end";
+    let mut rec = BTreeMap::new();
+    rec.insert("hp".to_string(), Value::Number(30.0));
+    rec.insert("atk".to_string(), Value::Number(4.0));
+    assert_same(src, "dmg", vec![Value::table(rec)]);
+}
+
+#[test]
+fn annotated_array_param_runs() {
+    let src = "---@param xs number[]\n\
+               function total(xs)\n\
+                 local s = 0\n\
+                 for _, v in ipairs(xs) do s = s + v end\n\
+                 return s\n\
+               end";
+    let xs = Value::array(vec![Value::Number(3.0), Value::Number(5.0), Value::Number(9.0)]);
+    assert_same(src, "total", vec![xs]);
+}
+
+#[test]
+fn annotated_unused_param_runs() {
+    // Previously an E0410 compile error; the annotation makes it a valid `fn(number) -> number`.
+    assert_same(
+        "---@param x number\nfunction f(x) return 1 end",
+        "f",
+        vec![Value::Number(99.0)],
+    );
+}

@@ -358,11 +358,34 @@ end
 
 ### 5.6 Annotations (optional)
 
-EmmyLua `---@` comments (§2.2) may pin types where inference is insufficient or for
-documentation. Recognized _(v1)_: `---@param <name> <type>`, `---@return <type>`,
-`---@type <type>`. Annotation type syntax mirrors §5.1 in EmmyLua spelling
-(`number`, `string?`, `number[]` for `array<number>`, `{ [string]: T }` for `map`,
-table literal for records). An annotation that contradicts inference is a compile error.
+EmmyLua `---@` comments (§2.2) may pin types where inference is insufficient (e.g. a
+parameter used only by pass-through, or a record/array parameter whose shape inference can't
+recover) or for documentation. A `---` doc-comment block **immediately preceding** a
+top-level `function` annotates it; the block binds to that function only.
+
+Recognized _(v1)_: `---@param <name> <type>` and `---@return <type>` on top-level functions.
+`---@type <type>` (locals) is **deferred**. Other EmmyLua directives (`@class`, `@field`, …)
+and free-form doc text are ignored, so a file stays valid EmmyLua documentation; only a
+malformed `@param`/`@return` we consume is an error.
+
+**Accepted type syntax _(v1)_** — the EmmyLua spelling of the §5.1 lattice:
+
+```ebnf
+type    ::= primary { '?' | '[' ']' }          -- postfix optional / array, left-to-right
+primary ::= 'number' | 'bool' | 'string' | 'nil'
+          | '{' '[' 'string' ']' ':' type '}'  -- map<string, T>
+          | '{' field {',' field} [','] '}'    -- record
+field   ::= Name ':' type
+```
+
+Postfix binds left-to-right: `number[]?` is an optional array; `number?[]` is an array of
+optionals. Record and map literals may nest. Function types (`fn(...)->...`) and host
+`userdata` are **not** yet spellable in an annotation.
+
+An annotation is applied **before** the body is checked, so a record/array parameter's shape
+is visible to the body. An annotation that **contradicts** how the body uses the value is a
+compile error at the conflicting use (e.g. `---@param x string` with `x + 1` fails the numeric
+operator). `---@param` naming a non-parameter, or an unknown type name, is also an error.
 
 ## 6. Builtins _(v1)_
 
@@ -496,7 +519,9 @@ both read/write persistent memory.
   iterate with `ipairs` (§5.4).
 - **`repeat … until` is not supported**; **`//` floor-division is supported** (§3.3, §3.5, §8).
 - **Multi-return arity mismatch is a compile error** — no Lua-style truncate/pad (§5.5).
+- **`---@` annotation type-syntax subset** is fixed (§5.6): `@param`/`@return` on top-level
+  functions, scalar/optional/array/map/record spellings, `@type` and function/userdata types
+  deferred, unknown directives ignored.
 
 ### Open spec items still to settle during implementation
-- Exact EmmyLua type-syntax subset accepted by `---@` annotations (§5.6).
 - `string.format` verb whitelist and `string.find` plain-vs-pattern policy (§6).

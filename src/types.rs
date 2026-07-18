@@ -9,8 +9,9 @@
 //! ## What is and isn't inferred (v1)
 //!
 //! * Numbers are a single `f64` type ([`Type::Number`]).
-//! * Parameter types are inferred from how they're *used* (operators, calls, indexing).
-//!   A parameter whose type can't be pinned that way is an error ("ambiguous, annotate").
+//! * Parameter types are inferred from how they're *used* (operators, calls, indexing), or
+//!   pinned by a `---@param` annotation (§5.6). A parameter that is neither used in a
+//!   type-determining way nor annotated is an error ("ambiguous, annotate").
 //! * Table literals get a concrete shape: all-positional → [`Type::Array`], all-`name =`
 //!   → [`Type::Record`], string-keyed → [`Type::Map`].
 //! * Conditions must be `bool`; equality needs matching operand types; arithmetic/relational
@@ -21,9 +22,10 @@
 //! * **Multi-value returns / tuples.** A function returns 0 or 1 values in v1; a `return`
 //!   with two or more values is rejected. Call/assignment lists require exact arity with
 //!   one value per expression.
-//! * **EmmyLua `---@` annotations.** Comments are stripped by the lexer, so annotations
-//!   can't yet pin types; inference is the only source. (Record-typed *parameters*
-//!   therefore can't be expressed yet — they'd need an annotation.)
+//! * **EmmyLua `---@` annotations** (§5.6) are supported for top-level functions: `---@param
+//!   <name> <type>` and `---@return <type>` pin a parameter/return type (parsed by
+//!   [`crate::annotations`], applied in Pass 2 before bodies are checked). This is what lets a
+//!   record/array-typed *parameter* be expressed. Still deferred: `---@type` on locals.
 //! * **Flow narrowing** is limited to `if <name> ~= nil`/`== nil` on a bare local; richer
 //!   narrowing (fields, early-return flow) is future work.
 //! * **Method calls** (`recv:m(...)`) and **`pairs` over records** are not yet typed.
@@ -403,10 +405,16 @@ impl<'a> Checker<'a> {
         }
 
         // Pass 2: pre-create a signature (fresh vars) for every top-level function so
-        // calls — including mutual recursion — resolve before bodies are checked.
+        // calls — including mutual recursion — resolve before bodies are checked. `---@`
+        // annotations pin parameter/return vars here, *before* Pass 3, so the body sees a
+        // record/array parameter's shape and an otherwise-untypeable parameter is no longer
+        // ambiguous (`SPEC.md` §5.6).
         for decl in &module.decls {
             if let TopDecl::Function(f) = decl {
                 let sig = self.make_sig(&f.body.params);
+                if !f.annotations.is_empty() {
+                    self.apply_fn_annotations(f, &sig);
+                }
                 self.func_sigs.insert(f.name.node.clone(), sig);
             }
         }
@@ -495,6 +503,78 @@ impl<'a> Checker<'a> {
         FnType {
             params: ptypes,
             ret: Box::new(self.u.fresh()),
+        }
+    }
+
+    /// Pin parameter/return types from `---@param`/`---@return` annotations onto the (still
+    /// fresh) signature vars. Applied in Pass 2, before bodies are checked, so a record/array
+    /// parameter's shape is visible to the body and an unused parameter becomes typed. A
+    /// direct conflict *here* is rare (the vars are fresh); the usual contradiction —
+    /// annotation vs. how the body uses the value — surfaces as an ordinary type error at the
+    /// conflicting use site.
+    fn apply_fn_annotations(&mut self, f: &FuncDecl, sig: &FnType) {
+        for pa in &f.annotations.params {
+            match f.body.params.iter().find(|p| p.node == pa.name.node) {
+                Some(param) => {
+                    if let Some(id) = self.res.def(param.span) {
+                        let ann = self.ann_to_type(&pa.ty.node, pa.ty.span);
+                        let target = self.sym_types[id as usize].clone();
+                        if self.u.unify(&ann, &target).is_err() {
+                            self.error(
+                                "E0460",
+                                format!(
+                                    "annotation for parameter `{}` conflicts with its type",
+                                    pa.name.node
+                                ),
+                                pa.ty.span,
+                            );
+                        }
+                    }
+                }
+                None => self.error(
+                    "E0461",
+                    format!("`@param` refers to unknown parameter `{}`", pa.name.node),
+                    pa.name.span,
+                ),
+            }
+        }
+        if let Some(ret_ann) = &f.annotations.ret {
+            let ann = self.ann_to_type(&ret_ann.node, ret_ann.span);
+            let target = (*sig.ret).clone();
+            if self.u.unify(&ann, &target).is_err() {
+                self.error(
+                    "E0460",
+                    "`@return` annotation conflicts with the inferred return type",
+                    ret_ann.span,
+                );
+            }
+        }
+    }
+
+    /// Resolve a parsed [`TypeAnn`] shape to a concrete [`Type`]. `span` locates an
+    /// unknown-type-name error back at the annotation.
+    fn ann_to_type(&mut self, ann: &TypeAnn, span: Span) -> Type {
+        match ann {
+            TypeAnn::Named(n) => match n.as_str() {
+                "number" => Type::Number,
+                "bool" => Type::Bool,
+                "string" => Type::String,
+                "nil" => Type::Nil,
+                other => {
+                    self.error("E0462", format!("unknown type `{other}` in annotation"), span);
+                    Type::Error
+                }
+            },
+            TypeAnn::Optional(t) => Type::optional(self.ann_to_type(t, span)),
+            TypeAnn::Array(t) => Type::array(self.ann_to_type(t, span)),
+            TypeAnn::Map(t) => Type::map(self.ann_to_type(t, span)),
+            TypeAnn::Record(fields) => {
+                let mut m = BTreeMap::new();
+                for (k, v) in fields {
+                    m.insert(k.clone(), self.ann_to_type(v, span));
+                }
+                Type::Record(m)
+            }
         }
     }
 
@@ -1655,6 +1735,90 @@ mod tests {
     fn ambiguous_param_is_rejected() {
         // `x` is passed through without any type-determining use.
         assert_eq!(err_code("function f(x) return x end", &empty()), "E0410");
+    }
+
+    #[test]
+    fn annotation_types_an_unused_param() {
+        // The keystone: `---@param` pins an otherwise-untypeable parameter (no E0410).
+        let info = ok(
+            "---@param x number\nfunction f(x) return 1 end",
+            &empty(),
+        );
+        assert_eq!(info.exports["f"].to_string(), "fn(number) -> number");
+    }
+
+    #[test]
+    fn annotation_expresses_a_record_param() {
+        // Record-typed parameters — impossible by inference alone — become expressible, and
+        // the annotated shape is visible to the body's field access.
+        let info = ok(
+            "---@param p { hp: number, tag: string }\nfunction f(p) return p.hp end",
+            &empty(),
+        );
+        assert_eq!(
+            info.exports["f"].to_string(),
+            "fn(record { hp: number, tag: string }) -> number"
+        );
+    }
+
+    #[test]
+    fn annotation_optional_and_array_and_map() {
+        let info = ok(
+            "---@param a number[]\n\
+             ---@param m { [string]: bool }\n\
+             ---@param s string?\n\
+             function f(a, m, s) return #a end",
+            &empty(),
+        );
+        assert_eq!(
+            info.exports["f"].to_string(),
+            "fn(array<number>, map<string, bool>, string?) -> number"
+        );
+    }
+
+    #[test]
+    fn annotation_return_type() {
+        let info = ok("---@return number\nfunction f() return 5 end", &empty());
+        assert_eq!(info.exports["f"].to_string(), "fn() -> number");
+    }
+
+    #[test]
+    fn annotation_contradicting_usage_is_error() {
+        // `x` annotated `string` but used in arithmetic — the annotation is respected, so the
+        // numeric use fails.
+        assert_eq!(
+            err_code("---@param x string\nfunction f(x) return x + 1 end", &empty()),
+            "E0401",
+        );
+    }
+
+    #[test]
+    fn annotation_unknown_param_is_error() {
+        assert_eq!(
+            err_code("---@param y number\nfunction f(x) return x + 0 end", &empty()),
+            "E0461",
+        );
+    }
+
+    #[test]
+    fn annotation_unknown_type_is_error() {
+        assert_eq!(
+            err_code("---@param x widget\nfunction f(x) return 1 end", &empty()),
+            "E0462",
+        );
+    }
+
+    #[test]
+    fn conflicting_duplicate_annotations_error() {
+        // Two `@param` lines for the same parameter with incompatible types: the second pin
+        // fails against the first.
+        assert_eq!(
+            err_code(
+                "---@param x number\n---@param x string\nfunction f(x) return 1 end",
+                &empty(),
+            ),
+            "E0460",
+        );
     }
 
     #[test]

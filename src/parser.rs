@@ -14,12 +14,15 @@
 
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, Diagnostics, Span};
-use crate::lexer::{Token, TokenKind};
+use crate::lexer::{DocComment, Token, TokenKind};
 
-/// Parse a token stream (as produced by [`crate::lexer::lex`]) into a [`Module`].
-pub fn parse(tokens: Vec<Token>) -> Result<Module, Diagnostics> {
+/// Parse a token stream plus the `---` doc comments (as produced by [`crate::lexer::lex`])
+/// into a [`Module`]. Doc comments are associated with the `function` they precede and their
+/// `@param`/`@return` directives attached as [`FnAnnotations`].
+pub fn parse(tokens: Vec<Token>, docs: Vec<DocComment>) -> Result<Module, Diagnostics> {
     let mut p = Parser {
         tokens,
+        docs,
         pos: 0,
         diags: Diagnostics::new(),
     };
@@ -35,6 +38,7 @@ type PResult<T> = Result<T, Aborted>;
 
 struct Parser {
     tokens: Vec<Token>,
+    docs: Vec<DocComment>,
     pos: usize,
     diags: Diagnostics,
 }
@@ -184,11 +188,44 @@ impl Parser {
     }
 
     fn parse_func_decl(&mut self) -> PResult<FuncDecl> {
+        // Doc comments sitting between the previous token and the `function` keyword annotate
+        // this declaration (`SPEC.md` §5.6).
+        let annotations = self.gather_annotations_before(self.peek_span().start);
         let kw = self.expect(TokenKind::Function)?;
         let name = self.expect_name()?;
         let body = self.parse_func_body()?;
         let span = kw.span.to(body.span);
-        Ok(FuncDecl { name, body, span })
+        Ok(FuncDecl {
+            name,
+            body,
+            annotations,
+            span,
+        })
+    }
+
+    /// Collect the run of `---` doc comments in the source gap `[prev_token_end, func_start)`
+    /// and parse their `@param`/`@return` directives. Diagnostics from malformed directives are
+    /// recorded; the returned annotations are best-effort.
+    fn gather_annotations_before(&mut self, func_start: u32) -> FnAnnotations {
+        let prev_end = if self.pos == 0 {
+            0
+        } else {
+            self.tokens[self.pos - 1].span.end
+        };
+        let block: Vec<DocComment> = self
+            .docs
+            .iter()
+            .filter(|d| d.span.start >= prev_end && d.span.end <= func_start)
+            .cloned()
+            .collect();
+        if block.is_empty() {
+            return FnAnnotations::default();
+        }
+        let (ann, diags) = crate::annotations::parse_doc_block(&block);
+        for d in diags {
+            self.diags.push(d);
+        }
+        ann
     }
 
     fn parse_const_decl(&mut self) -> PResult<ConstDecl> {
@@ -919,7 +956,8 @@ mod tests {
     use crate::lexer::lex;
 
     fn parse_src(src: &str) -> Result<Module, Diagnostics> {
-        parse(lex(src).unwrap())
+        let (tokens, docs) = lex(src).unwrap();
+        parse(tokens, docs)
     }
 
     fn parse_ok(src: &str) -> Module {
@@ -929,6 +967,53 @@ mod tests {
     fn err_code(src: &str) -> String {
         let d = parse_src(src).unwrap_err();
         d.0[0].code.to_string()
+    }
+
+    fn func_decl(m: &Module, idx: usize) -> &FuncDecl {
+        match &m.decls[idx] {
+            TopDecl::Function(f) => f,
+            _ => panic!("decl {idx} is not a function"),
+        }
+    }
+
+    #[test]
+    fn doc_comments_attach_to_following_function() {
+        let m = parse_ok(
+            "---@param base number\n\
+             ---@return number\n\
+             function f(base) return base end",
+        );
+        let f = func_decl(&m, 0);
+        assert_eq!(f.annotations.params.len(), 1);
+        assert_eq!(f.annotations.params[0].name.node, "base");
+        assert!(f.annotations.ret.is_some());
+    }
+
+    #[test]
+    fn doc_comments_bind_only_the_next_function() {
+        // The annotation precedes `f`; `g` must see no annotations.
+        let m = parse_ok(
+            "---@param x number\n\
+             function f(x) return x end\n\
+             function g(y) return y end",
+        );
+        assert_eq!(func_decl(&m, 0).annotations.params.len(), 1);
+        assert!(func_decl(&m, 1).annotations.is_empty());
+    }
+
+    #[test]
+    fn plain_comments_are_not_annotations() {
+        // A `--` (two-dash) comment is not a doc comment and attaches nothing.
+        let m = parse_ok("-- @param x number\nfunction f(x) return x + 0 end");
+        assert!(func_decl(&m, 0).annotations.is_empty());
+    }
+
+    #[test]
+    fn malformed_annotation_is_a_parse_error() {
+        assert_eq!(
+            err_code("---@param x number[\nfunction f(x) return 1 end"),
+            "E0110",
+        );
     }
 
     #[test]

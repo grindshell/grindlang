@@ -34,6 +34,7 @@
 //! its [`resolve::Resolution`], and its [`types::TypeInfo`] (the export signature). All
 //! surface a batch of [`Diagnostics`] on failure.
 
+pub mod annotations;
 pub mod ast;
 mod capture;
 pub mod diagnostics;
@@ -80,8 +81,8 @@ pub use api::{Engine, Module as HostModule};
 /// assert_eq!(module.decls.len(), 1);
 /// ```
 pub fn parse(src: &str) -> Result<Module, Diagnostics> {
-    let tokens = lexer::lex(src)?;
-    parser::parse(tokens)
+    let (tokens, docs) = lexer::lex(src)?;
+    parser::parse(tokens, docs)
 }
 
 /// Parse and resolve Grindlang source against host configuration `cfg`.

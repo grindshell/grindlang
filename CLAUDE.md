@@ -95,8 +95,9 @@ No `mask` / workspace tooling — this crate is freestanding.
 
 ```
 source (.lua-syntax text)
-  └─ lexer        tokens (+ spans)              src/lexer.rs
+  └─ lexer        tokens (+ spans) + ---@ docs   src/lexer.rs
   └─ parser       AST (Lua-subset grammar)      src/parser.rs, src/ast.rs
+       └─ annotations  ---@param/---@return EmmyLua types   src/annotations.rs
   └─ resolver     scopes + CONSTRAINT contract  src/resolve.rs
   └─ type checker bidirectional inference       src/types.rs
   └─ lowering     typed mid-level SSA-ish IR     src/ir.rs

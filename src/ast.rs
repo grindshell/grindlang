@@ -46,7 +46,49 @@ pub enum TopDecl {
 pub struct FuncDecl {
     pub name: Ident,
     pub body: FuncBody,
+    /// Type annotations gathered from the `---@` doc-comment block above the declaration
+    /// (`SPEC.md` §5.6). Empty when the function has no annotations.
+    pub annotations: FnAnnotations,
     pub span: Span,
+}
+
+/// A parsed EmmyLua `---@` type expression (`SPEC.md` §5.6). Converted to a
+/// [`crate::types::Type`] by the checker; the parser only builds the shape.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TypeAnn {
+    /// A bare name — `number`, `bool`, `string`, `nil` (validity checked at conversion).
+    Named(String),
+    /// `T?`
+    Optional(Box<TypeAnn>),
+    /// `T[]`
+    Array(Box<TypeAnn>),
+    /// `{ [string]: T }`
+    Map(Box<TypeAnn>),
+    /// `{ k1: T1, k2: T2 }`
+    Record(Vec<(String, TypeAnn)>),
+}
+
+/// Type annotations attached to a [`FuncDecl`] from its `---@` doc-comment block.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FnAnnotations {
+    /// `---@param <name> <type>` entries, in source order.
+    pub params: Vec<ParamAnn>,
+    /// `---@return <type>` (v1: a single return; the first entry wins).
+    pub ret: Option<Spanned<TypeAnn>>,
+}
+
+impl FnAnnotations {
+    pub fn is_empty(&self) -> bool {
+        self.params.is_empty() && self.ret.is_none()
+    }
+}
+
+/// One `---@param <name> <type>` entry. `name` carries the doc-comment span so a mismatch or
+/// unknown-parameter diagnostic can point back at the annotation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParamAnn {
+    pub name: Ident,
+    pub ty: Spanned<TypeAnn>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

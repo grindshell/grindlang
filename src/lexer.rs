@@ -179,16 +179,27 @@ fn keyword(ident: &str) -> Option<TokenKind> {
     })
 }
 
-/// Lex `src` into a token stream terminated by [`TokenKind::Eof`].
+/// An EmmyLua `---` doc comment, captured as a side-channel (kept out of the token stream so
+/// the parser's cursor is undisturbed). `text` is the verbatim content after the leading
+/// `---`; the parser associates a run of these with the `function` they precede (`SPEC.md`
+/// §2.2, §5.6) and [`crate::annotations`] parses their `@param`/`@return` directives.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DocComment {
+    pub span: Span,
+    pub text: String,
+}
+
+/// Lex `src` into a token stream terminated by [`TokenKind::Eof`], plus the `---` doc comments
+/// captured along the way.
 ///
 /// Returns `Err` with every diagnostic collected if any lexical errors occurred.
-pub fn lex(src: &str) -> Result<Vec<Token>, Diagnostics> {
+pub fn lex(src: &str) -> Result<(Vec<Token>, Vec<DocComment>), Diagnostics> {
     let mut lexer = Lexer::new(src);
     lexer.run();
     if lexer.diags.has_errors() {
         Err(lexer.diags)
     } else {
-        Ok(lexer.tokens)
+        Ok((lexer.tokens, lexer.docs))
     }
 }
 
@@ -196,6 +207,7 @@ struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
     tokens: Vec<Token>,
+    docs: Vec<DocComment>,
     diags: Diagnostics,
 }
 
@@ -205,6 +217,7 @@ impl<'a> Lexer<'a> {
             src: src.as_bytes(),
             pos: 0,
             tokens: Vec::new(),
+            docs: Vec::new(),
             diags: Diagnostics::new(),
         }
     }
@@ -267,11 +280,13 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex_comment(&mut self) {
+        let comment_start = self.pos;
         // Consume the leading `--`.
         self.pos += 2;
         // Long comment? `--[[ ... ]]` or `--[==[ ... ]==]`. `long_bracket_level` returns
         // `None` (consuming nothing) when the cursor isn't at a long-bracket open, so a
-        // plain `--` line comment falls through below.
+        // plain `--` line comment falls through below. (A long comment is never a `---` doc
+        // comment.)
         if let Some(level) = self.long_bracket_level() {
             let start = self.pos;
             if self.consume_long_bracket_body(level).is_none() {
@@ -283,12 +298,27 @@ impl<'a> Lexer<'a> {
             }
             return;
         }
-        // Line comment: to end of line.
+        // Line comment. A third leading `-` (`---…`) makes it an EmmyLua doc comment, which we
+        // capture for annotation parsing; a plain `--…` is discarded.
+        let is_doc = self.peek() == Some(b'-');
+        if is_doc {
+            self.pos += 1; // consume the third `-`
+        }
+        let text_start = self.pos;
         while let Some(c) = self.peek() {
             if c == b'\n' {
                 break;
             }
             self.pos += 1;
+        }
+        if is_doc {
+            let text = std::str::from_utf8(&self.src[text_start..self.pos])
+                .unwrap_or("")
+                .to_string();
+            self.docs.push(DocComment {
+                span: Span::new(comment_start, self.pos),
+                text,
+            });
         }
     }
 
@@ -695,6 +725,7 @@ mod tests {
     fn kinds(src: &str) -> Vec<TokenKind> {
         lex(src)
             .unwrap()
+            .0
             .into_iter()
             .map(|t| t.kind)
             .filter(|k| *k != TokenKind::Eof)
