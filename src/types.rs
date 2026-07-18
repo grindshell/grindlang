@@ -154,6 +154,10 @@ pub struct TypeConfig {
     pub host_functions: BTreeMap<String, FnType>,
     /// Host memory binding name → its type (commonly a [`Type::Record`]).
     pub memory: BTreeMap<String, Type>,
+    /// Host memory methods (`mem:method(args)`, `SPEC.md` §7): memory binding name → method
+    /// name → the method's signature. A method's `params` are the **call-argument** types (the
+    /// receiver is implicit and typed by the memory binding); `ret` is the result type.
+    pub methods: BTreeMap<String, BTreeMap<String, FnType>>,
 }
 
 impl TypeConfig {
@@ -921,14 +925,11 @@ impl<'a> Checker<'a> {
             ExprKind::Field { base, name } => self.check_field(base, name),
             ExprKind::Index { base, index } => self.check_index(base, index),
             ExprKind::Call { callee, args } => self.check_call(callee, args, expr.span),
-            ExprKind::MethodCall { method, .. } => {
-                self.error(
-                    "E0417",
-                    "method calls are not yet supported by the type checker",
-                    method.span,
-                );
-                Type::Error
-            }
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => self.check_method_call(receiver, method, args, expr.span),
             ExprKind::Table(fields) => self.check_table(fields, expr.span),
             ExprKind::Unary { op, operand } => self.check_unary(*op, operand, expr.span),
             ExprKind::Binary { op, lhs, rhs } => self.check_binary(*op, lhs, rhs, expr.span),
@@ -1130,6 +1131,82 @@ impl<'a> Checker<'a> {
                 Type::Error
             }
         }
+    }
+
+    /// Type a host-memory method call `mem:method(args)` (`SPEC.md` §7). v1 rules: the receiver
+    /// must be a host-memory binding referenced directly by name; the method must be declared in
+    /// the memory's method schema; and the call arguments (the receiver is implicit) must match
+    /// the declared signature. Returns the method's result type.
+    fn check_method_call(
+        &mut self,
+        receiver: &Expr,
+        method: &Ident,
+        args: &[Expr],
+        span: Span,
+    ) -> Type {
+        // The receiver must be a bare name bound to host memory. Anything else (a local, a
+        // field, a call result) can't carry methods in v1.
+        let mem_name = if let ExprKind::Name(_) = &receiver.kind {
+            match self.res.binding(receiver.span) {
+                Some(Binding::Memory(name)) => Some(name.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let Some(mem_name) = mem_name else {
+            // Type the receiver first so any error inside it still surfaces, then reject `:`.
+            let _ = self.check_expr(receiver);
+            self.error(
+                "E0417",
+                "a method call `:` requires a host-memory receiver",
+                receiver.span,
+            );
+            for arg in args {
+                self.check_expr(arg);
+            }
+            return Type::Error;
+        };
+
+        let sig = self
+            .cfg
+            .methods
+            .get(&mem_name)
+            .and_then(|m| m.get(&method.node))
+            .cloned();
+        let Some(sig) = sig else {
+            self.error(
+                "E0432",
+                format!("no method `{}` on memory `{mem_name}`", method.node),
+                method.span,
+            );
+            for arg in args {
+                self.check_expr(arg);
+            }
+            return Type::Error;
+        };
+
+        if args.len() != sig.params.len() {
+            self.error(
+                "E0433",
+                format!(
+                    "method `{}` takes {} argument(s) but {} were supplied",
+                    method.node,
+                    sig.params.len(),
+                    args.len()
+                ),
+                span,
+            );
+        }
+        for (arg, pt) in args.iter().zip(&sig.params) {
+            let at = self.check_expr(arg);
+            self.require_assignable(arg.span, &at, pt, "argument type mismatch");
+        }
+        // Check any surplus args so their own errors still surface.
+        for arg in args.iter().skip(sig.params.len()) {
+            self.check_expr(arg);
+        }
+        (*sig.ret).clone()
     }
 
     fn check_table(&mut self, fields: &[Field], span: Span) -> Type {
@@ -2156,6 +2233,7 @@ mod tests {
         let cfg = TypeConfig {
             host_functions: BTreeMap::new(),
             memory,
+            methods: BTreeMap::new(),
         };
         ok(
             "function spend(n)\n\
@@ -2166,6 +2244,80 @@ mod tests {
                return false\n\
              end",
             &cfg,
+        );
+    }
+
+    fn mem_method_cfg() -> TypeConfig {
+        let mut rec = BTreeMap::new();
+        rec.insert("gold".to_string(), Type::Number);
+        let mut memory = BTreeMap::new();
+        memory.insert("mem".to_string(), Type::Record(rec));
+        let mut mm = BTreeMap::new();
+        mm.insert(
+            "add_item".to_string(),
+            FnType {
+                params: vec![Type::Number],
+                ret: Box::new(Type::Bool),
+            },
+        );
+        let mut methods = BTreeMap::new();
+        methods.insert("mem".to_string(), mm);
+        TypeConfig {
+            host_functions: BTreeMap::new(),
+            memory,
+            methods,
+        }
+    }
+
+    #[test]
+    fn method_call_types_from_declared_signature() {
+        // The receiver is implicit; the argument is typed by the method's declared param, and
+        // the call result is the method's return type — here inferring `id: number`.
+        let info = ok(
+            "function f(id) return mem:add_item(id) end",
+            &mem_method_cfg(),
+        );
+        assert_eq!(info.exports["f"].to_string(), "fn(number) -> bool");
+    }
+
+    #[test]
+    fn unknown_method_on_memory_is_error() {
+        assert_eq!(
+            err_code("function f() return mem:nope(1) end", &mem_method_cfg()),
+            "E0432"
+        );
+    }
+
+    #[test]
+    fn method_call_arity_mismatch_is_error() {
+        assert_eq!(
+            err_code(
+                "function f() return mem:add_item(1, 2) end",
+                &mem_method_cfg()
+            ),
+            "E0433"
+        );
+    }
+
+    #[test]
+    fn method_call_arg_type_mismatch_is_error() {
+        assert_eq!(
+            err_code(
+                "function f() return mem:add_item(\"x\") end",
+                &mem_method_cfg()
+            ),
+            "E0402"
+        );
+    }
+
+    #[test]
+    fn method_call_on_non_memory_receiver_is_error() {
+        assert_eq!(
+            err_code(
+                "function f()\n  local n = 1\n  return n:add_item(1)\nend",
+                &mem_method_cfg()
+            ),
+            "E0417"
         );
     }
 
@@ -2182,6 +2334,7 @@ mod tests {
         let cfg = TypeConfig {
             host_functions: host,
             memory: BTreeMap::new(),
+            methods: BTreeMap::new(),
         };
         let info = ok("function f() return roll(6) end", &cfg);
         assert_eq!(info.exports["f"].to_string(), "fn() -> number");

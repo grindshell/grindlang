@@ -303,6 +303,7 @@ fn pooled_ctx_rebinds_memory_between_calls() {
     let cfg = TypeConfig {
         host_functions: BTreeMap::new(),
         memory: tc_mem,
+        methods: BTreeMap::new(),
     };
     let (module, res, info) = grindlang::analyze(src, &cfg).unwrap();
     let program = grindlang::ir::lower(&module, &res, &info, &cfg).unwrap();
@@ -428,6 +429,7 @@ fn memory_and_pairs() {
     let cfg = TypeConfig {
         host_functions: BTreeMap::new(),
         memory: tc_mem,
+        methods: BTreeMap::new(),
     };
 
     let (module, res, info) = grindlang::analyze(src, &cfg).expect("analyze");
@@ -477,6 +479,7 @@ fn host_function() {
     let cfg = TypeConfig {
         host_functions: host,
         memory: BTreeMap::new(),
+        methods: BTreeMap::new(),
     };
 
     let (module, res, info) = grindlang::analyze(src, &cfg).expect("analyze");
@@ -508,6 +511,7 @@ fn host_error_propagates() {
     let cfg = TypeConfig {
         host_functions: host,
         memory: BTreeMap::new(),
+        methods: BTreeMap::new(),
     };
     let (module, res, info) = grindlang::analyze(src, &cfg).expect("analyze");
     let program = grindlang::ir::lower(&module, &res, &info, &cfg).expect("lower");
@@ -515,6 +519,90 @@ fn host_error_propagates() {
     jit.set_host_function("boom", |_| Err(grindlang::RunError::Host("kaboom".into())));
     let err = jit.call("f", vec![]).unwrap_err();
     assert!(matches!(err, grindlang::RunError::Host(m) if m == "kaboom"));
+}
+
+/// The method impl backing `mem:spend(amount)`: subtract `amount` from the receiver's `gold`
+/// when affordable (mutating the shared memory table) and return whether it went through. The
+/// receiver is passed as `args[0]` (SPEC §7.2) and the call argument as `args[1]`.
+fn spend_method(a: &[Value]) -> Result<Value, grindlang::RunError> {
+    let amount = a[1].as_f64().unwrap();
+    let gold = a[0].field("gold").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    if gold >= amount {
+        if let Value::Table(t) = &a[0] {
+            t.borrow_mut()
+                .insert("gold".to_string(), Value::Number(gold - amount));
+        }
+        Ok(Value::Bool(true))
+    } else {
+        Ok(Value::Bool(false))
+    }
+}
+
+/// A host-memory method call (`mem:spend(n)`, SPEC §7.2) dispatches identically across all
+/// three oracles: same boolean results *and* the same persisted memory mutation. Exercises
+/// `CallMethod` with the receiver prepended (`rt_call_method` in the JIT).
+#[test]
+fn memory_method_dispatch_matches() {
+    let src = "function pay(n)\n  return mem:spend(n)\nend";
+
+    let mut rec = BTreeMap::new();
+    rec.insert("gold".to_string(), Type::Number);
+    let mut tc_mem = BTreeMap::new();
+    tc_mem.insert("mem".to_string(), Type::Record(rec));
+    let mut mm = BTreeMap::new();
+    mm.insert(
+        "spend".to_string(),
+        grindlang::FnType {
+            params: vec![Type::Number],
+            ret: Box::new(Type::Bool),
+        },
+    );
+    let mut methods = BTreeMap::new();
+    methods.insert("mem".to_string(), mm);
+    let cfg = TypeConfig {
+        host_functions: BTreeMap::new(),
+        memory: tc_mem,
+        methods,
+    };
+
+    let (module, res, info) = grindlang::analyze(src, &cfg).expect("analyze");
+    let program = grindlang::ir::lower(&module, &res, &info, &cfg).expect("lower");
+    grindlang::ir::verify(&program).expect("verify");
+
+    let make_mem = || {
+        let mut m = BTreeMap::new();
+        m.insert("gold".to_string(), Value::Number(100.0));
+        Value::table(m)
+    };
+
+    let mut interp = Interpreter::new(&module, &res).unwrap();
+    interp.set_memory("mem", make_mem());
+    interp.set_method("mem:spend", spend_method);
+
+    let mut vm = Vm::new(&program);
+    vm.set_memory("mem", make_mem());
+    vm.set_method("mem:spend", spend_method);
+
+    let mut jit = JitModule::compile(&program).expect("jit");
+    jit.set_memory("mem", make_mem());
+    jit.set_method("mem:spend", spend_method);
+
+    for n in [30.0, 50.0, 40.0] {
+        let ar = interp.call("pay", vec![Value::Number(n)]).unwrap();
+        let br = vm.call("pay", vec![Value::Number(n)]).unwrap();
+        let cr = jit.call("pay", vec![Value::Number(n)]).unwrap();
+        assert_eq!(format!("{ar}"), format!("{br}"), "interp vs vm for pay({n})");
+        assert_eq!(format!("{br}"), format!("{cr}"), "vm vs jit for pay({n})");
+    }
+    // The persisted memory mutation agrees across all three oracles.
+    assert_eq!(
+        format!("{}", interp.memory("mem").unwrap()),
+        format!("{}", vm.memory("mem").unwrap())
+    );
+    assert_eq!(
+        format!("{}", vm.memory("mem").unwrap()),
+        format!("{}", jit.memory("mem").unwrap())
+    );
 }
 
 // ---- closures (upvalues) ----

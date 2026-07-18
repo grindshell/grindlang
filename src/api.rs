@@ -407,6 +407,10 @@ pub struct Engine {
     host_fns: BTreeMap<String, (FnType, NativeFn)>,
     /// name → declared type of a host memory binding (commonly a record or map)
     memory: BTreeMap<String, Type>,
+    /// memory binding name → method name → (call signature for the checker, implementation).
+    /// A memory method (`mem:method(args)`, `SPEC.md` §7) is invoked with the receiver
+    /// prepended to the declared call arguments.
+    methods: BTreeMap<String, BTreeMap<String, (FnType, NativeFn)>>,
 }
 
 impl Engine {
@@ -474,6 +478,31 @@ impl Engine {
         self
     }
 
+    /// Register a host-memory **method** (`mem:method(args)`, `SPEC.md` §7) on the memory
+    /// binding `mem`, with an explicit call signature and a raw `Value`-level implementation.
+    ///
+    /// The signature's parameters are the **call arguments** (what the script writes after
+    /// `:method(`); the receiver is implicit and typed by the memory binding. At runtime the
+    /// impl is invoked with the receiver value prepended: `args[0]` is the receiver and
+    /// `args[1..]` are the call arguments. The memory binding should be declared with
+    /// [`declare_memory`](Engine::declare_memory) before methods are registered on it.
+    pub fn register_method_raw<F>(
+        &mut self,
+        mem: impl Into<String>,
+        method: impl Into<String>,
+        sig: FnType,
+        f: F,
+    ) -> &mut Self
+    where
+        F: Fn(&[Value]) -> Result<Value, RunError> + 'static,
+    {
+        self.methods
+            .entry(mem.into())
+            .or_default()
+            .insert(method.into(), (sig, Rc::new(f)));
+        self
+    }
+
     /// The [`TypeConfig`] implied by the registered host functions and memory.
     fn type_config(&self) -> TypeConfig {
         TypeConfig {
@@ -483,6 +512,18 @@ impl Engine {
                 .map(|(k, (sig, _))| (k.clone(), sig.clone()))
                 .collect(),
             memory: self.memory.clone(),
+            methods: self
+                .methods
+                .iter()
+                .map(|(mem, ms)| {
+                    (
+                        mem.clone(),
+                        ms.iter()
+                            .map(|(name, (sig, _))| (name.clone(), sig.clone()))
+                            .collect(),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -501,6 +542,11 @@ impl Engine {
         let mut jit = JitModule::compile(&program)?;
         for (name, (_sig, native)) in &self.host_fns {
             jit.set_host_fn(name.clone(), native.clone());
+        }
+        for (mem, ms) in &self.methods {
+            for (method, (_sig, native)) in ms {
+                jit.set_method_fn(format!("{mem}:{method}"), native.clone());
+            }
         }
         Ok(Module {
             jit,

@@ -489,6 +489,10 @@ impl<'a, 'b> Translator<'a, 'b> {
                 let ret = self.dest_repr(dest);
                 Some(self.translate_call_host(name, args, ret))
             }
+            Op::CallMethod(symbol, receiver, args) => {
+                let ret = self.dest_repr(dest);
+                Some(self.translate_call_method(symbol, *receiver, args, ret))
+            }
             Op::CallBuiltinValue(ns, args) => {
                 let ret = self.dest_repr(dest);
                 Some(self.translate_call_builtin_value(ns, args, ret))
@@ -737,6 +741,27 @@ impl<'a, 'b> Translator<'a, 'b> {
         let idc = self.iconst32(id);
         let result = self
             .call_shim("rt_call_host", &[self.ctx_val, idc, base, argc])
+            .unwrap();
+        self.unbox_handle(result, ret)
+    }
+
+    /// Lower a host-memory method call (`mem:method(args)`, `SPEC.md` §7). Mirrors
+    /// [`translate_call_host`](Self::translate_call_host) but boxes the receiver as the first
+    /// argument and dispatches through the method pool.
+    fn translate_call_method(
+        &mut self,
+        symbol: &str,
+        receiver: ValueId,
+        args: &[ValueId],
+        ret: Repr,
+    ) -> ClifValue {
+        let id = self.pools.intern_method(symbol);
+        let mut handles: Vec<ClifValue> = vec![self.box_handle(receiver)];
+        handles.extend(args.iter().map(|&a| self.box_handle(a)));
+        let (base, argc) = self.arg_array(&handles);
+        let idc = self.iconst32(id);
+        let result = self
+            .call_shim("rt_call_method", &[self.ctx_val, idc, base, argc])
             .unwrap();
         self.unbox_handle(result, ret)
     }

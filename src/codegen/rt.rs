@@ -52,6 +52,8 @@ pub struct Pools {
     pub names: Vec<String>,
     /// Host function names, by host id.
     pub host_fns: Vec<String>,
+    /// Host-memory method symbols (`"mem:method"`), by method id.
+    pub methods: Vec<String>,
     /// Plain-value builtin namespaces (`tostring`/`tonumber`), by id.
     pub builtin_values: Vec<String>,
     /// Namespace-member builtins (`math.floor`, …) as `(ns, member)`, by id.
@@ -89,6 +91,9 @@ impl Pools {
     pub fn intern_host(&mut self, s: &str) -> u32 {
         Self::intern(&mut self.host_fns, s)
     }
+    pub fn intern_method(&mut self, s: &str) -> u32 {
+        Self::intern(&mut self.methods, s)
+    }
     pub fn intern_builtin_value(&mut self, ns: &str) -> u32 {
         Self::intern(&mut self.builtin_values, ns)
     }
@@ -118,6 +123,8 @@ pub struct RtCtx {
     pools: Arc<Pools>,
     /// Host functions resolved by id (parallel to [`Pools::host_fns`]).
     host: Vec<Option<NativeFn>>,
+    /// Host-memory methods resolved by id (parallel to [`Pools::methods`]).
+    methods: Vec<Option<NativeFn>>,
     /// Memory bindings resolved by id (parallel to [`Pools::memories`]).
     memory: Vec<Value>,
     /// Finalized native address of every compiled function, by name. Used to resolve the
@@ -137,6 +144,7 @@ impl RtCtx {
     pub fn new(
         pools: Arc<Pools>,
         host: Vec<Option<NativeFn>>,
+        methods: Vec<Option<NativeFn>>,
         memory: Vec<Value>,
         code_addrs: Arc<HashMap<String, u64>>,
         keepalive: Option<Rc<dyn Any>>,
@@ -145,6 +153,7 @@ impl RtCtx {
             values: vec![Value::Nil],
             pools,
             host,
+            methods,
             memory,
             code_addrs,
             keepalive,
@@ -201,10 +210,16 @@ impl RtCtx {
         self.error = None;
     }
 
-    /// Replace the host-function and memory bindings, for when the user re-registers them
-    /// between pooled invocations.
-    pub fn rebind(&mut self, host: Vec<Option<NativeFn>>, memory: Vec<Value>) {
+    /// Replace the host-function, method, and memory bindings, for when the user re-registers
+    /// them between pooled invocations.
+    pub fn rebind(
+        &mut self,
+        host: Vec<Option<NativeFn>>,
+        methods: Vec<Option<NativeFn>>,
+        memory: Vec<Value>,
+    ) {
         self.host = host;
+        self.methods = methods;
         self.memory = memory;
     }
 
@@ -540,6 +555,32 @@ pub unsafe extern "C" fn rt_call_host(
     }
 }
 
+/// Invoke a host-memory method (`mem:method(args)`, `SPEC.md` §7). `argv[0]` is the receiver;
+/// the remaining handles are the call arguments. The receiver is passed through to the impl as
+/// its first argument.
+pub unsafe extern "C" fn rt_call_method(
+    ctx: *mut RtCtx,
+    id: u32,
+    argv: *const Handle,
+    argc: u32,
+) -> Handle {
+    let ctx = ctx!(ctx);
+    let args = unsafe { collect_args(ctx, argv, argc) };
+    let f = match ctx.methods.get(id as usize).and_then(|f| f.clone()) {
+        Some(f) => f,
+        None => {
+            let name = ctx.pools.methods[id as usize].clone();
+            return ctx.fail(RunError::Runtime(format!(
+                "memory method `{name}` was not registered"
+            )));
+        }
+    };
+    match f(&args) {
+        Ok(v) => ctx.intern(v),
+        Err(e) => ctx.fail(e),
+    }
+}
+
 pub unsafe extern "C" fn rt_call_builtin_value(
     ctx: *mut RtCtx,
     id: u32,
@@ -704,6 +745,7 @@ pub fn shim_symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_errored", rt_errored as *const u8),
         ("rt_check_compare", rt_check_compare as *const u8),
         ("rt_call_host", rt_call_host as *const u8),
+        ("rt_call_method", rt_call_method as *const u8),
         ("rt_call_builtin_value", rt_call_builtin_value as *const u8),
         (
             "rt_call_builtin_member",

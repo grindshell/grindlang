@@ -182,6 +182,10 @@ pub enum Op {
     CallScript(String, Vec<ValueId>),
     /// Call a host-registered function by name.
     CallHost(String, Vec<ValueId>),
+    /// Call a host-memory method (`mem:method(args)`, `SPEC.md` §7). The `String` is the
+    /// interned method symbol (`"mem:method"`), the [`ValueId`] is the receiver, and the vec is
+    /// the call arguments. The receiver is passed to the host impl as an implicit first arg.
+    CallMethod(String, ValueId, Vec<ValueId>),
     /// A plain builtin call (`tostring`, `tonumber`).
     CallBuiltinValue(String, Vec<ValueId>),
     /// A builtin namespace member call (`math.floor`, `string.sub`).
@@ -1149,10 +1153,11 @@ impl<'a> FnLowerer<'a> {
             ExprKind::Field { base, name } => self.lower_field(base, name),
             ExprKind::Index { base, index } => self.lower_index(base, index),
             ExprKind::Call { callee, args } => self.lower_call(callee, args),
-            ExprKind::MethodCall { method, .. } => Err(LowerError::Unsupported(format!(
-                "method call `:{}` is not lowered to IR yet",
-                method.node
-            ))),
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => self.lower_method_call(receiver, method, args),
             ExprKind::Table(fields) => self.lower_table(fields),
             ExprKind::Unary { op, operand } => {
                 let v = self.lower_expr(operand)?;
@@ -1292,6 +1297,36 @@ impl<'a> FnLowerer<'a> {
 
     fn lower_args(&mut self, args: &[Expr]) -> Result<Vec<ValueId>, LowerError> {
         args.iter().map(|a| self.lower_expr(a)).collect()
+    }
+
+    /// Lower a host-memory method call `mem:method(args)` (`SPEC.md` §7) to [`Op::CallMethod`].
+    /// The checker has already verified the receiver is a memory binding and the method exists,
+    /// so this recovers the binding name to form the `"mem:method"` symbol and the result type.
+    fn lower_method_call(
+        &mut self,
+        receiver: &Expr,
+        method: &Ident,
+        args: &[Expr],
+    ) -> Result<ValueId, LowerError> {
+        let mem_name = match self.res.binding(receiver.span) {
+            Some(Binding::Memory(name)) => name.clone(),
+            _ => {
+                return Err(LowerError::Internal(
+                    "method receiver is not a host-memory binding".into(),
+                ));
+            }
+        };
+        let symbol = format!("{mem_name}:{}", method.node);
+        let recv = self.lower_expr(receiver)?;
+        let argv = self.lower_args(args)?;
+        let ret = self
+            .cfg
+            .methods
+            .get(&mem_name)
+            .and_then(|m| m.get(&method.node))
+            .map(|ft| (*ft.ret).clone())
+            .unwrap_or(Type::Error);
+        Ok(self.emit_value(Op::CallMethod(symbol, recv, argv), ret))
     }
 
     fn lower_table(&mut self, fields: &[Field]) -> Result<ValueId, LowerError> {
@@ -1492,6 +1527,9 @@ mod vm {
     pub struct Vm<'a> {
         program: &'a Program,
         host: HashMap<String, Native>,
+        /// Host-memory methods keyed by their `"mem:method"` symbol (`SPEC.md` §7). The impl is
+        /// called with the receiver prepended to the call arguments.
+        methods: HashMap<String, Native>,
         memory: HashMap<String, Value>,
         const_cache: HashMap<String, Value>,
     }
@@ -1506,6 +1544,7 @@ mod vm {
             Vm {
                 program,
                 host: HashMap::new(),
+                methods: HashMap::new(),
                 memory: HashMap::new(),
                 const_cache: HashMap::new(),
             }
@@ -1516,6 +1555,15 @@ mod vm {
             F: Fn(&[Value]) -> Result<Value, RunError> + 'static,
         {
             self.host.insert(name.into(), std::rc::Rc::new(f));
+        }
+
+        /// Register a host-memory method impl by its `"mem:method"` symbol. The impl receives
+        /// the receiver as its first argument, followed by the call arguments.
+        pub fn set_method<F>(&mut self, symbol: impl Into<String>, f: F)
+        where
+            F: Fn(&[Value]) -> Result<Value, RunError> + 'static,
+        {
+            self.methods.insert(symbol.into(), std::rc::Rc::new(f));
         }
 
         pub fn set_memory(&mut self, name: impl Into<String>, value: Value) {
@@ -1736,6 +1784,15 @@ mod vm {
                         self.host.get(name).cloned().ok_or_else(|| {
                             RunError::Runtime(format!("host fn `{name}` not set"))
                         })?;
+                    f(&argv)?
+                }
+                Op::CallMethod(symbol, receiver, args) => {
+                    let recv = self.val(act, *receiver)?;
+                    let mut argv = self.eval_args(act, args)?;
+                    argv.insert(0, recv);
+                    let f = self.methods.get(symbol).cloned().ok_or_else(|| {
+                        RunError::Runtime(format!("memory method `{symbol}` not set"))
+                    })?;
                     f(&argv)?
                 }
                 Op::CallBuiltinValue(ns, args) => {

@@ -104,6 +104,8 @@ pub struct JitModule {
     code_addrs: Arc<HashMap<String, u64>>,
     /// Registered host functions and memory, by name.
     host: HashMap<String, NativeFn>,
+    /// Registered host-memory methods, keyed by their `"mem:method"` symbol (`SPEC.md` §7).
+    methods: HashMap<String, NativeFn>,
     memory: HashMap<String, Value>,
     /// A pooled runtime context, reused across calls to avoid re-allocating the value table
     /// and re-cloning the shared bindings on every invocation. Taken out for the duration of a
@@ -299,6 +301,7 @@ impl JitModule {
             closure_sigs,
             code_addrs: Arc::new(code_addrs),
             host: HashMap::new(),
+            methods: HashMap::new(),
             memory: HashMap::new(),
             cached_ctx: None,
             bindings_dirty: false,
@@ -318,6 +321,22 @@ impl JitModule {
     /// which type-erases typed host closures into a [`NativeFn`] before compilation.
     pub fn set_host_fn(&mut self, name: impl Into<String>, f: NativeFn) {
         self.host.insert(name.into(), f);
+        self.bindings_dirty = true;
+    }
+
+    /// Register a host-memory method impl by its `"mem:method"` symbol (`SPEC.md` §7). The impl
+    /// receives the receiver as its first argument, followed by the call arguments.
+    pub fn set_method<F>(&mut self, symbol: impl Into<String>, f: F)
+    where
+        F: Fn(&[Value]) -> Result<Value, RunError> + 'static,
+    {
+        self.methods.insert(symbol.into(), std::rc::Rc::new(f));
+        self.bindings_dirty = true;
+    }
+
+    /// Install a pre-built native memory method (the embedding API's type-erased path).
+    pub fn set_method_fn(&mut self, symbol: impl Into<String>, f: NativeFn) {
+        self.methods.insert(symbol.into(), f);
         self.bindings_dirty = true;
     }
 
@@ -524,6 +543,15 @@ impl JitModule {
             .collect()
     }
 
+    /// Resolve registered memory methods into pool-id order (parallel to `pools.methods`).
+    fn resolve_methods(&self) -> Vec<Option<NativeFn>> {
+        self.pools
+            .methods
+            .iter()
+            .map(|s| self.methods.get(s).cloned())
+            .collect()
+    }
+
     /// Resolve bound memory handles into pool-id order (parallel to `pools.memories`).
     fn resolve_memory(&self) -> Vec<Value> {
         self.pools
@@ -540,6 +568,7 @@ impl JitModule {
         RtCtx::new(
             self.pools.clone(),
             self.resolve_host(),
+            self.resolve_methods(),
             self.resolve_memory(),
             self.code_addrs.clone(),
             Some(keepalive),
@@ -555,8 +584,9 @@ impl JitModule {
             Some(mut ctx) => {
                 if self.bindings_dirty {
                     let host = self.resolve_host();
+                    let methods = self.resolve_methods();
                     let memory = self.resolve_memory();
-                    ctx.rebind(host, memory);
+                    ctx.rebind(host, methods, memory);
                 }
                 ctx.reset();
                 ctx
@@ -666,6 +696,7 @@ fn declare_shims(
         ("rt_errored", &[I64], &[I8]),
         ("rt_check_compare", &[I64, F64, F64], &[]),
         ("rt_call_host", &[I64, I32, I64, I32], &[I64]),
+        ("rt_call_method", &[I64, I32, I64, I32], &[I64]),
         ("rt_call_builtin_value", &[I64, I32, I64, I32], &[I64]),
         ("rt_call_builtin_member", &[I64, I32, I64, I32], &[I64]),
         ("rt_cell_new", &[I64, I64], &[I64]),

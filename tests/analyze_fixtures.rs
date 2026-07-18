@@ -40,6 +40,7 @@ fn dialog_decision_fixture_type_checks() {
     let cfg = TypeConfig {
         host_functions: BTreeMap::new(),
         memory,
+        methods: BTreeMap::new(),
     };
 
     let (_m, _res, info) = grindlang::analyze(&src, &cfg)

@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use grindlang::Type;
 use grindlang::Value;
 use grindlang::api::{CallError, Engine, MarshalError};
+use grindlang::FnType;
 use grindlang::RunError;
 
 /// Typed args in, typed result out, plus a registered infallible host function.
@@ -221,6 +222,52 @@ fn memory_read_write() {
     assert!(m.call_typed::<_, bool>("spend", (30.0,)).unwrap());
     assert!(m.call_typed::<_, bool>("spend", (50.0,)).unwrap());
     assert!(!m.call_typed::<_, bool>("spend", (40.0,)).unwrap()); // only 20 left
+
+    let gold = m.memory("mem").unwrap().field("gold").unwrap();
+    assert_eq!(gold.as_f64(), Some(20.0));
+}
+
+/// Host-memory method (`mem:spend(n)`, SPEC §7.2): register the method impl on the engine,
+/// call it from a script export, and observe that it mutates persistent memory. The impl
+/// receives the receiver as its first argument.
+#[test]
+fn memory_method_registration_and_call() {
+    let mut engine = Engine::new();
+    let mut rec = BTreeMap::new();
+    rec.insert("gold".to_string(), Type::Number);
+    engine.declare_memory("mem", Type::Record(rec));
+    engine.register_method_raw(
+        "mem",
+        "spend",
+        FnType {
+            params: vec![Type::Number],
+            ret: Box::new(Type::Bool),
+        },
+        |a| {
+            let amount = a[1].as_f64().unwrap();
+            let gold = a[0].field("gold").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if gold >= amount {
+                if let Value::Table(t) = &a[0] {
+                    t.borrow_mut()
+                        .insert("gold".to_string(), Value::Number(gold - amount));
+                }
+                Ok(Value::Bool(true))
+            } else {
+                Ok(Value::Bool(false))
+            }
+        },
+    );
+
+    let src = "function pay(n) return mem:spend(n) end";
+    let mut m = engine.compile(src).unwrap();
+
+    let mut initial = BTreeMap::new();
+    initial.insert("gold".to_string(), Value::Number(100.0));
+    m.set_memory("mem", Value::table(initial));
+
+    assert!(m.call_typed::<_, bool>("pay", (30.0,)).unwrap());
+    assert!(m.call_typed::<_, bool>("pay", (50.0,)).unwrap());
+    assert!(!m.call_typed::<_, bool>("pay", (40.0,)).unwrap()); // only 20 left
 
     let gold = m.memory("mem").unwrap().field("gold").unwrap();
     assert_eq!(gold.as_f64(), Some(20.0));

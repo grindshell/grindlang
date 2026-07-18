@@ -244,6 +244,7 @@ fn memory_and_pairs_match() {
     let cfg = TypeConfig {
         host_functions: BTreeMap::new(),
         memory: tc_mem,
+        methods: BTreeMap::new(),
     };
 
     let (module, res, info) = grindlang::analyze(src, &cfg).expect("analyze");
@@ -287,6 +288,7 @@ fn host_function_matches() {
     let cfg = TypeConfig {
         host_functions: host,
         memory: BTreeMap::new(),
+        methods: BTreeMap::new(),
     };
 
     let (module, res, info) = grindlang::analyze(src, &cfg).expect("analyze");

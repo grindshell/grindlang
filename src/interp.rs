@@ -42,7 +42,7 @@ use crate::ast::*;
 use crate::diagnostics::Diagnostics;
 use crate::resolve::{Binding, Resolution, ResolveConfig, SymbolId};
 use crate::runtime::builtins::{field_value, member_call, num_to_string, value_call};
-use crate::value::{RunError, Value};
+use crate::value::{NativeFn, RunError, Value};
 
 /// A script function: its parameter symbols, body, and (for closures) the captured
 /// upvalue slots. Top-level functions capture nothing.
@@ -115,6 +115,9 @@ pub struct Interpreter<'a> {
     host: HashMap<String, Value>,
     /// Host memory handles, by name.
     memory: HashMap<String, Value>,
+    /// Host-memory methods keyed by their `"mem:method"` symbol (`SPEC.md` §7). The impl is
+    /// invoked with the receiver prepended to the call arguments.
+    methods: HashMap<String, NativeFn>,
     /// The current activation frame chain (innermost last).
     env: Vec<Frame>,
 }
@@ -130,6 +133,7 @@ impl<'a> Interpreter<'a> {
             exports: HashMap::new(),
             host: HashMap::new(),
             memory: HashMap::new(),
+            methods: HashMap::new(),
             env: Vec::new(),
         };
         me.init(module)?;
@@ -184,6 +188,15 @@ impl<'a> Interpreter<'a> {
         F: Fn(&[Value]) -> Result<Value, RunError> + 'static,
     {
         self.host.insert(name.into(), Value::Native(Rc::new(f)));
+    }
+
+    /// Register a host-memory method impl by its `"mem:method"` symbol. The impl receives the
+    /// receiver as its first argument, followed by the call arguments.
+    pub fn set_method<F>(&mut self, symbol: impl Into<String>, f: F)
+    where
+        F: Fn(&[Value]) -> Result<Value, RunError> + 'static,
+    {
+        self.methods.insert(symbol.into(), Rc::new(f));
     }
 
     /// Bind a host memory handle. `value` is typically a [`Value::table`]; the interpreter
@@ -671,10 +684,11 @@ impl<'a> Interpreter<'a> {
             ExprKind::Field { base, name } => self.eval_field(base, name),
             ExprKind::Index { base, index } => self.eval_index(base, index),
             ExprKind::Call { callee, args } => self.eval_call(callee, args),
-            ExprKind::MethodCall { method, .. } => Err(RunError::Internal(format!(
-                "method call `:{}` is not supported by the interpreter",
-                method.node
-            ))),
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => self.eval_method_call(receiver, method, args),
             ExprKind::Table(fields) => self.eval_table(fields),
             ExprKind::Unary { op, operand } => self.eval_unary(*op, operand),
             ExprKind::Binary { op, lhs, rhs } => self.eval_binary(*op, lhs, rhs),
@@ -712,6 +726,35 @@ impl<'a> Interpreter<'a> {
                 "builtin namespace `{ns}` used as a value"
             ))),
         }
+    }
+
+    /// Evaluate a host-memory method call `mem:method(args)` (`SPEC.md` §7): recover the memory
+    /// binding name for the `"mem:method"` symbol, evaluate the receiver and arguments, then
+    /// invoke the registered impl with the receiver prepended.
+    fn eval_method_call(
+        &mut self,
+        receiver: &Expr,
+        method: &Ident,
+        args: &[Expr],
+    ) -> Result<Value, RunError> {
+        let mem_name = match self.res.binding(receiver.span) {
+            Some(Binding::Memory(name)) => name.clone(),
+            _ => {
+                return Err(RunError::Internal(
+                    "method receiver is not a host-memory binding".into(),
+                ));
+            }
+        };
+        let symbol = format!("{mem_name}:{}", method.node);
+        let recv = self.eval_expr(receiver)?;
+        let mut argv = self.eval_list(args)?;
+        argv.insert(0, recv);
+        let f = self
+            .methods
+            .get(&symbol)
+            .cloned()
+            .ok_or_else(|| RunError::Runtime(format!("memory method `{symbol}` was not set")))?;
+        f(&argv)
     }
 
     fn eval_field(&mut self, base: &Expr, name: &Ident) -> Result<Value, RunError> {

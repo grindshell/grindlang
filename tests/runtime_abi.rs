@@ -39,6 +39,7 @@ fn fn_abi_unit_return() {
     let cfg = TypeConfig {
         host_functions: BTreeMap::new(),
         memory: mem,
+        methods: BTreeMap::new(),
     };
     let src = "function touch(x)\n  mem.n = x\nend";
     let (_m, _r, info) = grindlang::analyze(src, &cfg).expect("analyze");

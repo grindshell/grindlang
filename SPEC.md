@@ -429,7 +429,7 @@ function bodies:
    **persistent, Rust-owned state** that survives between invocations. Its fields/methods
    are declared by the host's schema and compile to **direct Rust calls** (no copying for
    reads where possible). Field access (`mem.gold`) and method calls (`mem:add_item(id)`)
-   are the only places `:`-method syntax is valid _(v1)_.
+   are the only places `:`-method syntax is valid _(v1)_ — see §7.2.
 
 ```lua
 ---@param amount number
@@ -461,6 +461,34 @@ in-script discipline rather than silently coercing:
   non-finite value** (`NaN`, `±∞`) as a marshaling error rather than letting it land silently
   as `0` / `i*::MAX` via a saturating cast. Marshaling into `f64`/`f32` passes any value
   through unchanged (non-finite floats are valid).
+
+### 7.2 Memory methods (`mem:method(args)`)
+
+A memory binding may expose **methods** — host-provided behavior invoked with Lua's
+colon-call syntax. `mem:add_item(id)` calls the host's `add_item` implementation, which
+receives the receiver as an implicit `self` (its **first** argument) followed by the call
+arguments. This is the only place `:`-call syntax is accepted _(v1)_.
+
+- **Declaration.** Each method is registered on its memory binding with a signature whose
+  parameters are the **call arguments** — the receiver is implicit and typed by the memory
+  binding, so it is *not* listed in the declared parameters. The result type is the method's
+  return type.
+- **Receiver.** The receiver must be a host-memory binding referenced **directly by name**
+  (`mem:m(...)`), not an arbitrary expression — a `:` call on a non-memory receiver is a
+  `E0417` error. (In practice scripts cannot construct method-bearing values themselves, so
+  this confines methods to host memory, matching §7.)
+- **Arity.** Exactly as many arguments as the declared signature — no pad/drop (§5.5). A
+  mismatch is `E0433`; an unknown method on the memory is `E0432`.
+- **Semantics.** A method is a **direct Rust call**; it may read and mutate the receiver's
+  Rust-owned state, and those writes persist between invocations like any memory write.
+
+```lua
+-- `mem` is host memory exposing a method `add_item(id: number) -> bool`
+---@param id number
+function pick_up(id)
+  return mem:add_item(id)      -- host mutates persistent inventory state, returns success
+end
+```
 
 ## 8. Rejected constructs (diagnostics, not silent)
 
@@ -533,6 +561,10 @@ both read/write persistent memory.
   parallel binding/assignment or a pass-through `return`, with **exact arity** (no Lua-style
   truncate/pad, no spreading into argument lists, no value-count adjustment). A multi-value
   call anywhere else is a compile error.
+- **Method calls are memory-only, self-passing** (§7.2): `mem:m(args)` is valid only when the
+  receiver is a host-memory binding named directly; the receiver is passed as an implicit
+  `self` to the host method, which resolves to a direct Rust call. `:` on any other receiver
+  is a compile error.
 - **`---@` annotation type-syntax subset** is fixed (§5.6): `@param`/`@return` on top-level
   functions, scalar/optional/array/map/record spellings, `@type` and function/userdata types
   deferred, unknown directives ignored.

@@ -105,6 +105,7 @@ fn snapshot_export_signatures() {
     let cfg = TypeConfig {
         host_functions: BTreeMap::new(),
         memory,
+        methods: BTreeMap::new(),
     };
     insta::assert_snapshot!(
         "signature_dialog_decision",
