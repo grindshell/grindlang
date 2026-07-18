@@ -986,7 +986,7 @@ mod tests {
         let f = func_decl(&m, 0);
         assert_eq!(f.annotations.params.len(), 1);
         assert_eq!(f.annotations.params[0].name.node, "base");
-        assert!(f.annotations.ret.is_some());
+        assert_eq!(f.annotations.ret.len(), 1);
     }
 
     #[test]

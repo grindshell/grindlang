@@ -73,9 +73,8 @@ pub fn parse_doc_block(docs: &[DocComment]) -> (FnAnnotations, Vec<Diagnostic>) 
                     continue;
                 }
                 match parse_type_ann(args) {
-                    // v1 has a single return; a second `@return` line is ignored.
-                    Ok(ty) if ann.ret.is_none() => ann.ret = Some(Spanned::new(ty, doc.span)),
-                    Ok(_) => {}
+                    // Each `@return` line contributes one return value; ≥ 2 build a tuple.
+                    Ok(ty) => ann.ret.push(Spanned::new(ty, doc.span)),
                     Err(msg) => diags.push(Diagnostic::error(
                         "E0110",
                         format!("malformed type in `---@return`: {msg}"),
@@ -370,7 +369,29 @@ mod tests {
         assert_eq!(ann.params.len(), 1);
         assert_eq!(ann.params[0].name.node, "base");
         assert_eq!(ann.params[0].ty.node, TypeAnn::Named("number".into()));
-        assert_eq!(ann.ret.as_ref().unwrap().node, TypeAnn::Named("number".into()));
+        assert_eq!(ann.ret.len(), 1);
+        assert_eq!(ann.ret[0].node, TypeAnn::Named("number".into()));
+    }
+
+    #[test]
+    fn multiple_return_directives_build_a_list() {
+        use crate::diagnostics::Span;
+        let sp = Span::new(0, 0);
+        let docs = vec![
+            DocComment {
+                span: sp,
+                text: " @return number".into(),
+            },
+            DocComment {
+                span: sp,
+                text: " @return string".into(),
+            },
+        ];
+        let (ann, diags) = parse_doc_block(&docs);
+        assert!(diags.is_empty());
+        assert_eq!(ann.ret.len(), 2);
+        assert_eq!(ann.ret[0].node, TypeAnn::Named("number".into()));
+        assert_eq!(ann.ret[1].node, TypeAnn::Named("string".into()));
     }
 
     #[test]

@@ -48,6 +48,7 @@ impl Repr {
             | Type::Array(_)
             | Type::Map(_)
             | Type::Record(_)
+            | Type::Tuple(_)
             | Type::Userdata(_)
             | Type::Function(_)
             | Type::Optional(_)

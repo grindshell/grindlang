@@ -338,12 +338,22 @@ end
 
 ### 5.5 Functions, tuples, closures
 
-- Functions may return multiple values (a tuple), consumed by parallel assignment:
-  `local q, r = divmod(a, b)`. **Arity must match exactly:** the number of values a call
-  produces must equal the number of targets (in assignment) or the callee's declared
-  parameter count (when used as a call argument). Unlike Lua, Grindlang does **not**
-  silently truncate extra values or pad missing ones with `nil` — a mismatch is a compile
-  error.
+- Functions may return multiple values as a **tuple**. A `return e1, …, en` with `n ≥ 2`
+  builds a tuple of `n` single-valued elements (a nested multi-value call in the list is **not**
+  flattened — `E0415`). The tuple type is written `(T1, …, Tn)` and is inferred from the
+  `return` expressions (or pinned by repeating `---@return`, one line per element).
+- A tuple is **only** consumable in two positions:
+  1. **Parallel binding / assignment** — `local q, r = divmod(a, b)` or `q, r = divmod(a, b)`,
+     where the single right-hand call produces exactly as many values as there are targets.
+  2. **Pass-through return** — `return divmod(a, b)`, forwarding the callee's tuple unchanged.
+
+  **Arity must match exactly.** Unlike Lua, Grindlang does **not** silently truncate extra
+  values or pad missing ones with `nil`; a count mismatch is a compile error (`E0414` for a
+  binding, `E0413` for an inconsistent `return`). A tuple used in **any** other position —
+  as a single value, an operand, a call argument, an array/table element, or mixed into a
+  value list (`local a, b = f(), 5`) — is a compile error (`E0415`). *(v1 / "Tier A": there is
+  no value-count adjustment and no spreading of a call's results into an argument list; those
+  Lua behaviors are intentionally omitted.)*
 - Anonymous `function … end` expressions (closures) are allowed **inside** function
   bodies; they may capture enclosing locals (their *upvalues*). Captured variables are shared
   mutable cells: a write through one closure is observed by the enclosing scope and by sibling
@@ -364,9 +374,10 @@ recover) or for documentation. A `---` doc-comment block **immediately preceding
 top-level `function` annotates it; the block binds to that function only.
 
 Recognized _(v1)_: `---@param <name> <type>` and `---@return <type>` on top-level functions.
-`---@type <type>` (locals) is **deferred**. Other EmmyLua directives (`@class`, `@field`, …)
-and free-form doc text are ignored, so a file stays valid EmmyLua documentation; only a
-malformed `@param`/`@return` we consume is an error.
+A single `---@return` pins a single return type; **two or more `---@return` lines** pin a
+multi-value (tuple) return in order (§5.5). `---@type <type>` (locals) is **deferred**. Other
+EmmyLua directives (`@class`, `@field`, …) and free-form doc text are ignored, so a file stays
+valid EmmyLua documentation; only a malformed `@param`/`@return` we consume is an error.
 
 **Accepted type syntax _(v1)_** — the EmmyLua spelling of the §5.1 lattice:
 
@@ -518,7 +529,10 @@ both read/write persistent memory.
 - **Array indexing always yields `T?`** — no static bounds analysis; narrow per-access or
   iterate with `ipairs` (§5.4).
 - **`repeat … until` is not supported**; **`//` floor-division is supported** (§3.3, §3.5, §8).
-- **Multi-return arity mismatch is a compile error** — no Lua-style truncate/pad (§5.5).
+- **Multi-return is "Tier A"** (§5.5): a `return`-list builds a tuple, consumed only by a
+  parallel binding/assignment or a pass-through `return`, with **exact arity** (no Lua-style
+  truncate/pad, no spreading into argument lists, no value-count adjustment). A multi-value
+  call anywhere else is a compile error.
 - **`---@` annotation type-syntax subset** is fixed (§5.6): `@param`/`@return` on top-level
   functions, scalar/optional/array/map/record spellings, `@type` and function/userdata types
   deferred, unknown directives ignored.

@@ -156,6 +156,12 @@ pub enum Op {
     MakeArray(Vec<ValueId>),
     /// Build a table from (key, value) pairs.
     MakeTable(Vec<(String, ValueId)>),
+    /// Build a multi-value `return` tuple from its element values (`SPEC.md` §5.5). Always
+    /// ≥ 2 elements. The result is a `Ptr` handle, consumed only by [`Op::TupleGet`].
+    MakeTuple(Vec<ValueId>),
+    /// Read the i-th (0-based) element of a tuple. Emitted when a parallel binding unpacks a
+    /// multi-return call; the index is a compile-time constant known to be in range.
+    TupleGet(ValueId, u32),
 
     /// `base[index]` on an array → element (assumed in range at runtime).
     ArrayGet(ValueId, ValueId),
@@ -682,9 +688,22 @@ impl<'a> FnLowerer<'a> {
             }
         }
         if let Some(ret) = &block.ret {
-            let v = match ret.exprs.first() {
-                Some(e) => Some(self.lower_expr(e)?),
-                None => None,
+            let v = match ret.exprs.len() {
+                0 => None,
+                1 => Some(self.lower_expr(&ret.exprs[0])?),
+                _ => {
+                    // A return list builds a tuple value (`SPEC.md` §5.5).
+                    let elems = ret
+                        .exprs
+                        .iter()
+                        .map(|e| self.lower_expr(e))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let elem_tys = elems
+                        .iter()
+                        .map(|&e| self.values[e as usize].clone())
+                        .collect();
+                    Some(self.emit_value(Op::MakeTuple(elems), Type::Tuple(elem_tys)))
+                }
             };
             self.terminate(Terminator::Return(v));
             return Ok(true);
@@ -705,16 +724,10 @@ impl<'a> FnLowerer<'a> {
                 Ok(true)
             }
             StatKind::Local { names, exprs } => {
-                let vals: Vec<Option<ValueId>> = exprs
-                    .iter()
-                    .map(|e| self.lower_expr(e))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .map(Some)
-                    .collect();
+                let vals = self.lower_multi_rhs(exprs)?;
                 for (i, name) in names.iter().enumerate() {
                     let id = self.local_id(name.span)?;
-                    let v = match vals.get(i).copied().flatten() {
+                    let v = match vals.get(i).copied() {
                         Some(v) => v,
                         None => self.emit_value(Op::ConstNil, Type::Nil),
                     };
@@ -741,13 +754,9 @@ impl<'a> FnLowerer<'a> {
                 Ok(false)
             }
             StatKind::Assign { targets, exprs } => {
-                let vals = exprs
-                    .iter()
-                    .map(|e| self.lower_expr(e))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let vals = self.lower_multi_rhs(exprs)?;
                 for (i, target) in targets.iter().enumerate() {
-                    let v = vals[i];
-                    self.lower_assign(target, v)?;
+                    self.lower_assign(target, vals[i])?;
                 }
                 Ok(false)
             }
@@ -767,6 +776,26 @@ impl<'a> FnLowerer<'a> {
             } => self.lower_numeric_for(var, start, end, step.as_ref(), body),
             StatKind::GenericFor { names, iter, body } => self.lower_generic_for(names, iter, body),
         }
+    }
+
+    /// Lower the right-hand side of a parallel binding/assignment into the values its targets
+    /// consume, applying the Tier-A tuple rule (`SPEC.md` §5.5): a single multi-return call is
+    /// unpacked element-by-element via [`Op::TupleGet`]; any other list is lowered one value per
+    /// expression. The type checker has already validated arity, so the count matches the
+    /// targets by construction.
+    fn lower_multi_rhs(&mut self, exprs: &[Expr]) -> Result<Vec<ValueId>, LowerError> {
+        if exprs.len() == 1 {
+            let v = self.lower_expr(&exprs[0])?;
+            if let Type::Tuple(elem_tys) = self.values[v as usize].clone() {
+                let mut out = Vec::with_capacity(elem_tys.len());
+                for (i, ty) in elem_tys.into_iter().enumerate() {
+                    out.push(self.emit_value(Op::TupleGet(v, i as u32), ty));
+                }
+                return Ok(out);
+            }
+            return Ok(vec![v]);
+        }
+        exprs.iter().map(|e| self.lower_expr(e)).collect()
     }
 
     fn lower_assign(&mut self, target: &Expr, v: ValueId) -> Result<(), LowerError> {
@@ -1631,6 +1660,26 @@ mod vm {
                         .collect::<Result<Vec<_>, _>>()?;
                     Value::array(items)
                 }
+                Op::MakeTuple(elems) => {
+                    let items = elems
+                        .iter()
+                        .map(|e| self.val(act, *e))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Value::tuple(items)
+                }
+                Op::TupleGet(tup, idx) => match self.val(act, *tup)? {
+                    Value::Tuple(items) => {
+                        items.borrow().get(*idx as usize).cloned().ok_or_else(|| {
+                            RunError::Internal(format!("tuple index {idx} out of range"))
+                        })?
+                    }
+                    other => {
+                        return Err(RunError::Internal(format!(
+                            "TupleGet on a {} value",
+                            other.type_name()
+                        )));
+                    }
+                },
                 Op::MakeTable(pairs) => {
                     let mut map = std::collections::BTreeMap::new();
                     for (k, v) in pairs {

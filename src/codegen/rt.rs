@@ -293,6 +293,35 @@ pub unsafe extern "C" fn rt_array_push(ctx: *mut RtCtx, arr: Handle, elem: Handl
     }
 }
 
+// ---- tuples (multi-value returns, `SPEC.md` §5.5) ---------------------------
+
+pub unsafe extern "C" fn rt_tuple_new(ctx: *mut RtCtx, cap: u32) -> Handle {
+    let ctx = ctx!(ctx);
+    ctx.intern(Value::tuple(Vec::with_capacity(cap as usize)))
+}
+
+pub unsafe extern "C" fn rt_tuple_push(ctx: *mut RtCtx, tup: Handle, elem: Handle) {
+    let ctx = ctx!(ctx);
+    let v = ctx.value(elem);
+    if let Value::Tuple(t) = ctx.get(tup) {
+        t.borrow_mut().push(v);
+    }
+}
+
+/// Read the `idx`-th (0-based, always in range) element of a tuple. The result is a boxed
+/// handle the caller unboxes to the element's declared [`Repr`].
+pub unsafe extern "C" fn rt_tuple_get(ctx: *mut RtCtx, tup: Handle, idx: u32) -> Handle {
+    let ctx = ctx!(ctx);
+    let elem = match ctx.get(tup) {
+        Value::Tuple(t) => t.borrow().get(idx as usize).cloned(),
+        _ => None,
+    };
+    match elem {
+        Some(v) => ctx.intern(v),
+        None => NIL,
+    }
+}
+
 pub unsafe extern "C" fn rt_table_new(ctx: *mut RtCtx) -> Handle {
     ctx!(ctx).intern(Value::empty_table())
 }
@@ -654,6 +683,9 @@ pub fn shim_symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_namespace_field", rt_namespace_field as *const u8),
         ("rt_array_new", rt_array_new as *const u8),
         ("rt_array_push", rt_array_push as *const u8),
+        ("rt_tuple_new", rt_tuple_new as *const u8),
+        ("rt_tuple_push", rt_tuple_push as *const u8),
+        ("rt_tuple_get", rt_tuple_get as *const u8),
         ("rt_table_new", rt_table_new as *const u8),
         ("rt_table_set", rt_table_set as *const u8),
         ("rt_array_get", rt_array_get as *const u8),

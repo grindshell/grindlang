@@ -73,13 +73,15 @@ pub enum TypeAnn {
 pub struct FnAnnotations {
     /// `---@param <name> <type>` entries, in source order.
     pub params: Vec<ParamAnn>,
-    /// `---@return <type>` (v1: a single return; the first entry wins).
-    pub ret: Option<Spanned<TypeAnn>>,
+    /// `---@return <type>` entries, in source order. Zero for a value-less/unannotated
+    /// function, one for a single return, or ≥ 2 to annotate a multi-value (tuple) return
+    /// (`SPEC.md` §5.5) — the checker unifies the list against the function's return type.
+    pub ret: Vec<Spanned<TypeAnn>>,
 }
 
 impl FnAnnotations {
     pub fn is_empty(&self) -> bool {
-        self.params.is_empty() && self.ret.is_none()
+        self.params.is_empty() && self.ret.is_empty()
     }
 }
 

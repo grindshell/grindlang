@@ -426,6 +426,15 @@ impl<'a, 'b> Translator<'a, 'b> {
             Op::Truthy(v) => Some(self.translate_truthy(*v)),
             Op::MakeArray(elems) => Some(self.translate_make_array(elems)),
             Op::MakeTable(pairs) => Some(self.translate_make_table(pairs)),
+            Op::MakeTuple(elems) => Some(self.translate_make_tuple(elems)),
+            Op::TupleGet(tup, idx) => {
+                let t = self.val(*tup);
+                let i = self.iconst32(*idx);
+                let h = self
+                    .call_shim("rt_tuple_get", &[self.ctx_val, t, i])
+                    .unwrap();
+                Some(self.unbox_handle(h, self.dest_repr(dest)))
+            }
             Op::ArrayGet(base, idx) => {
                 let b = self.val(*base);
                 let i = self.val(*idx);
@@ -678,6 +687,18 @@ impl<'a, 'b> Translator<'a, 'b> {
             self.call_shim("rt_array_push", &[self.ctx_val, arr, h]);
         }
         arr
+    }
+
+    fn translate_make_tuple(&mut self, elems: &[ValueId]) -> ClifValue {
+        let cap = self.iconst32(elems.len() as u32);
+        let tup = self
+            .call_shim("rt_tuple_new", &[self.ctx_val, cap])
+            .unwrap();
+        for &e in elems {
+            let h = self.box_handle(e);
+            self.call_shim("rt_tuple_push", &[self.ctx_val, tup, h]);
+        }
+        tup
     }
 
     fn translate_make_table(&mut self, pairs: &[(String, ValueId)]) -> ClifValue {

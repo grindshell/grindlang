@@ -84,6 +84,13 @@ pub enum Value {
     /// A mutable string-keyed table — the runtime representation of records, maps, and
     /// host memory alike.
     Table(Rc<RefCell<BTreeMap<String, Value>>>),
+    /// A fixed, heterogeneous tuple — the runtime form of a multi-value `return` (`SPEC.md`
+    /// §5.5). Only ever produced by a `return e1, …, en` (n ≥ 2) and consumed by a
+    /// matching-arity parallel binding; the type checker keeps it out of every other position,
+    /// so it never appears standalone in well-typed code. Effectively immutable — no operation
+    /// mutates a tuple; the shared cell only exists so the JIT can fill it element-by-element
+    /// while constructing it (mirroring [`Value::Array`]).
+    Tuple(Rc<RefCell<Vec<Value>>>),
     /// A script function or closure (interpreter only).
     #[cfg(feature = "interp")]
     Function(Rc<crate::interp::Func>),
@@ -126,6 +133,11 @@ impl Value {
 
     pub fn array(items: Vec<Value>) -> Value {
         Value::Array(Rc::new(RefCell::new(items)))
+    }
+
+    /// A multi-value `return` tuple (`SPEC.md` §5.5). Tuples are never mutated after creation.
+    pub fn tuple(items: Vec<Value>) -> Value {
+        Value::Tuple(Rc::new(RefCell::new(items)))
     }
 
     pub fn table(entries: BTreeMap<String, Value>) -> Value {
@@ -185,6 +197,7 @@ impl Value {
             Value::Str(_) => "string",
             Value::Array(_) => "array",
             Value::Table(_) => "table",
+            Value::Tuple(_) => "tuple",
             #[cfg(any(feature = "interp", feature = "jit"))]
             Value::Closure(_) => "function",
             #[cfg(feature = "interp")]
@@ -229,6 +242,16 @@ impl fmt::Display for Value {
                     write!(f, "{k} = {v}")?;
                 }
                 f.write_str("}")
+            }
+            Value::Tuple(items) => {
+                f.write_str("(")?;
+                for (i, v) in items.borrow().iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                f.write_str(")")
             }
             #[cfg(any(feature = "interp", feature = "jit"))]
             Value::Closure(_) => f.write_str("function"),
@@ -276,6 +299,14 @@ impl serde::Serialize for Value {
                     map.serialize_entry(k, v)?;
                 }
                 map.end()
+            }
+            Value::Tuple(items) => {
+                let items = items.borrow();
+                let mut seq = s.serialize_seq(Some(items.len()))?;
+                for v in items.iter() {
+                    seq.serialize_element(v)?;
+                }
+                seq.end()
             }
             #[cfg(any(feature = "interp", feature = "jit"))]
             Value::Closure(_) => Err(serde::ser::Error::custom(

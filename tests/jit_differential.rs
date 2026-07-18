@@ -795,3 +795,100 @@ fn annotated_unused_param_runs() {
         vec![Value::Number(99.0)],
     );
 }
+
+// ---- multi-return / tuples (Tier A, `SPEC.md` §5.5) -------------------------
+//
+// These validate that `MakeTuple`/`TupleGet` — and a directly-returned tuple crossing the host
+// boundary — behave identically across the AST interpreter, the IR `Vm`, and the JIT.
+
+#[test]
+fn multi_return_consumed_by_parallel_binding() {
+    // The tuple is built and unpacked internally; the observable result is a scalar. Exercises
+    // MakeTuple (scalar element boxing) → TupleGet (unbox to number).
+    let src = "function divmod(a, b) return a // b, a % b end\n\
+               function use(a, b) local q, r = divmod(a, b) return q * 100 + r end";
+    for (a, b) in [(17.0, 5.0), (7.0, 3.0), (-7.0, 3.0), (10.0, 2.0)] {
+        assert_same(src, "use", vec![Value::Number(a), Value::Number(b)]);
+    }
+}
+
+#[test]
+fn directly_returned_tuple_displays_the_same() {
+    // The tuple crosses the host boundary; all three oracles must Display it as `(…, …)`.
+    assert_same(
+        "function f(a, b) return a + b, a - b end",
+        "f",
+        vec![Value::Number(8.0), Value::Number(3.0)],
+    );
+}
+
+#[test]
+fn tuple_of_mixed_scalar_and_reference_elements() {
+    // number + string + bool elements: scalar elements box/unbox, the string is already a Ptr.
+    assert_same(
+        "function f(n) return n * 2, \"tag\", n > 0 end",
+        "f",
+        vec![Value::Number(4.0)],
+    );
+    assert_same(
+        "function f(n) return n * 2, \"tag\", n > 0 end",
+        "f",
+        vec![Value::Number(-1.0)],
+    );
+}
+
+#[test]
+fn tuple_with_an_array_element() {
+    let src = "function f(x) return x, { x, x + 1 } end";
+    assert_same(src, "f", vec![Value::Number(5.0)]);
+}
+
+#[test]
+fn multi_return_pass_through() {
+    // `forward` returns the callee's tuple unchanged (no re-packing). `+ 0` pins the pass-through
+    // params to `number` (otherwise they'd be ambiguous — the unused-param case).
+    let src = "function pair(a, b) return a + 0, b + 0 end\n\
+               function forward(a, b) return pair(a, b) end";
+    assert_same(
+        src,
+        "forward",
+        vec![Value::Number(2.0), Value::Number(9.0)],
+    );
+}
+
+#[test]
+fn multi_return_consumed_by_parallel_assignment() {
+    let src = "function pair(a, b) return a + 1, b + 1 end\n\
+               function use(a, b)\n\
+                 local x = 0\n\
+                 local y = 0\n\
+                 x, y = pair(a, b)\n\
+                 return x * 10 + y\n\
+               end";
+    assert_same(src, "use", vec![Value::Number(3.0), Value::Number(4.0)]);
+}
+
+#[test]
+fn chained_multi_return_unpacks() {
+    // A second unpack whose inputs came from the first — stresses tuple handles not aliasing.
+    let src = "function divmod(a, b) return a // b, a % b end\n\
+               function use(a, b)\n\
+                 local q, r = divmod(a, b)\n\
+                 local q2, r2 = divmod(q + r, 2)\n\
+                 return q2 * 1000 + r2 * 100 + q * 10 + r\n\
+               end";
+    for (a, b) in [(23.0, 7.0), (100.0, 9.0)] {
+        assert_same(src, "use", vec![Value::Number(a), Value::Number(b)]);
+    }
+}
+
+#[test]
+fn tuple_with_optional_element() {
+    // `xs[i]` yields `number?` (a boxed optional Ptr) — returned as a tuple element alongside a
+    // bare number, it must stay a Ptr through MakeTuple and the host decode, `nil` included.
+    let src = "---@param xs number[]\nfunction f(xs) return #xs, xs[1] end";
+    let xs = Value::array(vec![Value::Number(42.0), Value::Number(7.0)]);
+    assert_same(src, "f", vec![xs]);
+    // Empty array → `xs[1]` is nil; the element Displays as `nil` across all three oracles.
+    assert_same(src, "f", vec![Value::array(vec![])]);
+}

@@ -4,6 +4,11 @@
 //! argument vectors with `proptest`, then asserts the three semantics oracles agree:
 //! AST `Interpreter` == IR `Vm` == cranelift `JitModule`.
 //!
+//! [`interp_vm_jit_agree`] covers single-value functions; [`multi_return_oracles_agree`] covers
+//! Tier-A multi-return (`SPEC.md` §5.5) — a generated tuple return consumed both as a direct
+//! pass-through (exercising `MakeTuple` + tuple `Display` across the host boundary) and via a
+//! parallel-binding unpack (exercising `TupleGet`).
+//!
 //! proptest **shrinks** any failure to a minimal expression + inputs, which is the point:
 //! a codegen divergence is reported as the smallest program that triggers it.
 //!
@@ -96,5 +101,71 @@ proptest! {
 
         prop_assert_eq!(&si, &sv, "AST vs IR mismatch:\n{}", src);
         prop_assert_eq!(&sv, &sj, "IR vs JIT mismatch:\n{}", src);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// AST == IR == JIT for a *multi-return* function (Tier A, `SPEC.md` §5.5). A helper `mr`
+    /// returns a tuple of 2–4 generated expressions; we then check two consumers over the same
+    /// inputs: `direct` returns the tuple unchanged (stressing `MakeTuple` and tuple `Display`
+    /// as it crosses the host boundary), and `sum` unpacks it with a parallel `local` binding
+    /// and adds the elements (stressing `TupleGet` and per-element box/unbox).
+    #[test]
+    fn multi_return_oracles_agree(
+        exprs in prop::collection::vec(arb_expr(), 2..=4),
+        a in -50.0f64..50.0,
+        b in -50.0f64..50.0,
+        c in -50.0f64..50.0,
+    ) {
+        // Union of the params actually used across *any* element expression (an unused param is
+        // un-inferrable and rejected). `direct`/`sum` pass every param straight to `mr`, so each
+        // is "used" there too.
+        let joined = exprs.join(" ");
+        let used: Vec<(&str, f64)> = [("a", a), ("b", b), ("c", c)]
+            .into_iter()
+            .filter(|(name, _)| joined.contains(name))
+            .collect();
+        let names = used.iter().map(|(n, _)| *n).collect::<Vec<_>>();
+        let params = names.join(", ");
+        // Pin every used param to `number` (a bare pass-through leaves it ambiguous → E0410).
+        let pin = if names.is_empty() {
+            String::new()
+        } else {
+            format!("  local _pin = ({}) * 0\n", names.join(" + "))
+        };
+        let ret_list = exprs.join(", ");
+        let binders = (0..exprs.len())
+            .map(|i| format!("v{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sum = (0..exprs.len())
+            .map(|i| format!("v{i}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let src = format!(
+            "function mr({params})\n{pin}  return {ret_list}\nend\n\
+             function direct({params})\n  return mr({params})\nend\n\
+             function sum({params})\n  local {binders} = mr({params})\n  return {sum}\nend"
+        );
+
+        let cfg = TypeConfig::default();
+        let (module, res, info) = grindlang::analyze(&src, &cfg).expect("analyze multi-return");
+        let program = grindlang::ir::lower(&module, &res, &info, &cfg).expect("lower");
+        grindlang::ir::verify(&program).expect("verify");
+
+        let mut interp = Interpreter::new(&module, &res).expect("interp");
+        let mut vm = Vm::new(&program);
+        let mut jit = JitModule::compile(&program).expect("jit compile");
+
+        let args: Vec<Value> = used.iter().map(|(_, v)| Value::Number(*v)).collect();
+        for func in ["direct", "sum"] {
+            let si = render(&interp.call(func, args.clone()));
+            let sv = render(&vm.call(func, args.clone()));
+            let sj = render(&jit.call(func, args.clone()));
+            prop_assert_eq!(&si, &sv, "AST vs IR mismatch in `{}`:\n{}", func, src);
+            prop_assert_eq!(&sv, &sj, "IR vs JIT mismatch in `{}`:\n{}", func, src);
+        }
     }
 }

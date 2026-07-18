@@ -271,9 +271,18 @@ impl<'a> Interpreter<'a> {
             }
         }
         if let Some(ret) = &block.ret {
-            let v = match ret.exprs.first() {
-                Some(e) => self.eval_expr(e)?,
-                None => Value::Nil,
+            let v = match ret.exprs.len() {
+                0 => Value::Nil,
+                1 => self.eval_expr(&ret.exprs[0])?,
+                // A return list evaluates to a tuple value (`SPEC.md` §5.5).
+                _ => {
+                    let items = ret
+                        .exprs
+                        .iter()
+                        .map(|e| self.eval_expr(e))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Value::tuple(items)
+                }
             };
             return Ok(Flow::Return(v));
         }
@@ -285,7 +294,7 @@ impl<'a> Interpreter<'a> {
             StatKind::Empty => Ok(Flow::Normal),
             StatKind::Break => Ok(Flow::Break),
             StatKind::Local { names, exprs } => {
-                let values = self.eval_list(exprs)?;
+                let values = self.eval_rhs(exprs)?;
                 for (i, name) in names.iter().enumerate() {
                     let v = values.get(i).cloned().unwrap_or(Value::Nil);
                     self.declare(name, v)?;
@@ -305,7 +314,7 @@ impl<'a> Interpreter<'a> {
                 Ok(Flow::Normal)
             }
             StatKind::Assign { targets, exprs } => {
-                let values = self.eval_list(exprs)?;
+                let values = self.eval_rhs(exprs)?;
                 for (i, target) in targets.iter().enumerate() {
                     let v = values.get(i).cloned().unwrap_or(Value::Nil);
                     self.assign_to(target, v)?;
@@ -606,6 +615,21 @@ impl<'a> Interpreter<'a> {
 
     fn eval_list(&mut self, exprs: &[Expr]) -> Result<Vec<Value>, RunError> {
         exprs.iter().map(|e| self.eval_expr(e)).collect()
+    }
+
+    /// Evaluate the right-hand side of a parallel binding/assignment, applying the Tier-A
+    /// tuple rule (`SPEC.md` §5.5): a single expression that evaluates to a multi-return tuple
+    /// is spread across the targets; any other list is one value per expression. The type
+    /// checker has already validated arity, so no adjustment (truncate/pad) is needed here.
+    fn eval_rhs(&mut self, exprs: &[Expr]) -> Result<Vec<Value>, RunError> {
+        if exprs.len() == 1 {
+            let v = self.eval_expr(&exprs[0])?;
+            if let Value::Tuple(items) = v {
+                return Ok(items.borrow().clone());
+            }
+            return Ok(vec![v]);
+        }
+        self.eval_list(exprs)
     }
 
     fn eval_number(&mut self, expr: &Expr) -> Result<f64, RunError> {

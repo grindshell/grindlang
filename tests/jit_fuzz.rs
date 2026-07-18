@@ -131,3 +131,28 @@ fn fuzz_short_circuit() {
                end";
     fuzz_numeric(src, "f", 2, 0x5C2C, 500);
 }
+
+#[test]
+fn fuzz_multi_return_unpack() {
+    // A 3-value helper consumed by a parallel binding, combined back into a scalar. Exercises
+    // `MakeTuple` (three elements) → `TupleGet` across all three oracles (`SPEC.md` §5.5).
+    let src = "function stats(a, b)\n\
+                 return a + b, a - b, a * b\n\
+               end\n\
+               function f(a, b)\n\
+                 local s, d, p = stats(a, b)\n\
+                 return s * 2.0 + d - p\n\
+               end";
+    fuzz_numeric(src, "f", 2, 0x7071E, 500);
+}
+
+#[test]
+fn fuzz_multi_return_direct_tuple() {
+    // A directly-returned tuple with a numeric and a bool element: the result crosses the host
+    // boundary as a `Value::Tuple` and all three oracles must `Display` it identically — which
+    // also stresses per-element box/unbox (bool element) through the tuple.
+    let src = "function f(a, b)\n\
+                 return a + b, a * b, a < b\n\
+               end";
+    fuzz_numeric(src, "f", 2, 0x7DEC0DE, 500);
+}

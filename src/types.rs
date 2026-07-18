@@ -55,6 +55,10 @@ pub enum Type {
     Map(Box<Type>),
     /// Fixed, known string keys.
     Record(BTreeMap<String, Type>),
+    /// A fixed, heterogeneous tuple of length ≥ 2 — the type of a multi-value `return`
+    /// (`SPEC.md` §5.5). Only ever inhabits a function's return position and is consumed by a
+    /// matching-arity parallel binding; the checker rejects it in every other position.
+    Tuple(Vec<Type>),
     Function(FnType),
     /// Opaque named host type.
     Userdata(String),
@@ -88,6 +92,10 @@ impl Type {
             ret: Box::new(ret),
         })
     }
+    /// A tuple type. Tuples always carry ≥ 2 elements (a single `return e` is not a tuple).
+    pub fn tuple(elems: Vec<Type>) -> Type {
+        Type::Tuple(elems)
+    }
 }
 
 impl std::fmt::Display for Type {
@@ -110,6 +118,16 @@ impl std::fmt::Display for Type {
                     write!(f, "{k}: {v}")?;
                 }
                 f.write_str(" }")
+            }
+            Type::Tuple(elems) => {
+                f.write_str("(")?;
+                for (i, t) in elems.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{t}")?;
+                }
+                f.write_str(")")
             }
             Type::Function(ft) => {
                 f.write_str("fn(")?;
@@ -258,6 +276,7 @@ impl Unifier {
                     .map(|(k, v)| (k.clone(), self.deep(v)))
                     .collect(),
             ),
+            Type::Tuple(elems) => Type::Tuple(elems.iter().map(|e| self.deep(e)).collect()),
             Type::Function(ft) => Type::Function(FnType {
                 params: ft.params.iter().map(|p| self.deep(p)).collect(),
                 ret: Box::new(self.deep(&ft.ret)),
@@ -271,6 +290,7 @@ impl Unifier {
             Type::Var(id) => id == var,
             Type::Optional(i) | Type::Array(i) | Type::Map(i) => self.occurs(var, &i),
             Type::Record(fields) => fields.values().any(|v| self.occurs(var, v)),
+            Type::Tuple(elems) => elems.iter().any(|e| self.occurs(var, e)),
             Type::Function(ft) => {
                 ft.params.iter().any(|p| self.occurs(var, p)) || self.occurs(var, &ft.ret)
             }
@@ -308,6 +328,15 @@ impl Unifier {
                 }
                 for (k, xv) in &x {
                     self.unify(xv, &y[k])?;
+                }
+                Ok(())
+            }
+            (Type::Tuple(x), Type::Tuple(y)) => {
+                if x.len() != y.len() {
+                    return Err(());
+                }
+                for (xv, yv) in x.iter().zip(&y) {
+                    self.unify(xv, yv)?;
                 }
                 Ok(())
             }
@@ -538,14 +567,27 @@ impl<'a> Checker<'a> {
                 ),
             }
         }
-        if let Some(ret_ann) = &f.annotations.ret {
-            let ann = self.ann_to_type(&ret_ann.node, ret_ann.span);
+        // Zero `@return` lines: nothing to pin. One: a single return type. Two or more: a
+        // tuple return (`SPEC.md` §5.5), in source order.
+        if !f.annotations.ret.is_empty() {
+            let span = f.annotations.ret[0].span;
+            let ann = if f.annotations.ret.len() == 1 {
+                self.ann_to_type(&f.annotations.ret[0].node, span)
+            } else {
+                let elems = f
+                    .annotations
+                    .ret
+                    .iter()
+                    .map(|r| self.ann_to_type(&r.node, r.span))
+                    .collect();
+                Type::Tuple(elems)
+            };
             let target = (*sig.ret).clone();
             if self.u.unify(&ann, &target).is_err() {
                 self.error(
                     "E0460",
                     "`@return` annotation conflicts with the inferred return type",
-                    ret_ann.span,
+                    span,
                 );
             }
         }
@@ -601,22 +643,25 @@ impl<'a> Checker<'a> {
     }
 
     fn check_return(&mut self, ret: &RetStat) {
-        if ret.exprs.len() > 1 {
-            self.error(
-                "E0412",
-                "multiple return values are not supported in this version of Grindlang",
-                ret.span,
-            );
-        }
         let frame_ret = self.return_stack.last().map(|f| f.ret.clone());
-        if let Some(expr) = ret.exprs.first() {
-            let t = self.check_expr(expr);
-            if let Some(r) = frame_ret {
-                self.require(expr.span, &t, &r, "E0413", "return type mismatch");
-            }
-            if let Some(frame) = self.return_stack.last_mut() {
-                frame.saw_value = true;
-            }
+        // 0 exprs → value-less; 1 → a single value (which may itself be a tuple-returning call,
+        // i.e. a pass-through); ≥ 2 → a tuple built from single-valued elements (no flattening).
+        let (value_ty, span) = if ret.exprs.is_empty() {
+            return;
+        } else if ret.exprs.len() == 1 {
+            let e = &ret.exprs[0];
+            (self.check_expr_multi(e), e.span)
+        } else {
+            // Each element is typed through `check_expr` (the guard), so a nested multi-value
+            // call inside the list is rejected as E0415 rather than silently flattened.
+            let elems = ret.exprs.iter().map(|e| self.check_expr(e)).collect();
+            (Type::Tuple(elems), ret.span)
+        };
+        if let Some(r) = frame_ret {
+            self.require(span, &value_ty, &r, "E0413", "return type mismatch");
+        }
+        if let Some(frame) = self.return_stack.last_mut() {
+            frame.saw_value = true;
         }
     }
 
@@ -665,43 +710,76 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_local(&mut self, names: &[Ident], exprs: &[Expr], span: Span) {
-        // v1: one value per expression; counts must match (no multi-value adjustment).
-        if !exprs.is_empty() && exprs.len() != names.len() {
+    /// Type the right-hand side of a parallel binding/assignment against `n` targets, applying
+    /// the Tier-A tuple rule (`SPEC.md` §5.5): a *single* multi-return call spreads across all
+    /// `n` targets; otherwise it is a one-value-per-expression list whose count must equal `n`.
+    /// Always returns exactly `n` types (padded with [`Type::Error`] on an arity error).
+    fn check_multi_rhs(&mut self, exprs: &[Expr], n: usize, span: Span) -> Vec<Type> {
+        // A single expression may be a multi-return call whose values spread across the targets.
+        if exprs.len() == 1 {
+            let t = self.check_expr_multi(&exprs[0]);
+            if let Type::Tuple(elems) = self.u.deep(&t) {
+                if elems.len() != n {
+                    self.error(
+                        "E0414",
+                        format!(
+                            "assignment arity mismatch: {n} target(s) but the call returns {} value(s)",
+                            elems.len()
+                        ),
+                        span,
+                    );
+                    return vec![Type::Error; n];
+                }
+                return elems;
+            }
+            // A single ordinary value.
+            if n != 1 {
+                self.error(
+                    "E0414",
+                    format!("assignment arity mismatch: {n} target(s) but 1 value"),
+                    span,
+                );
+            }
+            let mut vals = vec![t];
+            vals.resize(n, Type::Error);
+            return vals;
+        }
+        // Multiple expressions: each must be single-valued (the guard forbids a tuple), 1:1.
+        let mut vals: Vec<Type> = exprs.iter().map(|e| self.check_expr(e)).collect();
+        if vals.len() != n {
             self.error(
                 "E0414",
                 format!(
-                    "assignment arity mismatch: {} name(s) but {} value(s)",
-                    names.len(),
-                    exprs.len()
+                    "assignment arity mismatch: {n} target(s) but {} value(s)",
+                    vals.len()
                 ),
                 span,
             );
         }
-        let mut value_types: Vec<Type> = exprs.iter().map(|e| self.check_expr(e)).collect();
-        value_types.resize(names.len(), Type::Error);
+        vals.resize(n, Type::Error);
+        vals
+    }
+
+    fn check_local(&mut self, names: &[Ident], exprs: &[Expr], span: Span) {
+        if exprs.is_empty() {
+            // Uninitialized `local a, b` — each name gets a fresh var pinned by later use.
+            for name in names {
+                if let Some(id) = self.res.def(name.span) {
+                    self.sym_types[id as usize] = self.u.fresh();
+                }
+            }
+            return;
+        }
+        let value_types = self.check_multi_rhs(exprs, names.len(), span);
         for (name, vt) in names.iter().zip(value_types) {
             if let Some(id) = self.res.def(name.span) {
-                // Uninitialized `local x` gets a fresh var to be pinned by later use.
-                let t = if exprs.is_empty() { self.u.fresh() } else { vt };
-                self.sym_types[id as usize] = t;
+                self.sym_types[id as usize] = vt;
             }
         }
     }
 
     fn check_assign(&mut self, targets: &[Expr], exprs: &[Expr], span: Span) {
-        if targets.len() != exprs.len() {
-            self.error(
-                "E0414",
-                format!(
-                    "assignment arity mismatch: {} target(s) but {} value(s)",
-                    targets.len(),
-                    exprs.len()
-                ),
-                span,
-            );
-        }
-        let value_types: Vec<Type> = exprs.iter().map(|e| self.check_expr(e)).collect();
+        let value_types = self.check_multi_rhs(exprs, targets.len(), span);
         for (target, vt) in targets.iter().zip(value_types) {
             let place = self.place_type(target);
             self.require_assignable(target.span, &vt, &place, "assignment type mismatch");
@@ -801,13 +879,38 @@ impl<'a> Checker<'a> {
 
     // ---- expressions ---------------------------------------------------------
 
+    /// Type an expression that **must** yield a single value. A multi-value (tuple) call in
+    /// this position is an error (`E0415`): tuples are confined to the two legal spots — the
+    /// sole expression of a `return` and the sole right-hand side of a parallel binding — which
+    /// call [`Checker::check_expr_multi`] directly. Every recursive/operand position routes
+    /// through here, so a tuple can never silently unify into an operand, argument, container
+    /// element, or parameter var.
     fn check_expr(&mut self, expr: &Expr) -> Type {
+        let t = self.check_expr_multi(expr);
+        if matches!(self.u.shallow(&t), Type::Tuple(_)) {
+            self.error(
+                "E0415",
+                "a multi-value call must be returned directly or bound to a parallel \
+                 `local`/assignment; it can't be used as a single value here",
+                expr.span,
+            );
+            return Type::Error;
+        }
+        t
+    }
+
+    /// The expression-typing engine. Returns a [`Type::Tuple`] for a multi-return call so the
+    /// two legal multi-value positions can consume it; every other caller goes through the
+    /// [`Checker::check_expr`] wrapper, which forbids a tuple result.
+    fn check_expr_multi(&mut self, expr: &Expr) -> Type {
         match &expr.kind {
             ExprKind::Nil => Type::Nil,
             ExprKind::Bool(_) => Type::Bool,
             ExprKind::Number(_) => Type::Number,
             ExprKind::Str(_) => Type::String,
-            ExprKind::Paren(inner) => self.check_expr(inner),
+            // Parentheses are transparent in Tier A (no value-count adjustment): `(f())` has
+            // the same type as `f()`, so a paren'd pass-through stays legal.
+            ExprKind::Paren(inner) => self.check_expr_multi(inner),
             ExprKind::Name(_) => self.check_name(expr),
             ExprKind::Function(body) => {
                 let sig = self.make_sig(&body.params);
@@ -1892,8 +1995,123 @@ mod tests {
     }
 
     #[test]
-    fn multiple_returns_rejected() {
-        assert_eq!(err_code("function f() return 1, 2 end", &empty()), "E0412");
+    fn multi_return_infers_a_tuple_type() {
+        let info = ok("function f() return 1, 2 end", &empty());
+        assert_eq!(info.exports["f"].to_string(), "fn() -> (number, number)");
+    }
+
+    #[test]
+    fn parallel_binding_unpacks_a_multi_return_call() {
+        let info = ok(
+            "function divmod(a, b) return a // b, a % b end\n\
+             function use(x, y) local q, r = divmod(x, y) return q + r end",
+            &empty(),
+        );
+        assert_eq!(info.exports["use"].to_string(), "fn(number, number) -> number");
+    }
+
+    #[test]
+    fn parallel_assignment_unpacks_a_multi_return_call() {
+        let info = ok(
+            "function pair() return 1, 2 end\n\
+             function use() local a = 0\n local b = 0\n a, b = pair() return a + b end",
+            &empty(),
+        );
+        assert_eq!(info.exports["use"].to_string(), "fn() -> number");
+    }
+
+    #[test]
+    fn return_can_pass_through_a_multi_return_call() {
+        let info = ok(
+            "function pair() return 1, 2 end\n\
+             function forward() return pair() end",
+            &empty(),
+        );
+        assert_eq!(info.exports["forward"].to_string(), "fn() -> (number, number)");
+    }
+
+    #[test]
+    fn multi_return_annotation_builds_a_tuple() {
+        let info = ok(
+            "---@param x bool\n\
+             ---@return number\n\
+             ---@return string\n\
+             function f(x) if x then return 1, \"a\" end return 2, \"b\" end",
+            &empty(),
+        );
+        assert_eq!(info.exports["f"].to_string(), "fn(bool) -> (number, string)");
+    }
+
+    #[test]
+    fn binding_arity_mismatch_is_error() {
+        // A 2-value call bound to a single name.
+        assert_eq!(
+            err_code(
+                "function pair() return 1, 2 end\nfunction f() local x = pair() return x end",
+                &empty()
+            ),
+            "E0414"
+        );
+    }
+
+    #[test]
+    fn multi_return_in_value_position_is_error() {
+        assert_eq!(
+            err_code(
+                "function pair() return 1, 2 end\nfunction f() return pair() + 1 end",
+                &empty()
+            ),
+            "E0415"
+        );
+    }
+
+    #[test]
+    fn multi_return_as_call_argument_is_error() {
+        // Tier A: a multi-value call does not spread into an argument list. Single-param callee
+        // so the arity is fine and the tuple guard is unambiguously what fires.
+        assert_eq!(
+            err_code(
+                "function pair() return 1, 2 end\n\
+                 function id(a) return a end\n\
+                 function f() return id(pair()) end",
+                &empty()
+            ),
+            "E0415"
+        );
+    }
+
+    #[test]
+    fn mixing_multi_return_into_a_list_is_error() {
+        assert_eq!(
+            err_code(
+                "function pair() return 1, 2 end\n\
+                 function f() local a, b = pair(), 5 return a + b end",
+                &empty()
+            ),
+            "E0415"
+        );
+    }
+
+    #[test]
+    fn nesting_multi_return_in_a_return_list_is_error() {
+        assert_eq!(
+            err_code(
+                "function pair() return 1, 2 end\nfunction f() return pair(), 3 end",
+                &empty()
+            ),
+            "E0415"
+        );
+    }
+
+    #[test]
+    fn inconsistent_return_arity_is_error() {
+        assert_eq!(
+            err_code(
+                "function f(b) if b then return 1, 2 end return 3 end",
+                &empty()
+            ),
+            "E0413"
+        );
     }
 
     #[test]
