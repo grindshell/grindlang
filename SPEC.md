@@ -453,6 +453,13 @@ The names of injected bindings (`mem`, registered functions) are configured per 
 `mem` is used illustratively. Injected names are reserved within a script — a top-level
 declaration may not shadow them.
 
+A binding that the embedding **declares but never provides** is a runtime error the first time
+a script reads it — never a silent `nil`. The check is lazy: declaring a memory the script
+never touches costs nothing, and a script that reads it fails at that point (§7.3) rather than
+at call entry. Binding a memory explicitly *to* `nil` is a different thing: the host provided a
+value, so the read succeeds. The same rule applies to a declared host function that was never
+registered, and to a declared memory method (§7.2).
+
 ### 7.1 Calling exports from the host (arity & marshaling)
 
 The host invokes a compiled module's exports with Rust values and marshals the result back to

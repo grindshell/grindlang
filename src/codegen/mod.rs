@@ -577,12 +577,15 @@ impl JitModule {
             .collect()
     }
 
-    /// Resolve bound memory handles into pool-id order (parallel to `pools.memories`).
-    fn resolve_memory(&self) -> Vec<Value> {
+    /// Resolve bound memory handles into pool-id order (parallel to `pools.memories`), leaving
+    /// a declared-but-unprovided binding as `None` so reading it fails at the point of use the
+    /// way it does in both interpreters. Substituting `Value::Nil` here would make
+    /// `rt_memory_ref`'s not-provided error unreachable.
+    fn resolve_memory(&self) -> Vec<Option<Value>> {
         self.pools
             .memories
             .iter()
-            .map(|n| self.memory.get(n).cloned().unwrap_or(Value::Nil))
+            .map(|n| self.memory.get(n).cloned())
             .collect()
     }
 

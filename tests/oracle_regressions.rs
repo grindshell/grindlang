@@ -379,10 +379,10 @@ end
 
 // ---- Finding 3: a missing memory binding must be an error, not nil ---------
 
-/// Reading a declared-but-unbound memory must fail on every backend. The JIT resolves missing
-/// bindings to `Value::Nil`, which makes `rt_memory_ref`'s missing-slot error unreachable.
+/// Reading a declared-but-unbound memory must fail on every backend. The JIT used to resolve a
+/// missing binding to `Value::Nil`, which made `rt_memory_ref`'s not-provided error unreachable
+/// and turned `mem.x + 1` into a silently valid `1`.
 #[test]
-#[ignore = "finding 3: resolve_memory substitutes Value::Nil for an unbound memory"]
 fn missing_memory_binding_is_an_error() {
     let src = "function f() return mem.x + 1 end";
     let cfg = mem_config("x");
@@ -393,6 +393,101 @@ fn missing_memory_binding_is_an_error() {
     let c = jit.call("f", vec![]);
     assert_agree("unbound memory read", &a, &b, &c);
     assert!(c.is_err(), "reading an unbound memory must fail");
+}
+
+/// Binding a memory *to* `nil` is not the same as leaving it unbound: the host did provide a
+/// binding, so whatever happens next, it must not be reported as missing. Pins that the
+/// `Option` distinguishing the two cases isn't collapsed back to a `Value::Nil` sentinel.
+///
+/// (Binding `nil` where the schema declares a record is itself ill-typed, and the backends
+/// disagree on what that *does* — see `ill_typed_memory_binding_is_rejected_or_consistent`.
+/// This test deliberately asserts only the provided-vs-missing distinction.)
+#[test]
+fn memory_bound_to_nil_is_not_reported_as_missing() {
+    let src = "function f() return mem.x + 1 end";
+    let cfg = mem_config("x");
+    let (_, _, mut jit) = triple(src, &cfg);
+
+    let unbound = jit.call("f", vec![]).expect_err("unbound read must fail");
+    assert!(
+        format!("{unbound}").contains("was not provided"),
+        "got {unbound:?}"
+    );
+
+    jit.set_memory("mem", Value::Nil);
+    if let Err(e) = jit.call("f", vec![]) {
+        assert!(
+            !format!("{e}").contains("was not provided"),
+            "an explicitly bound memory must not read as missing; got {e:?}"
+        );
+    }
+}
+
+/// The same declared-but-not-provided rule for a host function (SPEC §7): calling one that was
+/// never registered must fail on every backend rather than returning a default.
+#[test]
+fn unregistered_host_function_is_an_error() {
+    let src = "function f() return tick() end";
+    let cfg = tick_config();
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    // Deliberately register nothing.
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("unregistered host function", &a, &b, &c);
+    assert!(
+        c.is_err(),
+        "calling an unregistered host function must fail"
+    );
+}
+
+/// And for a declared memory method (SPEC §7.2).
+#[test]
+fn unregistered_memory_method_is_an_error() {
+    let src = "function f() return mem:bump(1) end";
+    let mut cfg = mem_config("x");
+    let mut methods = BTreeMap::new();
+    methods.insert(
+        "bump".to_string(),
+        FnType {
+            params: vec![Type::Number],
+            ret: Box::new(Type::Number),
+        },
+    );
+    cfg.methods.insert("mem".to_string(), methods);
+
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let bind = || Value::table([("x".to_string(), Value::Number(0.0))].into());
+    interp.set_memory("mem", bind());
+    vm.set_memory("mem", bind());
+    jit.set_memory("mem", bind());
+    // The memory is bound; the method is not registered.
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("unregistered memory method", &a, &b, &c);
+    assert!(c.is_err(), "calling an unregistered method must fail");
+}
+
+/// Once a binding is provided, reads work — and a later `set_memory` is picked up, so the
+/// not-provided path can't be papered over by a stale resolved binding.
+#[test]
+fn memory_binding_is_observed_after_being_set() {
+    let src = "function f() return mem.x + 1 end";
+    let cfg = mem_config("x");
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    assert!(jit.call("f", vec![]).is_err(), "unbound read must fail");
+
+    let bind = || Value::table([("x".to_string(), Value::Number(41.0))].into());
+    interp.set_memory("mem", bind());
+    vm.set_memory("mem", bind());
+    jit.set_memory("mem", bind());
+
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("bound memory read", &a, &b, &c);
+    assert_eq!(c.expect("bound read").to_string(), "42");
 }
 
 // ---- Finding 4: constants must have consistent identity across oracles -----
@@ -441,7 +536,33 @@ fn exported_constant_reads_back_consistently() {
     assert_agree("read exported constant", &a, &b, &c);
 }
 
-// ---- Finding 5: raw calls must not coerce ill-typed arguments --------------
+// ---- Finding 5: the host boundary must not coerce ill-typed values ---------
+//
+// The JIT trusts the declared types and unboxes without a runtime shape check, while both
+// interpreters check dynamically. That shows up wherever the host supplies a value the
+// signature or schema didn't promise — call arguments *and* memory bindings.
+
+/// A memory bound with the wrong shape (the schema declares a record, the host supplies `nil`)
+/// reads as a silent `0` in the JIT but errors in both interpreters. Found while fixing
+/// finding 3; the same root cause as the argument case below, but a different entry point, so
+/// checking `encode_arg` alone would not fix it.
+///
+/// Accepts either resolution: `set_memory` rejecting the ill-typed binding up front, or all
+/// three backends agreeing at runtime.
+#[test]
+#[ignore = "finding 5: set_memory accepts a binding that violates the declared schema"]
+fn ill_typed_memory_binding_is_rejected_or_consistent() {
+    let src = "function f() return mem.x + 1 end";
+    let cfg = mem_config("x");
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    interp.set_memory("mem", Value::Nil);
+    vm.set_memory("mem", Value::Nil);
+    jit.set_memory("mem", Value::Nil);
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("memory bound to nil", &a, &b, &c);
+}
 
 /// The raw `call` path checks arity but not runtime shapes, so a string passed to a
 /// `number` parameter is silently encoded as `0.0` instead of failing.

@@ -142,8 +142,13 @@ pub struct RtCtx {
     host: Vec<Option<NativeFn>>,
     /// Host-memory methods resolved by id (parallel to [`Pools::methods`]).
     methods: Vec<Option<NativeFn>>,
-    /// Memory bindings resolved by id (parallel to [`Pools::memories`]).
-    memory: Vec<Value>,
+    /// Memory bindings resolved by id (parallel to [`Pools::memories`]), `None` where the host
+    /// declared a binding but never provided one. Optional for the same reason `host` is:
+    /// substituting a value for a missing binding would make [`rt_memory_ref`]'s
+    /// not-provided error unreachable and turn an unbound memory into a silently valid `nil`.
+    /// A binding the host explicitly set *to* `nil` is `Some(Value::Nil)` and stays legal —
+    /// the same distinction the interpreters draw by map presence.
+    memory: Vec<Option<Value>>,
     /// Finalized native address of every compiled function, by name. Used to resolve the
     /// callee of an indirect closure call ([`rt_closure_code_addr`]).
     code_addrs: Arc<HashMap<String, u64>>,
@@ -200,7 +205,7 @@ impl RtCtx {
         pools: Arc<Pools>,
         host: Vec<Option<NativeFn>>,
         methods: Vec<Option<NativeFn>>,
-        memory: Vec<Value>,
+        memory: Vec<Option<Value>>,
         code_addrs: Arc<HashMap<String, u64>>,
         origin: Rc<ClosureOrigin>,
     ) -> Self {
@@ -280,7 +285,7 @@ impl RtCtx {
         &mut self,
         host: Vec<Option<NativeFn>>,
         methods: Vec<Option<NativeFn>>,
-        memory: Vec<Value>,
+        memory: Vec<Option<Value>>,
     ) {
         self.host = host;
         self.methods = methods;
@@ -336,9 +341,11 @@ pub unsafe extern "C" fn rt_const_string(ctx: *mut RtCtx, idx: u32) -> Handle {
     ctx.intern(Value::string(s))
 }
 
+/// Read a host memory binding. A binding the host declared but never provided is an error at
+/// the point of use, matching both interpreters — not a silent `nil`.
 pub unsafe extern "C" fn rt_memory_ref(ctx: *mut RtCtx, id: u32) -> Handle {
     let ctx = ctx!(ctx);
-    match ctx.memory.get(id as usize).cloned() {
+    match ctx.memory.get(id as usize).cloned().flatten() {
         Some(v) => ctx.intern(v),
         None => {
             let name = ctx.pools.memories[id as usize].clone();
