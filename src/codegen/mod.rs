@@ -428,7 +428,7 @@ impl JitModule {
                 }
             };
 
-        let argv = encode_args(ctx, params, args);
+        let argv = encode_args(ctx, params, args)?;
         let argv = argv.as_slice();
         // SAFETY: `tramp` has the `TrampFn` ABI; `ctx` outlives the call; `argv` holds one
         // bits-ABI word per declared parameter.
@@ -442,8 +442,9 @@ impl JitModule {
 
     /// Direct-call fast path for an all-`number` export: invoke the native typed function at
     /// `addr` as `(ctx, f64 × arity) -> f64`, skipping the trampoline and the argument buffer.
-    /// `arity` is `<= MAX_DIRECT_ARGS` (guaranteed by the caller). Surplus args are ignored and
-    /// missing ones default to `0.0`, matching the trampoline path's `nil`-to-`0.0` coercion.
+    /// `arity` is `<= MAX_DIRECT_ARGS` and matches `args.len()` (both guaranteed by the caller).
+    /// Rejects a non-number argument exactly as the trampoline path's [`RtCtx::encode_arg`]
+    /// does, so taking the fast path can't change whether a call is accepted.
     fn call_direct_number(
         &self,
         ctx: &mut RtCtx,
@@ -453,7 +454,12 @@ impl JitModule {
     ) -> Result<Value, RunError> {
         let mut a = [0f64; MAX_DIRECT_ARGS];
         for (slot, v) in a.iter_mut().zip(args) {
-            *slot = v.as_f64().unwrap_or(0.0);
+            *slot = v.as_f64().ok_or_else(|| {
+                RunError::Runtime(format!(
+                    "expected a number argument, found {}",
+                    v.type_name()
+                ))
+            })?;
         }
         let p = addr as *const u8;
         let c = ctx as *mut RtCtx;
@@ -547,7 +553,7 @@ impl JitModule {
 
         // The closure itself is the env argument (it carries the captured cells).
         let env = ctx.intern(callee);
-        let argv = encode_args(ctx, params, args);
+        let argv = encode_args(ctx, params, args)?;
         let argv = argv.as_slice();
         // SAFETY: `tramp` has the `EnvTrampFn` ABI; `ctx` outlives the call; `argv` holds one
         // bits-ABI word per declared (source-level) parameter.
@@ -654,23 +660,27 @@ impl ArgBuf {
 
 /// Encode call arguments into the bits-ABI buffer the trampolines read: exactly one 64-bit
 /// word per declared parameter (scalars as raw bits via [`RtCtx::encode_arg`], reference
-/// values interned to handles). Surplus arguments are ignored and missing ones default to
-/// `nil`, so the buffer length always matches the parameter count the trampoline expects.
-fn encode_args(ctx: &mut RtCtx, params: &[Repr], args: Vec<Value>) -> ArgBuf {
+/// values interned to handles). Callers check arity first, so the buffer length always matches
+/// the parameter count the trampoline expects.
+///
+/// Fails if an argument's runtime shape contradicts its declared parameter type, rather than
+/// coercing it to `0` / `false` — the host boundary's third no-silent-coercion rule alongside
+/// exact arity and integer marshaling (`SPEC.md` §7.1).
+fn encode_args(ctx: &mut RtCtx, params: &[Repr], args: Vec<Value>) -> Result<ArgBuf, RunError> {
     let mut args = args.into_iter();
     if params.len() <= INLINE_ARGS {
         let mut buf = [0u64; INLINE_ARGS];
         for (slot, &r) in buf.iter_mut().zip(params) {
-            *slot = ctx.encode_arg(args.next().unwrap_or(Value::Nil), r);
+            *slot = ctx.encode_arg(args.next().unwrap_or(Value::Nil), r)?;
         }
-        ArgBuf::Inline(buf, params.len())
+        Ok(ArgBuf::Inline(buf, params.len()))
     } else {
-        ArgBuf::Heap(
+        Ok(ArgBuf::Heap(
             params
                 .iter()
                 .map(|&r| ctx.encode_arg(args.next().unwrap_or(Value::Nil), r))
-                .collect(),
-        )
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
     }
 }
 

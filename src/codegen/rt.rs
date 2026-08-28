@@ -183,6 +183,19 @@ pub struct ClosureOrigin {
 pub const FOREIGN_CLOSURE: &str =
     "closure belongs to a different compiled module and cannot be invoked here";
 
+/// A host-supplied argument whose runtime shape contradicts the declared parameter type.
+fn arg_type_error(want: &str, got: &Value) -> RunError {
+    RunError::Runtime(format!(
+        "expected a {want} argument, found {}",
+        got.type_name()
+    ))
+}
+
+/// A value flowing into a scalar slot whose runtime shape contradicts its static type.
+fn unbox_type_error(want: &str, got: &Value) -> RunError {
+    RunError::Runtime(format!("expected a {want}, found {}", got.type_name()))
+}
+
 /// The id of the module that built `c`, or `None` if it carries no JIT origin stamp (an IR VM
 /// closure, which the JIT can't run either).
 pub fn closure_module_id(c: &ClosureObj) -> Option<u64> {
@@ -239,12 +252,24 @@ impl RtCtx {
     /// Encode a call argument into a raw ABI word per its declared [`Repr`] (the **bits ABI**
     /// the trampolines decode). Scalars become raw bits with no value-table entry; only
     /// reference values are interned to a handle. Mirrors the trampoline's `decode_param`.
-    pub fn encode_arg(&mut self, v: Value, repr: Repr) -> u64 {
+    ///
+    /// A value that doesn't fit the declared scalar repr is **rejected**, not coerced. This is
+    /// the one place the host boundary has to check: a scalar becomes raw `f64`/`i8` bits here,
+    /// so by the time compiled code sees it there is nothing left to tell a string from the
+    /// `0.0` it would have been silently turned into. Reference params keep their value and are
+    /// checked at the point of use instead ([`rt_unbox_number`]).
+    pub fn encode_arg(&mut self, v: Value, repr: Repr) -> Result<u64, RunError> {
         match repr {
-            Repr::Number => Slot::from_number(v.as_f64().unwrap_or(0.0)).bits(),
-            Repr::Bool => Slot::from_bool(v.as_bool().unwrap_or(false)).bits(),
-            Repr::Ptr => self.intern(v),
-            Repr::Unit => 0,
+            Repr::Number => {
+                let n = v.as_f64().ok_or_else(|| arg_type_error("number", &v))?;
+                Ok(Slot::from_number(n).bits())
+            }
+            Repr::Bool => {
+                let b = v.as_bool().ok_or_else(|| arg_type_error("bool", &v))?;
+                Ok(Slot::from_bool(b).bits())
+            }
+            Repr::Ptr => Ok(self.intern(v)),
+            Repr::Unit => Ok(0),
         }
     }
 
@@ -325,12 +350,37 @@ pub unsafe extern "C" fn rt_box_bool(ctx: *mut RtCtx, b: i8) -> Handle {
     ctx!(ctx).intern(Value::Bool(b != 0))
 }
 
+/// Unbox a handle into a native `f64`. A value whose runtime shape contradicts its static type
+/// is an error, not a silent `0.0` — matching `interp`'s `eval_number` and `ir::Vm`'s `num`,
+/// which both fail rather than default. This is where an ill-typed *host-supplied* value gets
+/// caught: a memory bound off-schema, or a host function returning the wrong shape, reaches
+/// compiled code as a handle and is only forced into a scalar here.
+///
+/// The generated code guards on the errored flag after this call, so the `0.0` returned on the
+/// failing path is never observed.
 pub unsafe extern "C" fn rt_unbox_number(ctx: *mut RtCtx, h: Handle) -> f64 {
-    ctx!(ctx).get(h).as_f64().unwrap_or(0.0)
+    let ctx = ctx!(ctx);
+    match ctx.get(h).as_f64() {
+        Some(n) => n,
+        None => {
+            let e = unbox_type_error("number", ctx.get(h));
+            ctx.fail(e);
+            0.0
+        }
+    }
 }
 
+/// The `bool` counterpart of [`rt_unbox_number`]; same contract.
 pub unsafe extern "C" fn rt_unbox_bool(ctx: *mut RtCtx, h: Handle) -> i8 {
-    ctx!(ctx).get(h).as_bool().unwrap_or(false) as i8
+    let ctx = ctx!(ctx);
+    match ctx.get(h).as_bool() {
+        Some(b) => b as i8,
+        None => {
+            let e = unbox_type_error("bool", ctx.get(h));
+            ctx.fail(e);
+            0
+        }
+    }
 }
 
 // ---- constants / refs -------------------------------------------------------

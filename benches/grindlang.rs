@@ -43,6 +43,22 @@ function mitigated(attack, defense)
   return math.floor(dmg)
 end";
 
+/// Reference-heavy counterpart to the scalar workloads above: every `t.field` read crosses the
+/// handle boundary and is unboxed back to a native `f64`. The other three call benchmarks are
+/// pure scalar code and never touch the heap path at all, so without this one a change to
+/// boxing, field access, or unboxing is invisible to the suite.
+const FIELDSUM: &str = "\
+function fieldsum(n)
+  local t = {a = 1, b = 2, c = 3}
+  local s = 0
+  local i = 1
+  while i <= n do
+    s = s + t.a + t.b + t.c
+    i = i + 1
+  end
+  return s
+end";
+
 // ---- workloads (Luau twins) -------------------------------------------------
 
 const FIB_LUAU: &str = "\
@@ -70,6 +86,18 @@ function mitigated(attack, defense)
   return math.floor(dmg)
 end";
 
+const FIELDSUM_LUAU: &str = "\
+function fieldsum(n)
+  local t = {a = 1, b = 2, c = 3}
+  local s = 0
+  local i = 1
+  while i <= n do
+    s = s + t.a + t.b + t.c
+    i = i + 1
+  end
+  return s
+end";
+
 /// The three workloads as `(label, grindlang src, luau src, export name, args)`.
 fn workloads() -> Vec<(
     &'static str,
@@ -87,6 +115,13 @@ fn workloads() -> Vec<(
             MITIGATED_LUAU,
             "mitigated",
             vec![120.0, 80.0],
+        ),
+        (
+            "fieldsum",
+            FIELDSUM,
+            FIELDSUM_LUAU,
+            "fieldsum",
+            vec![1000.0],
         ),
     ]
 }

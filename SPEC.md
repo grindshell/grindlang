@@ -463,12 +463,19 @@ registered, and to a declared memory method (§7.2).
 ### 7.1 Calling exports from the host (arity & marshaling)
 
 The host invokes a compiled module's exports with Rust values and marshals the result back to
-a requested Rust type (`Module::call` / `call_typed`). Two boundary rules mirror the language's
-in-script discipline rather than silently coercing:
+a requested Rust type (`Module::call` / `call_typed`). Three boundary rules mirror the
+language's in-script discipline rather than silently coercing:
 
 - **Exact arity.** A call must supply exactly as many arguments as the export declares — the
   same rule §5.5 enforces in-script, now enforced at the host boundary too. A mismatch is a
   call error, not a silent pad-with-`nil` / drop-surplus.
+- **Argument types.** An argument's runtime shape must match the parameter's declared type. A
+  string passed where `number` is declared is a call error, not a silent `0`. The check happens
+  at the boundary because a scalar argument is converted to raw bits on the way in, leaving
+  nothing downstream to distinguish a wrong value from a plausible one. Values the host
+  supplies *elsewhere* — a memory binding, a registered function's result — keep their identity
+  further in and are instead rejected at the point where a script forces them into a scalar
+  (§7.3), which is where the interpreters check too.
 - **Integer marshaling.** Numbers are `f64`; marshaling a result into an integer Rust type
   (`i32`/`i64`/`u32`/`usize`) **truncates a finite non-integral value toward zero** — scripts
   are trusted dev code, so a fractional formula is treated as intentional — but **rejects a

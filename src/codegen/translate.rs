@@ -401,14 +401,27 @@ impl<'a, 'b> Translator<'a, 'b> {
     }
 
     /// Unbox a handle into the requested representation.
+    ///
+    /// Forcing a reference value into a scalar slot is fallible: its static type says `number`
+    /// or `bool`, but a host-supplied value (an off-schema memory binding, a host function
+    /// returning the wrong shape) can contradict that at runtime. The shim latches the error
+    /// and returns a default, so guard before the default can be used.
     fn unbox_handle(&mut self, handle: ClifValue, repr: Repr) -> ClifValue {
         match repr {
-            Repr::Number => self
-                .call_shim("rt_unbox_number", &[self.ctx_val, handle])
-                .unwrap(),
-            Repr::Bool => self
-                .call_shim("rt_unbox_bool", &[self.ctx_val, handle])
-                .unwrap(),
+            Repr::Number => {
+                let v = self
+                    .call_shim("rt_unbox_number", &[self.ctx_val, handle])
+                    .unwrap();
+                self.guard_errored();
+                v
+            }
+            Repr::Bool => {
+                let v = self
+                    .call_shim("rt_unbox_bool", &[self.ctx_val, handle])
+                    .unwrap();
+                self.guard_errored();
+                v
+            }
             Repr::Ptr => handle,
             Repr::Unit => self.builder.ins().iconst(types::I64, 0),
         }

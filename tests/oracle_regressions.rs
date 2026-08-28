@@ -538,20 +538,22 @@ fn exported_constant_reads_back_consistently() {
 
 // ---- Finding 5: the host boundary must not coerce ill-typed values ---------
 //
-// The JIT trusts the declared types and unboxes without a runtime shape check, while both
-// interpreters check dynamically. That shows up wherever the host supplies a value the
-// signature or schema didn't promise — call arguments *and* memory bindings.
+// The JIT trusted the declared types and unboxed without a runtime shape check, turning any
+// host-supplied value that contradicted its declared type into `0` / `false`. It bites wherever
+// the host hands over a value the signature or schema didn't promise, and the fix has two
+// halves because the value survives to different points:
+//
+//   * a scalar *argument* is converted to raw bits at the boundary, so it must be checked
+//     there (`encode_arg`) — nothing downstream can still tell a string from `0.0`;
+//   * everything else (a memory binding, a host function's result) reaches compiled code as a
+//     handle and is only forced into a scalar at the point of use (`rt_unbox_number`), which
+//     is exactly where both interpreters check.
 
-/// A memory bound with the wrong shape (the schema declares a record, the host supplies `nil`)
-/// reads as a silent `0` in the JIT but errors in both interpreters. Found while fixing
-/// finding 3; the same root cause as the argument case below, but a different entry point, so
-/// checking `encode_arg` alone would not fix it.
-///
-/// Accepts either resolution: `set_memory` rejecting the ill-typed binding up front, or all
-/// three backends agreeing at runtime.
+/// A memory bound off-schema (the schema declares a record of numbers, the host supplies `nil`)
+/// used to read as a silent `0`. Found while fixing finding 3 — a different entry point from
+/// the argument case, so checking `encode_arg` alone would not have covered it.
 #[test]
-#[ignore = "finding 5: set_memory accepts a binding that violates the declared schema"]
-fn ill_typed_memory_binding_is_rejected_or_consistent() {
+fn ill_typed_memory_binding_is_an_error() {
     let src = "function f() return mem.x + 1 end";
     let cfg = mem_config("x");
     let (mut interp, mut vm, mut jit) = triple(src, &cfg);
@@ -562,12 +564,35 @@ fn ill_typed_memory_binding_is_rejected_or_consistent() {
     let b = vm.call("f", vec![]);
     let c = jit.call("f", vec![]);
     assert_agree("memory bound to nil", &a, &b, &c);
+    assert!(c.is_err(), "an off-schema memory binding must fail");
 }
 
-/// The raw `call` path checks arity but not runtime shapes, so a string passed to a
-/// `number` parameter is silently encoded as `0.0` instead of failing.
+/// A host function that returns the wrong shape is caught at the same use site — its result
+/// crosses as a handle and only becomes a scalar when the script does arithmetic on it.
 #[test]
-#[ignore = "finding 5: encode_arg coerces a non-number to 0.0 instead of erroring"]
+fn ill_typed_host_function_result_is_an_error() {
+    let src = "function f() return tick() + 1 end";
+    let cfg = tick_config();
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    // Declared `tick() -> number`, but hands back a string.
+    interp.set_host_function("tick", |_: &[Value]| Ok(Value::string("nope")));
+    vm.set_host_function("tick", |_: &[Value]| Ok(Value::string("nope")));
+    jit.set_host_function("tick", |_: &[Value]| Ok(Value::string("nope")));
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("host function returning a string", &a, &b, &c);
+    assert!(c.is_err(), "an off-signature host result must fail");
+}
+
+/// The raw `call` path checked arity but not runtime shapes, so a string passed to a `number`
+/// parameter was silently encoded as `0.0`. This signature is all-`number`, so it also covers
+/// the direct-call fast path, which encodes arguments separately from the trampoline.
+///
+/// The interpreters happen to reach the same verdict here — they fail at the `n + 1` use site —
+/// so this one can be compared across all three. That agreement is incidental, not the rule;
+/// see `trampoline_call_rejects_mistyped_arguments`.
+#[test]
 fn raw_call_rejects_mistyped_arguments() {
     let src = "function f(n) return n + 1 end";
     let cfg = TypeConfig::default();
@@ -578,4 +603,44 @@ fn raw_call_rejects_mistyped_arguments() {
     let c = jit.call("f", vec![arg]);
     assert_agree("string passed to a number parameter", &a, &b, &c);
     assert!(c.is_err(), "a mistyped argument must be rejected");
+}
+
+/// The trampoline path (a signature that isn't all-`number`, so the direct fast path is not
+/// taken) must reject the same way, and `bool` parameters are checked too, not just `number`.
+///
+/// Deliberately **not** an `assert_agree` comparison. Argument checking is a host-boundary rule
+/// (`SPEC.md` §7.1), which the embedding API enforces and the interpreter oracles do not —
+/// exactly as they already skip §7.1's exact-arity rule, padding missing arguments with `nil`
+/// instead. Here the interpreters accept the number as a *truthy* value and return "yes", which
+/// is Lua behavior for a value the type system says cannot occur. Comparing the two would be
+/// comparing a boundary against something that isn't one.
+#[test]
+fn trampoline_call_rejects_mistyped_arguments() {
+    let src = "function f(flag, s) if flag then return s end return \"no\" end";
+    let cfg = TypeConfig::default();
+    let jit = &mut triple(src, &cfg).2;
+
+    // Sanity: the well-typed call works, so the rejection below is about the argument's shape.
+    let ok = jit
+        .call("f", vec![Value::Bool(true), Value::string("yes")])
+        .expect("well-typed call");
+    assert_eq!(ok.to_string(), "yes");
+
+    let r = jit.call("f", vec![Value::Number(1.0), Value::string("yes")]);
+    let e = r.expect_err("a number passed to a bool parameter must be rejected");
+    assert!(
+        format!("{e}").contains("expected a bool argument"),
+        "got {e:?}"
+    );
+}
+
+/// A parameter can only carry a scalar type because the body *uses* it as one — the checker
+/// rejects a parameter whose type nothing determines (`E0410`). So "the host passed the wrong
+/// type but the body never touches it" is not a reachable state, which is what keeps the
+/// boundary check above from diverging from the interpreters in the common case.
+#[test]
+fn a_parameter_type_is_always_justified_by_use() {
+    let err = grindlang::analyze("function f(n) return 7 end", &TypeConfig::default())
+        .expect_err("an undetermined parameter type must be rejected");
+    assert!(format!("{err:?}").contains("E0410"), "got {err:?}");
 }
