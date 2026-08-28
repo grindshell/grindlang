@@ -211,13 +211,22 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Call an exported function by name with `args`.
+    ///
+    /// A module exports constants as well as functions (`SPEC.md` §4), so a name that resolves
+    /// to a plain value is *read* rather than called — mirroring the IR VM's
+    /// `ExportTarget::Const` arm and the JIT's constant trampoline. Without this, reading an
+    /// exported constant through this entry point failed with "attempted to call a table
+    /// value" while the other two backends returned it.
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RunError> {
-        let func = self
+        let export = self
             .exports
             .get(name)
             .cloned()
             .ok_or_else(|| RunError::UnknownExport(name.to_string()))?;
-        self.call_value(&func, args)
+        if !matches!(export, Value::Function(_) | Value::Native(_)) {
+            return Ok(export);
+        }
+        self.call_value(&export, args)
     }
 
     /// Host-invoke a function value previously returned by [`call`](Self::call) (e.g. a

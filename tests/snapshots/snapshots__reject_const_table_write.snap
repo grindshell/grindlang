@@ -1,0 +1,9 @@
+---
+source: tests/snapshots.rs
+expression: "analyze_diag(\"C = {x = 1}\\nfunction f()\\n  C.x = 2\\n  return C.x\\nend\")"
+---
+error[E0307]: cannot assign through `C`: it is a top-level constant, and constants are immutable all the way down. Use host memory (`SPEC.md` §7) for state that changes between calls.
+  --> 3:3
+   |
+  3|   C.x = 2
+   |   ^^^

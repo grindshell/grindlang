@@ -76,6 +76,12 @@ fn snapshot_type_errors() {
         "type_error_nil_arithmetic",
         analyze_diag("function f()\n  local x = nil\n  return x + 1\nend")
     );
+    // A constant is immutable all the way down (SPEC §3): writing through one names the
+    // constant, not the field, and points at host memory as the place state belongs.
+    insta::assert_snapshot!(
+        "reject_const_table_write",
+        analyze_diag("C = {x = 1}\nfunction f()\n  C.x = 2\n  return C.x\nend")
+    );
 }
 
 // ---- inferred export signatures ---------------------------------------------

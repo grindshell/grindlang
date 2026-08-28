@@ -122,6 +122,17 @@ exportstat ::= 'return' tablecons [';']
   names (not even other top-level constants), call functions, or index/field-access —
   only literal values and operators over them. (This avoids const-ordering and cycle
   analysis; revisit if a consumer needs constant folding across declarations.)
+- A constant is **immutable all the way down**, not just as a binding. Writing *through* one —
+  `C.x = …`, `C.a.b = …`, `C.arr[1] = …` — is an `E0307` error, alongside the `E0302` that
+  rejects rebinding `C` itself. A constant is a compile-time value, so a mutable one would be
+  module-level state surviving between calls, which §1 reserves for host memory. Reading
+  through a constant is of course fine, and writing through **memory** stays fine (§7) — the
+  rule keys on what the assignment target is rooted in, not on its shape.
+
+  _(v1 limitation: the check is syntactic. Binding a composite constant to a local first
+  (`local t = C; t.x = …`) is not currently caught, and the backends disagree on what it does.
+  Closing that needs either runtime immutability for composite constants or a restriction on
+  how one may escape — see `PLAN.md` Phase 3.)_
 - If present, the trailing `exportstat` **curates the public surface**: only the names it
   lists are exported, under the keys given. Without it, *all* top-level declarations are
   exported under their own names. (There is no `local M = {}` / `return M` idiom — the

@@ -491,41 +491,87 @@ fn memory_binding_is_observed_after_being_set() {
 }
 
 // ---- Finding 4: constants must have consistent identity across oracles -----
+//
+// A write through a constant-bound table meant three different things: the AST and VM cache the
+// constant (so the write persisted across calls, which SPEC §1 forbids — the only cross-call
+// state is host memory), while the JIT rebuilt it per read (so the write was lost).
+//
+// Resolved by closing the SPEC gap rather than standardizing on a SPEC violation: a `constdecl`
+// is immutable all the way down, and writing through one is `E0307` at check time. See
+// `const_identity_is_consistent` below for what that does *not* cover.
 
-/// A write through a constant-bound table currently means three different things: the AST and
-/// VM cache the constant (so the write persists across calls, which SPEC §1 forbids — the only
-/// cross-call state is host memory), while the JIT rebuilds it per read (so the write is lost).
-///
-/// The test accepts either resolution: rejecting the write at check time (the preferred fix,
-/// since it closes the SPEC gap rather than standardizing on a SPEC violation), or all three
-/// backends agreeing at runtime.
+/// Writing through a constant is rejected — directly, nested, and through an index.
 #[test]
-#[ignore = "finding 4: SPEC is silent on composite-constant mutability; oracles disagree"]
-fn const_table_mutation_is_rejected_or_consistent() {
+fn const_table_write_is_rejected() {
+    let cases = [
+        "C = {x = 1}\nfunction f() C.x = 2 return C.x end\n",
+        "C = {a = {b = 1}}\nfunction f() C.a.b = 2 return C.a.b end\n",
+        "C = {arr = {1, 2}}\nfunction f() C.arr[1] = 9 return C.arr[1] end\n",
+    ];
+    for src in cases {
+        let err = grindlang::analyze(src, &TypeConfig::default())
+            .expect_err(&format!("must be rejected:\n{src}"));
+        assert!(format!("{err:?}").contains("E0307"), "got {err:?}");
+    }
+}
+
+/// Reading a constant stays legal — the rule is about writes, not about touching constants.
+#[test]
+fn const_table_read_is_allowed() {
+    let src = "C = {x = 1}\nfunction f() return C.x + 1 end\n";
+    let cfg = TypeConfig::default();
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("read through a constant", &a, &b, &c);
+    assert_eq!(c.expect("read").to_string(), "2");
+}
+
+/// A *local* that shadows a constant is an ordinary mutable table. The rejection resolves the
+/// root through normal scoping, so it must not fire on the shadowing local — a false positive
+/// here would reject correct code.
+#[test]
+fn a_local_shadowing_a_constant_is_still_writable() {
     let src = "\
 C = {x = 1}
 function f()
+  local C = {x = 10}
   C.x = C.x + 1
   return C.x
 end
 ";
     let cfg = TypeConfig::default();
-    if grindlang::analyze(src, &cfg).is_err() {
-        return; // rejected at check time — the SPEC gap is closed
-    }
     let (mut interp, mut vm, mut jit) = triple(src, &cfg);
-    for i in 0..3 {
-        let a = interp.call("f", vec![]);
-        let b = vm.call("f", vec![]);
-        let c = jit.call("f", vec![]);
-        assert_agree(&format!("const mutation, call {i}"), &a, &b, &c);
-    }
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("write through a shadowing local", &a, &b, &c);
+    assert_eq!(c.expect("shadowed write").to_string(), "11");
 }
 
-/// Reading an exported constant back is a three-way disagreement of its own: the AST
-/// interpreter cannot dispatch a non-function export at all.
+/// Writes through *host memory* must stay legal — that is what memory is for (SPEC §7), and the
+/// rejection above keys on the root binding precisely so it doesn't catch this.
 #[test]
-#[ignore = "finding 4: Interpreter::call rejects a non-function export"]
+fn memory_field_write_is_still_allowed() {
+    let src = "function f() mem.x = mem.x + 1 return mem.x end";
+    let cfg = mem_config("x");
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let bind = || Value::table([("x".to_string(), Value::Number(1.0))].into());
+    interp.set_memory("mem", bind());
+    vm.set_memory("mem", bind());
+    jit.set_memory("mem", bind());
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("memory field write", &a, &b, &c);
+    assert_eq!(c.expect("memory write").to_string(), "2");
+}
+
+/// Reading an exported constant back was a three-way disagreement of its own: the AST
+/// interpreter treated every export as callable and failed with "attempted to call a table
+/// value", while the VM and JIT returned the value.
+#[test]
 fn exported_constant_reads_back_consistently() {
     let src = "C = {x = 1}\nfunction f() return C.x end\n";
     let cfg = TypeConfig::default();
@@ -534,6 +580,57 @@ fn exported_constant_reads_back_consistently() {
     let b = vm.call("C", vec![]);
     let c = jit.call("C", vec![]);
     assert_agree("read exported constant", &a, &b, &c);
+    assert_eq!(c.expect("read export").to_string(), "{x = 1}");
+}
+
+/// **Residual of finding 4.** Rejecting writes is syntactic: it keys on the root of the
+/// assignment target, so aliasing the constant into a local escapes it, and the oracles still
+/// disagree there (AST/VM mutate the cached constant, the JIT mutates a fresh copy).
+///
+/// Closing this needs a second language decision — make composite constants immutable at
+/// runtime, or restrict how a composite constant may escape — so it is recorded rather than
+/// guessed at. See `PLAN.md` Phase 3.
+#[test]
+#[ignore = "finding 4 residual: a constant aliased into a local can still be written through"]
+fn const_aliased_into_a_local_is_not_writable() {
+    let src = "\
+C = {x = 1}
+function f()
+  local t = C
+  t.x = t.x + 1
+  return C.x
+end
+";
+    let cfg = TypeConfig::default();
+    if grindlang::analyze(src, &cfg).is_err() {
+        return; // closed by rejecting the alias
+    }
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("write through an aliased constant", &a, &b, &c);
+}
+
+/// **Residual of finding 4.** Reference values compare by identity, and the backends disagree
+/// on whether a constant is even equal to itself: the AST evaluates constants once (`true`),
+/// while the VM and JIT each produce a fresh value per read (`false`). Rejecting writes does
+/// not touch this — it is about identity, not mutability.
+///
+/// The fix is a decision about constant *lifetime*: memoized per module instance (matching the
+/// AST, but then a constant outlives a call) or per call (satisfying SPEC §1, but then the AST
+/// must change too). Recorded for the same reason as above.
+#[test]
+#[ignore = "finding 4 residual: constants have no consistent identity across backends"]
+fn a_constant_is_equal_to_itself() {
+    let src = "C = {x = 1}\nfunction f()\n  local a = C\n  local b = C\n  return a == b\nend\n";
+    let cfg = TypeConfig::default();
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("a constant compared with itself", &a, &b, &c);
+    assert_eq!(c.expect("identity").to_string(), "true");
 }
 
 // ---- Finding 5: the host boundary must not coerce ill-typed values ---------

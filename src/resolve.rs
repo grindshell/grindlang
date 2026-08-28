@@ -518,6 +518,16 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// The bare name a field/index chain is rooted in (`a.b[c].d` → `a`), or `None` if the
+    /// chain bottoms out in something else (a call result, a table literal).
+    fn root_name(expr: &Expr) -> Option<&str> {
+        match &expr.kind {
+            ExprKind::Name(n) => Some(n),
+            ExprKind::Field { base, .. } | ExprKind::Index { base, .. } => Self::root_name(base),
+            _ => None,
+        }
+    }
+
     fn resolve_assign_target(&mut self, expr: &Expr) {
         match &expr.kind {
             ExprKind::Name(n) => match self.lookup(n) {
@@ -546,13 +556,43 @@ impl<'a> Resolver<'a> {
                     expr.span,
                 ),
             },
-            ExprKind::Field { base, .. } => self.resolve_expr(base),
+            ExprKind::Field { base, .. } => {
+                self.reject_const_write(expr);
+                self.resolve_expr(base)
+            }
             ExprKind::Index { base, index } => {
+                self.reject_const_write(expr);
                 self.resolve_expr(base);
                 self.resolve_expr(index);
             }
             // The parser guarantees targets are name/field/index; anything else is a bug.
             _ => self.resolve_expr(expr),
+        }
+    }
+
+    /// Reject a write *through* a top-level constant (`C.x = …`, `C.a[1] = …`).
+    ///
+    /// A `constdecl` is an immutable binding (`SPEC.md` §3), which the `Name` arm above already
+    /// enforces against rebinding. Writing through one is the same promise one level down: a
+    /// constant is a compile-time value, so mutating it would be module-level state surviving
+    /// between calls, which §1 reserves for host memory alone.
+    ///
+    /// Field writes through **memory** stay legal — that is the whole point of memory (§7) —
+    /// so this checks the root binding rather than blanket-rejecting field targets.
+    fn reject_const_write(&mut self, target: &Expr) {
+        let Some(root) = Self::root_name(target) else {
+            return;
+        };
+        if matches!(self.lookup(root), Some(Binding::TopConst(_))) {
+            self.error(
+                "E0307",
+                format!(
+                    "cannot assign through `{root}`: it is a top-level constant, and constants \
+                     are immutable all the way down. Use host memory (`SPEC.md` §7) for state \
+                     that changes between calls."
+                ),
+                target.span,
+            );
         }
     }
 

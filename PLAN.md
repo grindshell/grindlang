@@ -163,6 +163,32 @@ Each phase is independently testable and leaves the crate green
 - **Exit:** well-typed programs check; ill-typed programs produce precise errors;
   export signature is queryable.
 
+#### Deferred: composite-constant immutability and identity
+
+A `constdecl` is immutable all the way down (`SPEC.md` §3): writing through one is `E0307`,
+resolved in `resolve.rs` by checking what the assignment target is *rooted* in, so that
+`mem.x = …` stays legal while `C.x = …` does not. That closed the common case, but two related
+gaps remain, both needing a language decision rather than an implementation:
+
+1. **The check is syntactic.** `local t = C; t.x = …` escapes it, and the backends disagree on
+   the result (the AST and IR VM mutate their cached constant; the JIT mutates a fresh copy).
+   Closing it means either making composite constants immutable at *runtime* — which needs a
+   frozen marker on `Value::Table`/`Value::Array`, touching every construction site — or
+   restricting how a composite constant may escape, which costs read-only aliasing and does not
+   generalize to passing one to a function or returning it.
+2. **Constants have no consistent identity.** Reference values compare by `Rc` identity, and
+   `local a = C; local b = C; return a == b` is `true` on the AST (constants evaluated once at
+   construction) but `false` on the IR VM and the JIT (a fresh value per read). This is
+   independent of mutability — rejecting writes does not touch it. The fix is a decision about
+   constant *lifetime*: memoized per module instance, matching the AST but letting a constant
+   outlive a call; or memoized per call, satisfying §1's "only host memory survives between
+   calls" but requiring the AST oracle to change too.
+
+Both are pinned by `#[ignore]`d tests in `tests/oracle_regressions.rs`
+(`const_aliased_into_a_local_is_not_writable`, `a_constant_is_equal_to_itself`). Note that (2)
+is the more clearly wrong of the two — a value not equal to itself is hard to defend under any
+reading — but it is also the one whose fix collides with §1, which is why it is not just a bug.
+
 ### Phase 4 — Reference interpreter (semantics oracle)
 - Tree-walking interpreter over the typed AST/IR implementing the canonical semantics,
   including arena-style value lifetimes, host-fn calls, and memory access.
