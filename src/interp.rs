@@ -85,32 +85,36 @@ enum Flow {
 }
 
 /// Structural-by-value for scalars, identity-by-`Rc` for reference types (Lua semantics).
+/// Shared with the IR VM and the JIT via [`Value::ref_eq`] so the three cannot drift.
 fn values_equal(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Nil, Value::Nil) => true,
-        (Value::Bool(x), Value::Bool(y)) => x == y,
-        (Value::Number(x), Value::Number(y)) => x == y,
-        (Value::Str(x), Value::Str(y)) => x == y,
-        (Value::Array(x), Value::Array(y)) => Rc::ptr_eq(x, y),
-        (Value::Table(x), Value::Table(y)) => Rc::ptr_eq(x, y),
-        (Value::Function(x), Value::Function(y)) => Rc::ptr_eq(x, y),
-        (Value::Native(x), Value::Native(y)) => Rc::ptr_eq(x, y),
-        (Value::Cell(x), Value::Cell(y)) => Rc::ptr_eq(x, y),
-        (Value::Closure(x), Value::Closure(y)) => Rc::ptr_eq(x, y),
-        _ => false,
-    }
+    a.ref_eq(b)
 }
 
 /// The reference interpreter for one resolved module.
+/// What an exported name refers to.
+#[derive(Clone)]
+enum Export {
+    /// A fixed value: a top-level function, or an export-table entry evaluated at construction.
+    Value(Value),
+    /// A top-level constant, held by *name* rather than pre-evaluated so that reading it goes
+    /// through the per-call cache and sees the same value an in-script reference does.
+    Const(String),
+}
+
 pub struct Interpreter<'a> {
     res: &'a Resolution,
     /// Top-level function declarations, by declared name.
     funcs: HashMap<String, Value>,
-    /// Top-level constants, by declared name.
+    /// Top-level constant declarations, evaluated on demand into [`consts`](Self::consts).
+    const_exprs: HashMap<String, Expr>,
+    /// Constants evaluated during the current call, cleared when a new top-level call starts.
+    /// Memoizing per call keeps a constant equal to itself within one invocation (reference
+    /// values compare by identity) without letting it survive between calls, which `SPEC.md`
+    /// §1 reserves for host memory.
     consts: HashMap<String, Value>,
     /// The public surface callable via [`Interpreter::call`] — the curated export table if
     /// present, otherwise every top-level declaration.
-    exports: HashMap<String, Value>,
+    exports: HashMap<String, Export>,
     /// Host-registered native functions, by name.
     host: HashMap<String, Value>,
     /// Host memory handles, by name.
@@ -129,6 +133,7 @@ impl<'a> Interpreter<'a> {
         let mut me = Interpreter {
             res,
             funcs: HashMap::new(),
+            const_exprs: HashMap::new(),
             consts: HashMap::new(),
             exports: HashMap::new(),
             host: HashMap::new(),
@@ -154,32 +159,62 @@ impl<'a> Interpreter<'a> {
             }
         }
 
-        // Top-level constants: evaluated in an empty environment (const RHS references no
-        // names, per the resolver's E0303 rule).
-        self.env = vec![new_frame()];
+        // Top-level constants are *not* evaluated here: they are memoized per call, so their
+        // bodies are kept and evaluated on first use within an invocation.
         for decl in &module.decls {
             if let TopDecl::Const(c) = decl {
-                let v = self.eval_expr(&c.value)?;
-                self.consts.insert(c.name.node.clone(), v);
+                self.const_exprs
+                    .insert(c.name.node.clone(), c.value.clone());
             }
         }
 
         // Exports.
+        self.env = vec![new_frame()];
         if let Some(export) = &module.export {
             for field in &export.node {
                 if let Field::Named { name, value } = field {
-                    let v = self.eval_expr(value)?;
-                    self.exports.insert(name.node.clone(), v);
+                    // A curated entry naming a constant stays a *reference* to it, so reading
+                    // the export goes through the per-call cache like any other read.
+                    let export = match self.res.binding(value.span) {
+                        Some(Binding::TopConst(n)) => Export::Const(n.clone()),
+                        _ => Export::Value(self.eval_expr(value)?),
+                    };
+                    self.exports.insert(name.node.clone(), export);
                 }
             }
         } else {
-            for (k, v) in self.funcs.iter().chain(self.consts.iter()) {
-                self.exports.insert(k.clone(), v.clone());
+            for k in self.funcs.keys() {
+                self.exports
+                    .insert(k.clone(), Export::Value(self.funcs[k].clone()));
+            }
+            for k in self.const_exprs.keys() {
+                self.exports.insert(k.clone(), Export::Const(k.clone()));
             }
         }
 
         self.env.clear();
         Ok(())
+    }
+
+    /// The value of top-level constant `name` for the current call, evaluating it on first use.
+    ///
+    /// A `constexpr` references no names (the resolver's `E0303` rule), so an empty environment
+    /// is enough — and evaluating in one keeps a constant independent of wherever it is read.
+    fn const_value(&mut self, name: &str) -> Result<Value, RunError> {
+        if let Some(v) = self.consts.get(name) {
+            return Ok(v.clone());
+        }
+        let expr = self
+            .const_exprs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| RunError::Internal(format!("missing const `{name}`")))?;
+        let saved = std::mem::replace(&mut self.env, vec![new_frame()]);
+        let evaluated = self.eval_expr(&expr);
+        self.env = saved;
+        let v = evaluated?;
+        self.consts.insert(name.to_string(), v.clone());
+        Ok(v)
     }
 
     /// Register a host function callable from scripts under `name`.
@@ -223,10 +258,20 @@ impl<'a> Interpreter<'a> {
             .get(name)
             .cloned()
             .ok_or_else(|| RunError::UnknownExport(name.to_string()))?;
-        if !matches!(export, Value::Function(_) | Value::Native(_)) {
-            return Ok(export);
+        self.begin_call();
+        match export {
+            Export::Const(n) => self.const_value(&n),
+            Export::Value(v) if matches!(v, Value::Function(_) | Value::Native(_)) => {
+                self.call_value(&v, args)
+            }
+            Export::Value(v) => Ok(v),
         }
-        self.call_value(&export, args)
+    }
+
+    /// Start a top-level invocation: drop the previous call's memoized constants so this one
+    /// re-evaluates what it reads (`SPEC.md` §1 — only host memory survives between calls).
+    fn begin_call(&mut self) {
+        self.consts.clear();
     }
 
     /// Host-invoke a function value previously returned by [`call`](Self::call) (e.g. a
@@ -237,6 +282,7 @@ impl<'a> Interpreter<'a> {
         callee: Value,
         args: Vec<Value>,
     ) -> Result<Value, RunError> {
+        self.begin_call();
         self.call_value(&callee, args)
     }
 
@@ -718,11 +764,10 @@ impl<'a> Interpreter<'a> {
                 .get(n)
                 .cloned()
                 .ok_or_else(|| RunError::Internal(format!("missing function `{n}`"))),
-            Binding::TopConst(n) => self
-                .consts
-                .get(n)
-                .cloned()
-                .ok_or_else(|| RunError::Internal(format!("missing const `{n}`"))),
+            Binding::TopConst(n) => {
+                let n = n.clone();
+                self.const_value(&n)
+            }
             Binding::HostFunction(n) => self.host.get(n).cloned().ok_or_else(|| {
                 RunError::Runtime(format!("host function `{n}` was not registered"))
             }),

@@ -583,16 +583,50 @@ fn exported_constant_reads_back_consistently() {
     assert_eq!(c.expect("read export").to_string(), "{x = 1}");
 }
 
-/// **Residual of finding 4.** Rejecting writes is syntactic: it keys on the root of the
-/// assignment target, so aliasing the constant into a local escapes it, and the oracles still
-/// disagree there (AST/VM mutate the cached constant, the JIT mutates a fresh copy).
+/// Reference values compare by identity, so a constant read twice in one call must *be* the
+/// same value. The AST evaluated constants once at construction (`true`) while the VM and JIT
+/// produced a fresh value per read (`false`) — a value not equal to itself.
 ///
-/// Closing this needs a second language decision — make composite constants immutable at
-/// runtime, or restrict how a composite constant may escape — so it is recorded rather than
-/// guessed at. See `PLAN.md` Phase 3.
+/// Fixed by memoizing constants **per call** in all three backends, which is the lifetime that
+/// satisfies both halves: stable identity within an invocation, nothing surviving between them.
 #[test]
-#[ignore = "finding 4 residual: a constant aliased into a local can still be written through"]
-fn const_aliased_into_a_local_is_not_writable() {
+fn a_constant_is_equal_to_itself() {
+    let src = "C = {x = 1}\nfunction f()\n  local a = C\n  local b = C\n  return a == b\nend\n";
+    let cfg = TypeConfig::default();
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("a constant compared with itself", &a, &b, &c);
+    assert_eq!(c.expect("identity").to_string(), "true");
+}
+
+/// The same identity, reached through the two ways a constant is read: in-script, and as an
+/// export. Both must observe the call's one memoized value.
+#[test]
+fn a_constant_read_as_an_export_matches_the_in_script_read() {
+    let src = "C = {x = 1}\nfunction f() return C end\n";
+    let cfg = TypeConfig::default();
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    for (label, from_fn, from_export) in [
+        ("AST", interp.call("f", vec![]), interp.call("C", vec![])),
+        ("VM", vm.call("f", vec![]), vm.call("C", vec![])),
+        ("JIT", jit.call("f", vec![]), jit.call("C", vec![])),
+    ] {
+        assert_eq!(
+            outcome(&from_fn),
+            outcome(&from_export),
+            "{label}: reading `C` in-script and as an export disagreed"
+        );
+    }
+}
+
+/// Aliasing a constant into a local escapes the syntactic `E0307` check, so this is the one
+/// path that can still write through a constant. Per-call memoization makes all three backends
+/// agree on what that does — and, because the cache dies with the call, the write does not
+/// leak into the next one, which is what `SPEC.md` §1 requires.
+#[test]
+fn a_write_through_an_aliased_constant_agrees_and_does_not_persist() {
     let src = "\
 C = {x = 1}
 function f()
@@ -603,34 +637,66 @@ end
 ";
     let cfg = TypeConfig::default();
     if grindlang::analyze(src, &cfg).is_err() {
-        return; // closed by rejecting the alias
+        return; // a later change may close the alias hole outright
     }
     let (mut interp, mut vm, mut jit) = triple(src, &cfg);
-    let a = interp.call("f", vec![]);
-    let b = vm.call("f", vec![]);
-    let c = jit.call("f", vec![]);
-    assert_agree("write through an aliased constant", &a, &b, &c);
+    // Repeat: each call must start from the constant's declared value, not the mutated one.
+    for i in 0..3 {
+        let a = interp.call("f", vec![]);
+        let b = vm.call("f", vec![]);
+        let c = jit.call("f", vec![]);
+        assert_agree(&format!("aliased write, call {i}"), &a, &b, &c);
+        assert_eq!(
+            c.expect("aliased write").to_string(),
+            "2",
+            "call {i}: a constant leaked across calls"
+        );
+    }
 }
 
-/// **Residual of finding 4.** Reference values compare by identity, and the backends disagree
-/// on whether a constant is even equal to itself: the AST evaluates constants once (`true`),
-/// while the VM and JIT each produce a fresh value per read (`false`). Rejecting writes does
-/// not touch this — it is about identity, not mutability.
-///
-/// The fix is a decision about constant *lifetime*: memoized per module instance (matching the
-/// AST, but then a constant outlives a call) or per call (satisfying SPEC §1, but then the AST
-/// must change too). Recorded for the same reason as above.
+/// Reference equality is by `Rc` identity in every backend. Found while fixing the constant
+/// identity above: the IR VM's copy of the rule answered `false` for *every* reference pair, so
+/// a table was not equal to itself. No constant is involved — the three backends each had their
+/// own copy of the rule and one had drifted, and the differential corpus never compared two
+/// reference values, so nothing caught it.
 #[test]
-#[ignore = "finding 4 residual: constants have no consistent identity across backends"]
-fn a_constant_is_equal_to_itself() {
-    let src = "C = {x = 1}\nfunction f()\n  local a = C\n  local b = C\n  return a == b\nend\n";
+fn a_table_is_equal_to_itself() {
+    let src = "function f()\n  local t = {x = 1}\n  local u = t\n  return t == u\nend\n";
     let cfg = TypeConfig::default();
     let (mut interp, mut vm, mut jit) = triple(src, &cfg);
     let a = interp.call("f", vec![]);
     let b = vm.call("f", vec![]);
     let c = jit.call("f", vec![]);
-    assert_agree("a constant compared with itself", &a, &b, &c);
+    assert_agree("a table compared with itself", &a, &b, &c);
     assert_eq!(c.expect("identity").to_string(), "true");
+}
+
+/// The other half of identity semantics: two structurally identical tables are still distinct
+/// values. Guards against "fixing" the above by switching to structural equality.
+#[test]
+fn structurally_identical_tables_are_not_equal() {
+    let src = "function f()\n  local a = {x = 1}\n  local b = {x = 1}\n  return a == b\nend\n";
+    let cfg = TypeConfig::default();
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("two equal-looking tables", &a, &b, &c);
+    assert_eq!(c.expect("identity").to_string(), "false");
+}
+
+/// A scalar constant skips the cache entirely (it has no identity to keep stable). It must
+/// still read correctly and identically everywhere.
+#[test]
+fn scalar_constants_still_read_correctly() {
+    let src = "MAX = 99\nSCALE = 1.5\nfunction f() return MAX * SCALE end\n";
+    let cfg = TypeConfig::default();
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("scalar constants", &a, &b, &c);
+    assert_eq!(c.expect("scalar const").to_string(), "148.5");
 }
 
 // ---- Finding 5: the host boundary must not coerce ill-typed values ---------

@@ -1531,6 +1531,10 @@ mod vm {
         /// called with the receiver prepended to the call arguments.
         methods: HashMap<String, Native>,
         memory: HashMap<String, Value>,
+        /// Constants evaluated during the current call, cleared when a new top-level call
+        /// starts. Memoizing per call keeps a constant equal to itself within one invocation
+        /// (reference values compare by identity) without letting it survive between calls,
+        /// which `SPEC.md` §1 reserves for host memory.
         const_cache: HashMap<String, Value>,
     }
 
@@ -1576,6 +1580,7 @@ mod vm {
 
         /// Call an exported function by name.
         pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RunError> {
+            self.const_cache.clear();
             let target = self
                 .program
                 .exports
@@ -1593,6 +1598,7 @@ mod vm {
         /// Host-invoke a closure value previously returned by a call. The closure's captured
         /// cells are shared (by `Rc`), so upvalue writes persist across host calls.
         pub fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RunError> {
+            self.const_cache.clear();
             let code = match &callee {
                 Value::Closure(c) => c.code.clone(),
                 other => {
@@ -1966,15 +1972,11 @@ mod vm {
         }
     }
 
+    /// Grindlang `==` — shared with the AST interpreter and the JIT via [`Value::ref_eq`] so
+    /// the three cannot drift. This copy used to answer `false` for *every* reference pair, so
+    /// a table was not equal to itself.
     fn scalar_eq(l: &Value, r: &Value) -> bool {
-        match (l, r) {
-            (Value::Nil, Value::Nil) => true,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Number(a), Value::Number(b)) => a == b,
-            (Value::Str(a), Value::Str(b)) => a == b,
-            (Value::Nil, _) | (_, Value::Nil) => false,
-            _ => false,
-        }
+        l.ref_eq(r)
     }
 
     fn array_get(base: &Value, idx: &Value) -> Result<Value, RunError> {

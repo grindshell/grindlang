@@ -129,10 +129,16 @@ exportstat ::= 'return' tablecons [';']
   through a constant is of course fine, and writing through **memory** stays fine (§7) — the
   rule keys on what the assignment target is rooted in, not on its shape.
 
-  _(v1 limitation: the check is syntactic. Binding a composite constant to a local first
-  (`local t = C; t.x = …`) is not currently caught, and the backends disagree on what it does.
-  Closing that needs either runtime immutability for composite constants or a restriction on
-  how one may escape — see `PLAN.md` Phase 3.)_
+  _(v1 limitation: the check is syntactic, so binding a composite constant to a local first
+  (`local t = C; t.x = …`) is not caught. It is well-defined — see the per-call rule below —
+  just not rejected. Closing it needs runtime immutability for composite constants or a
+  restriction on how one may escape; see `PLAN.md` Phase 3.)_
+- A constant is **memoized per call**. Within one invocation every read of `C` yields the same
+  value — so `C == C`, which matters because reference values compare by *identity* (§3.5), not
+  structurally — and the memo is discarded when the call ends, so no constant (nor anything
+  reachable from one) survives between calls, per §1. A composite constant is therefore rebuilt
+  by the first call that reads it and never by a call that doesn't. Scalar constants have no
+  identity to preserve and are simply re-evaluated.
 - If present, the trailing `exportstat` **curates the public surface**: only the names it
   lists are exported, under the keys given. Without it, *all* top-level declarations are
   exported under their own names. (There is no `local M = {}` / `return M` idiom — the
@@ -249,6 +255,12 @@ Operator typing _(v1)_:
 - `not` : `bool → bool`
 - `#` : `string → number` or `array<T> → number`
 - unary `-` : `number → number`
+
+**Equality compares scalars by value and reference types by identity** (Lua semantics).
+`nil`, `bool`, `number`, and `string` compare by their value; `array`, `map`/`record`, tuples,
+and function values compare by *which object they are*. So two separately built tables with the
+same contents are **not** equal, and a table is equal to itself however it was reached —
+including through a constant, which §3 memoizes per call precisely so that holds.
 
 **Conditions must be `bool`.** Unlike Lua, `if`, `while`, and the operands of `and`/`or`
 in condition position require a `bool`; there is no implicit "everything except

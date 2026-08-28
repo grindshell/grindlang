@@ -58,6 +58,12 @@ fn repr_of(ty: &Type) -> Repr {
     Repr::of(ty)
 }
 
+/// A constant's return repr. Unknown names fall back to `Ptr`, the conservative choice: it only
+/// costs a cache lookup, whereas guessing scalar would drop a reference constant's identity.
+fn repr_of_const(cx: &Context<'_>, name: &str) -> Repr {
+    cx.const_rets.get(name).copied().unwrap_or(Repr::Ptr)
+}
+
 /// Build the typed signature of a script function: `(ctx, params...) -> ret`.
 pub fn typed_signature(call_conv: CallConv, params: &[Repr], ret: Repr) -> Signature {
     let mut sig = Signature::new(call_conv);
@@ -119,6 +125,10 @@ pub struct Context<'a> {
     pub shims: &'a HashMap<&'static str, FuncId>,
     pub typed_ids: &'a HashMap<String, FuncId>,
     pub const_ids: &'a HashMap<String, FuncId>,
+    /// Each constant's return repr, so [`Translator::translate_const_ref`] can tell a
+    /// reference-valued constant (memoized per call, to keep its identity stable) from a scalar
+    /// one (re-evaluated, since a scalar has no identity to keep).
+    pub const_rets: &'a HashMap<String, Repr>,
 }
 
 /// Translates one IR [`Function`] into the builder's clif function.
@@ -814,7 +824,54 @@ impl<'a, 'b> Translator<'a, 'b> {
         result
     }
 
+    /// Read a top-level constant.
+    ///
+    /// A **reference-valued** constant is memoized for the duration of the call: every read in
+    /// one invocation yields the same value, so a constant is equal to itself (reference values
+    /// compare by identity), while the cache dies with the call so nothing survives between
+    /// them (`SPEC.md` §1, §3). A **scalar** constant skips all of this — it has no identity to
+    /// keep stable, and caching one would mean boxing it into the value table per call.
+    ///
+    /// The lookup is lazy: a constant this call never reads is never evaluated.
     fn translate_const_ref(&mut self, name: &str) -> Option<ClifValue> {
+        if repr_of_const(self.cx, name) != Repr::Ptr {
+            return self.call_const_body(name);
+        }
+
+        let idc = {
+            let id = self.pools.intern_const(name);
+            self.iconst32(id)
+        };
+        let cached = self
+            .call_shim("rt_const_cached", &[self.ctx_val, idc])
+            .unwrap();
+        // `ERR` marks a miss: `nil` is a legal constant value, so the null handle can't.
+        let miss = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, cached, ERR as i64);
+
+        let eval = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.append_block_param(done, types::I64);
+        self.builder
+            .ins()
+            .brif(miss, eval, &[], done, &[cached.into()]);
+
+        self.builder.switch_to_block(eval);
+        let fresh = self
+            .call_const_body(name)
+            .expect("a reference-valued constant returns a handle");
+        self.call_shim("rt_const_store", &[self.ctx_val, idc, fresh]);
+        self.builder.ins().jump(done, &[fresh.into()]);
+
+        self.builder.switch_to_block(done);
+        Some(self.builder.block_params(done)[0])
+    }
+
+    /// Invoke a constant's compiled body, propagating a failure the way any script call does —
+    /// a `constexpr` can contain a comparison, so its body is not unconditionally infallible.
+    fn call_const_body(&mut self, name: &str) -> Option<ClifValue> {
         let id = self.cx.const_ids[name];
         let fref = self.script_ref(id);
         let call = self.builder.ins().call(fref, &[self.ctx_val]);

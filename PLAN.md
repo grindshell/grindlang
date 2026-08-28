@@ -163,31 +163,35 @@ Each phase is independently testable and leaves the crate green
 - **Exit:** well-typed programs check; ill-typed programs produce precise errors;
   export signature is queryable.
 
-#### Deferred: composite-constant immutability and identity
+#### Constants: immutability and per-call identity  ✅ done
 
 A `constdecl` is immutable all the way down (`SPEC.md` §3): writing through one is `E0307`,
-resolved in `resolve.rs` by checking what the assignment target is *rooted* in, so that
-`mem.x = …` stays legal while `C.x = …` does not. That closed the common case, but two related
-gaps remain, both needing a language decision rather than an implementation:
+resolved in `resolve.rs` by checking what the assignment target is *rooted* in, so `mem.x = …`
+stays legal, a local shadowing a constant stays writable, and `C.x = …` does not.
 
-1. **The check is syntactic.** `local t = C; t.x = …` escapes it, and the backends disagree on
-   the result (the AST and IR VM mutate their cached constant; the JIT mutates a fresh copy).
-   Closing it means either making composite constants immutable at *runtime* — which needs a
-   frozen marker on `Value::Table`/`Value::Array`, touching every construction site — or
-   restricting how a composite constant may escape, which costs read-only aliasing and does not
-   generalize to passing one to a function or returning it.
-2. **Constants have no consistent identity.** Reference values compare by `Rc` identity, and
-   `local a = C; local b = C; return a == b` is `true` on the AST (constants evaluated once at
-   construction) but `false` on the IR VM and the JIT (a fresh value per read). This is
-   independent of mutability — rejecting writes does not touch it. The fix is a decision about
-   constant *lifetime*: memoized per module instance, matching the AST but letting a constant
-   outlive a call; or memoized per call, satisfying §1's "only host memory survives between
-   calls" but requiring the AST oracle to change too.
+Constants are **memoized per call** in all three backends — the lifetime that satisfies both
+halves of the problem at once. Within an invocation every read yields the same value, so a
+constant is equal to itself (reference values compare by identity, `SPEC.md` §3.5); the memo
+dies with the call, so nothing survives between calls (§1). The JIT caches lazily in `RtCtx`
+(`rt_const_cached`/`rt_const_store`, keyed by a constant pool id) so a constant a call never
+reads is never built; scalar constants skip the cache entirely, having no identity to keep.
 
-Both are pinned by `#[ignore]`d tests in `tests/oracle_regressions.rs`
-(`const_aliased_into_a_local_is_not_writable`, `a_constant_is_equal_to_itself`). Note that (2)
-is the more clearly wrong of the two — a value not equal to itself is hard to defend under any
-reading — but it is also the one whose fix collides with §1, which is why it is not just a bug.
+Two things surfaced while doing this, both fixed:
+
+- The IR VM's copy of `==` answered `false` for *every* reference pair, so a table was not equal
+  to itself — no constants involved. All three backends had their own copy of the rule and one
+  had drifted; the differential corpus never compared two reference values, so nothing caught
+  it. Equality now lives once, in `Value::ref_eq`.
+- `SPEC.md` documented the *typing* of `==` but never its *semantics*, which is what let that
+  drift go unnoticed. §3.5 now states value-vs-identity explicitly.
+
+**Still deferred:** the write rejection is syntactic, so `local t = C; t.x = …` escapes it. It
+is now well-defined and consistent across backends (all three mutate that call's memoized
+constant, and the next call starts fresh), just not rejected. Closing it means either making
+composite constants immutable at runtime — a frozen marker on `Value::Table`/`Value::Array`,
+touching every construction site — or restricting how a composite constant may escape, which
+costs read-only aliasing and does not generalize to passing one to a function or returning it.
+Pinned by `a_write_through_an_aliased_constant_agrees_and_does_not_persist`.
 
 ### Phase 4 — Reference interpreter (semantics oracle)
 - Tree-walking interpreter over the typed AST/IR implementing the canonical semantics,

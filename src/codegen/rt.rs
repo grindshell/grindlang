@@ -72,6 +72,10 @@ pub struct Pools {
     pub memories: Vec<String>,
     /// Lifted-closure function names (`MakeClosure`), by closure id.
     pub closure_names: Vec<String>,
+    /// Reference-valued top-level constants (`ConstRef`), by constant id. Only constants whose
+    /// value is a reference are interned: a scalar has no identity to keep stable, so it is
+    /// re-evaluated rather than cached (see [`RtCtx::const_cache`]).
+    pub consts: Vec<String>,
 }
 
 impl Pools {
@@ -117,6 +121,9 @@ impl Pools {
     pub fn intern_closure_name(&mut self, name: &str) -> u32 {
         Self::intern(&mut self.closure_names, name)
     }
+    pub fn intern_const(&mut self, name: &str) -> u32 {
+        Self::intern(&mut self.consts, name)
+    }
 }
 
 /// One invocation's runtime state. Created fresh per top-level call (this *is* the per-call
@@ -152,6 +159,15 @@ pub struct RtCtx {
     /// Finalized native address of every compiled function, by name. Used to resolve the
     /// callee of an indirect closure call ([`rt_closure_code_addr`]).
     code_addrs: Arc<HashMap<String, u64>>,
+    /// Reference-valued constants already evaluated during this invocation, by constant id
+    /// (parallel to [`Pools::consts`]).
+    ///
+    /// A constant is memoized **per call** (`SPEC.md` §3): within one invocation every read
+    /// yields the same value — so a constant is equal to itself, which reference values decide
+    /// by identity — and the cache is dropped with the rest of the per-call arena, so nothing
+    /// survives between calls (§1). Populated lazily, so a constant a call never reads costs
+    /// nothing.
+    const_cache: Vec<Option<Handle>>,
     /// The compiled module this context belongs to. Stamped into every closure
     /// [`rt_closure_new`] builds, and compared against a closure's own stamp before invoking it
     /// ([`rt_closure_code_addr`]).
@@ -225,6 +241,7 @@ impl RtCtx {
         RtCtx {
             errored: 0,
             values: vec![Value::Nil],
+            const_cache: vec![None; pools.consts.len()],
             pools,
             host,
             methods,
@@ -293,6 +310,9 @@ impl RtCtx {
     pub fn reset(&mut self) {
         self.values.clear();
         self.values.push(Value::Nil);
+        // Constants are memoized per call: the next invocation re-evaluates what it reads, so
+        // no constant (and nothing reachable from one) survives between calls.
+        self.const_cache.fill(None);
         self.error = None;
         self.errored = 0;
     }
@@ -389,6 +409,23 @@ pub unsafe extern "C" fn rt_const_string(ctx: *mut RtCtx, idx: u32) -> Handle {
     let ctx = ctx!(ctx);
     let s = ctx.pools.strings[idx as usize].clone();
     ctx.intern(Value::string(s))
+}
+
+/// The constant already evaluated during this call, or [`ERR`] as a *miss* marker. A miss can't
+/// be signalled with [`NIL`] because `nil` is a legal constant value, whereas `ERR` is never a
+/// valid handle. This is a lookup, not a failure path — it never latches an error.
+pub unsafe extern "C" fn rt_const_cached(ctx: *mut RtCtx, id: u32) -> Handle {
+    match ctx!(ctx).const_cache.get(id as usize) {
+        Some(Some(h)) => *h,
+        _ => ERR,
+    }
+}
+
+/// Memoize a freshly evaluated constant for the rest of this call.
+pub unsafe extern "C" fn rt_const_store(ctx: *mut RtCtx, id: u32, h: Handle) {
+    if let Some(slot) = ctx!(ctx).const_cache.get_mut(id as usize) {
+        *slot = Some(h);
+    }
 }
 
 /// Read a host memory binding. A binding the host declared but never provided is an error at
@@ -822,26 +859,10 @@ pub unsafe extern "C" fn rt_closure_code_addr(ctx: *mut RtCtx, clo: Handle) -> i
     }
 }
 
-/// Local re-implementation of [`Value`] equality (the interpreter's is private): scalars by
-/// value, reference types by `Rc` identity (Lua semantics).
+/// Grindlang `==` — shared with both interpreters via [`Value::ref_eq`] so the three cannot
+/// drift: scalars by value, reference types by `Rc` identity (Lua semantics).
 fn value_eq(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Nil, Value::Nil) => true,
-        (Value::Bool(x), Value::Bool(y)) => x == y,
-        (Value::Number(x), Value::Number(y)) => x == y,
-        (Value::Str(x), Value::Str(y)) => x == y,
-        (Value::Array(x), Value::Array(y)) => Rc::ptr_eq(x, y),
-        (Value::Table(x), Value::Table(y)) => Rc::ptr_eq(x, y),
-        // The JIT never produces these interpreter-only callables; the arms exist only so a
-        // build with `interp` also enabled still matches them exhaustively by identity.
-        #[cfg(feature = "interp")]
-        (Value::Function(x), Value::Function(y)) => Rc::ptr_eq(x, y),
-        #[cfg(feature = "interp")]
-        (Value::Native(x), Value::Native(y)) => Rc::ptr_eq(x, y),
-        (Value::Cell(x), Value::Cell(y)) => Rc::ptr_eq(x, y),
-        (Value::Closure(x), Value::Closure(y)) => Rc::ptr_eq(x, y),
-        _ => false,
-    }
+    a.ref_eq(b)
 }
 
 /// A shim's name and function pointer, for registration with the JIT linker.
@@ -852,6 +873,8 @@ pub fn shim_symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_unbox_number", rt_unbox_number as *const u8),
         ("rt_unbox_bool", rt_unbox_bool as *const u8),
         ("rt_const_string", rt_const_string as *const u8),
+        ("rt_const_cached", rt_const_cached as *const u8),
+        ("rt_const_store", rt_const_store as *const u8),
         ("rt_memory_ref", rt_memory_ref as *const u8),
         ("rt_namespace_field", rt_namespace_field as *const u8),
         ("rt_array_new", rt_array_new as *const u8),

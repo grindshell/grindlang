@@ -210,6 +210,7 @@ impl JitModule {
             shims: &shims,
             typed_ids: &typed_ids,
             const_ids: &const_ids,
+            const_rets: &const_rets,
         };
 
         let mut fbctx = FunctionBuilderContext::new();
@@ -708,6 +709,8 @@ fn declare_shims(
         ("rt_unbox_number", &[I64, I64], &[F64]),
         ("rt_unbox_bool", &[I64, I64], &[I8]),
         ("rt_const_string", &[I64, I32], &[I64]),
+        ("rt_const_cached", &[I64, I32], &[I64]),
+        ("rt_const_store", &[I64, I32, I64], &[]),
         ("rt_memory_ref", &[I64, I32], &[I64]),
         ("rt_namespace_field", &[I64, I32], &[I64]),
         ("rt_array_new", &[I64, I32], &[I64]),

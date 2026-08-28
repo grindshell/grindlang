@@ -134,6 +134,34 @@ pub struct ClosureObj {
 }
 
 impl Value {
+    /// Grindlang `==`: scalars compare **by value**, reference types **by `Rc` identity** (Lua
+    /// semantics) — so two structurally identical tables are different values, and a table is
+    /// equal to itself however it was reached.
+    ///
+    /// Every backend must decide equality the same way, so this is the one implementation they
+    /// all call. It used to be copied into each of the three; the IR VM's copy answered `false`
+    /// for *every* reference pair, including a value compared with itself, and nothing caught
+    /// it because the differential corpus never compared two reference values.
+    #[cfg(any(feature = "interp", feature = "jit"))]
+    pub fn ref_eq(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::Nil, Value::Nil) => true,
+            (Value::Bool(x), Value::Bool(y)) => x == y,
+            (Value::Number(x), Value::Number(y)) => x == y,
+            (Value::Str(x), Value::Str(y)) => x == y,
+            (Value::Array(x), Value::Array(y)) => Rc::ptr_eq(x, y),
+            (Value::Table(x), Value::Table(y)) => Rc::ptr_eq(x, y),
+            (Value::Tuple(x), Value::Tuple(y)) => Rc::ptr_eq(x, y),
+            #[cfg(feature = "interp")]
+            (Value::Function(x), Value::Function(y)) => Rc::ptr_eq(x, y),
+            #[cfg(feature = "interp")]
+            (Value::Native(x), Value::Native(y)) => Rc::ptr_eq(x, y),
+            (Value::Cell(x), Value::Cell(y)) => Rc::ptr_eq(x, y),
+            (Value::Closure(x), Value::Closure(y)) => Rc::ptr_eq(x, y),
+            _ => false,
+        }
+    }
+
     pub fn string(s: impl Into<String>) -> Value {
         Value::Str(Rc::from(s.into().as_str()))
     }
