@@ -147,13 +147,44 @@ pub struct RtCtx {
     /// Finalized native address of every compiled function, by name. Used to resolve the
     /// callee of an indirect closure call ([`rt_closure_code_addr`]).
     code_addrs: Arc<HashMap<String, u64>>,
-    /// Keeps the compiled module's native code mapped for any closure created during this
-    /// invocation that escapes to the host. Stamped into each [`Value::Closure`] by
-    /// [`rt_closure_new`] so a returned closure outlives the call without dangling.
-    keepalive: Option<Rc<dyn Any>>,
+    /// The compiled module this context belongs to. Stamped into every closure
+    /// [`rt_closure_new`] builds, and compared against a closure's own stamp before invoking it
+    /// ([`rt_closure_code_addr`]).
+    origin: Rc<ClosureOrigin>,
     /// The first error raised during this invocation, if any. Private so it cannot drift out of
     /// sync with [`errored`](Self::errored); read it with [`take_error`](Self::take_error).
     error: Option<RunError>,
+}
+
+/// The stamp a compiled module puts on every closure it builds: which module that was, plus
+/// the keepalive holding that module's native code mapped.
+///
+/// A closure is only meaningful inside the module that created it — its `code` name is
+/// synthetic and collides across modules, and its compiled body indexes that module's constant
+/// pools by baked-in id. Carrying the origin lets both invocation paths reject a foreign
+/// closure outright instead of running an unrelated function (or the right function against
+/// the wrong pools).
+pub struct ClosureOrigin {
+    /// Process-unique id of the [`super::JitModule`] that built the closure. Ids come from a
+    /// monotonic counter and are never reused, so a closure can't be mistaken for one from a
+    /// later module that happens to reuse a dropped module's address.
+    pub module_id: u64,
+    /// Keeps the origin module's native code mapped for as long as any closure it built is
+    /// reachable, so holding a closure past its module's drop stays sound.
+    pub keepalive: Rc<dyn Any>,
+}
+
+/// The error both invocation paths raise for a closure built by a different module.
+pub const FOREIGN_CLOSURE: &str =
+    "closure belongs to a different compiled module and cannot be invoked here";
+
+/// The id of the module that built `c`, or `None` if it carries no JIT origin stamp (an IR VM
+/// closure, which the JIT can't run either).
+pub fn closure_module_id(c: &ClosureObj) -> Option<u64> {
+    c.origin
+        .as_ref()?
+        .downcast_ref::<ClosureOrigin>()
+        .map(|o| o.module_id)
 }
 
 /// Byte offset of [`RtCtx::errored`] within the context. Generated code loads the flag from
@@ -171,7 +202,7 @@ impl RtCtx {
         methods: Vec<Option<NativeFn>>,
         memory: Vec<Value>,
         code_addrs: Arc<HashMap<String, u64>>,
-        keepalive: Option<Rc<dyn Any>>,
+        origin: Rc<ClosureOrigin>,
     ) -> Self {
         RtCtx {
             errored: 0,
@@ -181,7 +212,7 @@ impl RtCtx {
             methods,
             memory,
             code_addrs,
-            keepalive,
+            origin,
             error: None,
         }
     }
@@ -668,8 +699,9 @@ pub unsafe extern "C" fn rt_cell_set(ctx: *mut RtCtx, cell: Handle, val: Handle)
 }
 
 /// Build a closure value: the lifted function named by `name_id` plus its captured cells
-/// (`argc` handles at `argv`, each a cell). The closure carries the module keepalive so it
-/// stays callable if it escapes to the host.
+/// (`argc` handles at `argv`, each a cell). Stamped with this module's [`ClosureOrigin`], which
+/// both keeps the native code mapped if the closure escapes to the host and identifies the only
+/// module that may invoke it.
 pub unsafe extern "C" fn rt_closure_new(
     ctx: *mut RtCtx,
     name_id: u32,
@@ -679,11 +711,11 @@ pub unsafe extern "C" fn rt_closure_new(
     let ctx = ctx!(ctx);
     let env = unsafe { collect_args(ctx, argv, argc) };
     let code = ctx.pools.closure_names[name_id as usize].clone();
-    let keepalive = ctx.keepalive.clone();
+    let origin: Rc<dyn Any> = ctx.origin.clone();
     ctx.intern(Value::Closure(Rc::new(ClosureObj {
         code,
         env,
-        keepalive,
+        origin: Some(origin),
     })))
 }
 
@@ -701,14 +733,29 @@ pub unsafe extern "C" fn rt_closure_env_get(ctx: *mut RtCtx, clo: Handle, i: u32
 }
 
 /// Resolve the native code address of a closure's lifted function, for an indirect call.
+///
+/// Only a closure this module built may be called: its `code` name means nothing in another
+/// module's address table, and its body would index this module's pools by ids baked in
+/// elsewhere. A foreign closure is rejected rather than silently dispatched (see
+/// [`ClosureOrigin`]).
 pub unsafe extern "C" fn rt_closure_code_addr(ctx: *mut RtCtx, clo: Handle) -> i64 {
     let ctx = ctx!(ctx);
-    let addr = match ctx.get(clo) {
-        Value::Closure(c) => ctx.code_addrs.get(&c.code).copied(),
-        _ => None,
+    let (foreign, addr) = match ctx.get(clo) {
+        Value::Closure(c) => {
+            if closure_module_id(c) == Some(ctx.origin.module_id) {
+                (false, ctx.code_addrs.get(&c.code).copied())
+            } else {
+                (true, None)
+            }
+        }
+        _ => (false, None),
     };
     match addr {
         Some(a) => a as i64,
+        None if foreign => {
+            ctx.fail(RunError::Runtime(FOREIGN_CLOSURE.into()));
+            0
+        }
         None => {
             ctx.fail(RunError::Internal(
                 "indirect call to an unknown closure".into(),
@@ -798,7 +845,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Arc::new(HashMap::new()),
-            None,
+            Rc::new(ClosureOrigin {
+                module_id: 0,
+                keepalive: Rc::new(()),
+            }),
         )
     }
 

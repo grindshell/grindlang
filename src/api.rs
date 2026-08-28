@@ -605,12 +605,18 @@ impl Module {
     }
 
     /// Invoke a closure value previously returned by [`call`](Self::call_typed) (or by another
-    /// `call_value`), at the raw [`Value`] level. The closure carries its captured upvalues,
-    /// so mutations persist across host calls, and it keeps its backing code alive — so it
-    /// remains callable even after the originating [`Module`] is dropped.
+    /// `call_value`), at the raw [`Value`] level. The closure carries its captured upvalues, so
+    /// mutations persist across host calls.
     ///
-    /// `callee` must be a function value (`Type::Function(..)`); anything else is a runtime
-    /// error. Closures cannot be persisted into host memory or serialized.
+    /// `callee` must be a function value (`Type::Function(..)`) built by **this** module;
+    /// anything else is a runtime error. A closure is bound to its origin: its lifted name is
+    /// synthetic and collides across modules, and its compiled body reads that module's
+    /// constant pools by baked-in id, so passing one to a different module is rejected rather
+    /// than silently running an unrelated function. Holding a closure after its module is
+    /// dropped stays sound — it keeps the backing code mapped — but it can no longer be
+    /// invoked, so keep the [`Module`] alive for as long as you intend to call its closures.
+    ///
+    /// Closures cannot be persisted into host memory or serialized.
     pub fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RunError> {
         self.jit.call_value(callee, args)
     }

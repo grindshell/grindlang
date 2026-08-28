@@ -751,10 +751,14 @@ fn host_invokes_counter_twice_persisting_upvalue() {
 }
 
 #[test]
-fn closure_survives_origin_module_drop() {
-    // A returned closure carries its captured cells (and a keepalive to its native code), so
-    // it remains a valid value after the module that produced it is dropped. Here it is then
-    // host-invoked through a second module compiled from the same program.
+fn closure_outlives_origin_module_drop_but_is_not_invocable() {
+    // A returned closure keeps its origin module's native code mapped, so holding one after
+    // that module is dropped stays sound — the value is still inspectable, nothing dangles.
+    //
+    // It is *not* invocable through a different module, even one compiled from the same
+    // program. A closure's lifted name (`make_adder$c0`) collides freely across modules and its
+    // body reads its own module's constant pools by baked-in id, so a second module could only
+    // guess. It rejects the foreign closure instead.
     let cfg = TypeConfig::default();
     let src = "function make_adder(n) return function(x) return x + n end end";
     let (module, res, info) = grindlang::analyze(src, &cfg).expect("analyze");
@@ -765,12 +769,38 @@ fn closure_survives_origin_module_drop() {
         let mut jit1 = JitModule::compile(&program).expect("jit compile 1");
         jit1.call("make_adder", vec![Value::Number(40.0)])
             .expect("closure")
-        // jit1 dropped here; `closure` lives on via its keepalive.
+        // jit1 dropped here; `closure` lives on, keeping jit1's code mapped.
     };
-    let r = jit2
+    assert_eq!(closure.type_name(), "function");
+
+    let err = jit2
         .call_value(closure, vec![Value::Number(2.0)])
-        .expect("invoke");
-    assert_eq!(format!("{r}"), "42");
+        .expect_err("a foreign closure must be rejected");
+    assert!(
+        format!("{err}").contains("different compiled module"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn closure_is_invocable_through_its_own_module() {
+    // The flip side of the rule above: the origin module invokes its own closure normally, and
+    // keeps doing so across repeated calls.
+    let cfg = TypeConfig::default();
+    let src = "function make_adder(n) return function(x) return x + n end end";
+    let (module, res, info) = grindlang::analyze(src, &cfg).expect("analyze");
+    let program = grindlang::ir::lower(&module, &res, &info, &cfg).expect("lower");
+
+    let mut jit = JitModule::compile(&program).expect("jit compile");
+    let closure = jit
+        .call("make_adder", vec![Value::Number(40.0)])
+        .expect("closure");
+    for (arg, want) in [(2.0, "42"), (10.0, "50")] {
+        let r = jit
+            .call_value(closure.clone(), vec![Value::Number(arg)])
+            .expect("invoke");
+        assert_eq!(format!("{r}"), want);
+    }
 }
 
 #[test]

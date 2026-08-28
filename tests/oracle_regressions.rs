@@ -264,13 +264,17 @@ end
     );
 }
 
-// ---- Finding 2: an escaped closure must run its origin module's code -------
+// ---- Finding 2: a closure is bound to the module that built it -------------
+//
+// A closure can only run inside its origin: its lifted name (`make$c0`) collides freely across
+// modules, and its compiled body reads that module's constant pools by baked-in id. Both
+// invocation paths used to resolve the name through the *receiving* module, silently running an
+// unrelated function. Both now reject a foreign closure.
 
-/// A closure returned by module A must keep running A's code when handed to module B, whose
-/// lifted-closure names collide with A's (`make$c0` in both).
+/// The host `call_value` path. Module B defines a same-named closure with different behavior,
+/// so a name-based resolution returns a plausible wrong answer rather than failing loudly.
 #[test]
-#[ignore = "finding 2: dispatch_value resolves the closure's name through the receiving module"]
-fn escaped_closure_runs_origin_module_via_call_value() {
+fn foreign_closure_rejected_by_call_value() {
     let a_src = "\
 function make(n)
   local function op(x) return x + n end
@@ -288,20 +292,25 @@ end
     let mut b = jit_only(b_src, &cfg);
 
     let clo = a.call("make", vec![Value::Number(3.0)]).expect("make");
-    let via_a = a.call_value(clo.clone(), vec![Value::Number(10.0)]);
-    let via_b = b.call_value(clo, vec![Value::Number(10.0)]);
-    assert_eq!(
-        outcome(&via_a),
-        outcome(&via_b),
-        "A's closure behaved differently when invoked through module B"
+    let via_a = a
+        .call_value(clo.clone(), vec![Value::Number(10.0)])
+        .expect("origin module invokes its own closure");
+    assert_eq!(via_a.to_string(), "13");
+
+    let via_b = b
+        .call_value(clo, vec![Value::Number(10.0)])
+        .expect_err("module B must reject A's closure");
+    assert!(
+        format!("{via_b}").contains("different compiled module"),
+        "got {via_b:?}"
     );
 }
 
-/// The same guarantee for the in-script indirect-call path, which reaches the closure through
-/// `rt_closure_code_addr` and does no signature check at all.
+/// The in-script indirect-call path, reached when a host function hands a foreign closure to a
+/// script that calls it. This one bypassed even the arity check, going straight to
+/// `call_indirect` on whatever address the name resolved to.
 #[test]
-#[ignore = "finding 2: rt_closure_code_addr resolves the name through the receiving module"]
-fn escaped_closure_runs_origin_module_via_script_call() {
+fn foreign_closure_rejected_by_script_call() {
     let a_src = "\
 function make(n)
   local function op(x) return x + n end
@@ -335,13 +344,36 @@ end
     let mut b = jit_only(b_src, &b_cfg);
 
     let clo = a.call("make", vec![Value::Number(3.0)]).expect("make");
-    let via_a = a.call_value(clo.clone(), vec![Value::Number(10.0)]);
     b.set_host_function("borrow", move |_: &[Value]| Ok(clo.clone()));
-    let via_b = b.call("apply", vec![Value::Number(10.0)]);
-    assert_eq!(
-        outcome(&via_a),
-        outcome(&via_b),
-        "A's closure behaved differently when called from module B's script"
+
+    let via_b = b
+        .call("apply", vec![Value::Number(10.0)])
+        .expect_err("B's script must reject A's closure");
+    assert!(
+        format!("{via_b}").contains("different compiled module"),
+        "got {via_b:?}"
+    );
+}
+
+/// A closure produced by the IR VM carries no JIT origin stamp at all, so the JIT must refuse
+/// it rather than resolving its name against whatever it happens to have compiled.
+#[test]
+fn vm_closure_rejected_by_jit() {
+    let src = "\
+function make(n)
+  local function op(x) return x + n end
+  return op
+end
+";
+    let cfg = TypeConfig::default();
+    let (_, mut vm, mut jit) = triple(src, &cfg);
+    let from_vm = vm.call("make", vec![Value::Number(3.0)]).expect("vm make");
+    let r = jit
+        .call_value(from_vm, vec![Value::Number(10.0)])
+        .expect_err("the JIT must reject a VM-built closure");
+    assert!(
+        format!("{r}").contains("different compiled module"),
+        "got {r:?}"
     );
 }
 

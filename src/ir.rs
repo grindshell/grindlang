@@ -1858,7 +1858,7 @@ mod vm {
                     Value::Closure(std::rc::Rc::new(crate::value::ClosureObj {
                         code: code.clone(),
                         env,
-                        keepalive: None,
+                        origin: None,
                     }))
                 }
                 Op::CallValue(callee, args) => {

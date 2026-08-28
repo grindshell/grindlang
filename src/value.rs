@@ -120,10 +120,17 @@ pub struct ClosureObj {
     /// The captured upvalue cells, in the lifted function's env order (each a
     /// [`Value::Cell`]).
     pub env: Vec<Value>,
-    /// Keeps the backing native code mapped for as long as this closure is reachable, so a
-    /// closure returned to the host outlives the call that built it without dangling. `None`
-    /// for the IR VM (no native code); `Some` for the JIT (an `Rc` to the compiled module).
-    pub keepalive: Option<Rc<dyn Any>>,
+    /// Which backend instance built this closure, as an opaque handle the backend downcasts.
+    /// `None` for the IR VM (which resolves [`code`](Self::code) against its own `Program`);
+    /// for the JIT an `Rc<codegen::ClosureOrigin>` naming the module that created it and
+    /// keeping that module's native code mapped, so holding a closure past its module's drop
+    /// stays sound.
+    ///
+    /// A closure is **bound to the instance that built it**: `code` is a synthetic name
+    /// (`enclosing$c0`) that collides freely across modules, and a compiled body indexes its
+    /// own module's constant pools, so running it anywhere else would be meaningless. The
+    /// backends compare this stamp and refuse a foreign closure rather than guess.
+    pub origin: Option<Rc<dyn Any>>,
 }
 
 impl Value {

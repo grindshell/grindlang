@@ -214,20 +214,46 @@ Each phase is independently testable and leaves the crate green
 > (MakeArray/FieldGet/MapGet/builtins/host/memory) lower to `extern "C"` calls into `rt_*`
 > shims — heap correctness delegated to the proven runtime. The ctx is a hidden first param;
 > each export gets a uniform `(ctx, argv, argc) -> handle` trampoline. Errors: shims record
-> the first `RunError` in the ctx and return a null/`ERR` sentinel; loop back-edges check
-> `rt_errored` and divert to a per-function error-exit; the driver reports `ctx.error` after
-> the call. `JitModule` mirrors the `Vm`/`Interpreter` surface
+> the first `RunError` in the ctx and return the `ERR` sentinel, and **every fallible op
+> branches to a per-function error-exit at its own call site**, so a raised error aborts the
+> rest of the call the way it does in both interpreters (`SPEC.md` §7.3); the driver reports
+> the error after the call. `JitModule` mirrors the `Vm`/`Interpreter` surface
 > (`set_host_function`/`set_memory`/`memory`/`call`). **Validated** by
 > `tests/jit_differential.rs` (JIT == AST == IR over the corpus — the third oracle) and
 > `tests/jit_fuzz.rs` (a deterministic LCG drives ~2,500 randomized inputs). **Closures with
 > upvalues and calling first-class function values have since landed** (`src/capture.rs` is the
 > single source of truth for upvalue ordering, shared by both interpreters and the JIT;
 > `Module::call_value`/`call_value_typed` invoke a returned closure, which keeps its backing
-> code alive via the closure's `keepalive`). Still deferred to future work: method-call syntax
-> and the full native arena (raw-pointer `#[repr(C)]` layouts) — the handle runtime is
+> code alive via the closure's `origin` stamp). Still deferred to future work: method-call
+> syntax and the full native arena (raw-pointer `#[repr(C)]` layouts) — the handle runtime is
 > incrementally upgradable to it later. The ABI/value-model contract is documented in the
 > `codegen` and `runtime` module rustdoc (`SPEC.md` stays the author-facing language contract,
 > §1–§9).
+
+#### Deferred: portable (self-contained) closures
+
+A closure is currently **bound to the module instance that built it** (`SPEC.md` §5.5):
+`codegen::rt::ClosureOrigin` stamps each closure with its origin module's id, and both
+invocation paths — the host `JitModule::call_value` and the in-script `call_indirect` via
+`rt_closure_code_addr` — reject a foreign one. That closed a real hole (lifted names like
+`make$c0` collide across modules, so name-based resolution silently ran an unrelated function),
+but it is the *conservative* resolution: it makes the failure loud rather than making the call
+work.
+
+Making closures portable is strictly harder than redirecting dispatch to the origin's code
+address, and that shortcut is a trap: a compiled body indexes **its own module's** constant
+pools (strings, host-fn ids, memory slots) by baked-in id, so running origin code against the
+invoking module's `RtCtx` reads the wrong bindings and can index out of bounds — a panic
+unwinding through `extern "C"`. Portability therefore requires carrying the origin's whole
+invocation environment on the closure: its `Pools`, its code table, and a *shared* handle to
+its host/method/memory registrations (which are mutable per-`JitModule` state today, so they
+would have to move behind an `Rc`).
+
+That also raises policy questions worth settling before building it: what does a closure see if
+its origin registers a new host function after the closure escaped, and what should happen when
+the origin module is dropped but the closure is still invoked — error, or run with no host
+bindings? Until a consumer actually needs cross-module closures, the bound-to-origin rule is
+the honest contract.
 
 ### Phase 8 — Host embedding API
 - `Engine` (owns cranelift/JIT context, builtin registry), `Module` (compiled script +

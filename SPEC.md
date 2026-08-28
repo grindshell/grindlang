@@ -362,6 +362,13 @@ end
   boundary) and held by the host, which can re-invoke it later — multiple times, observing
   mutations to its upvalues between calls (`Module::call_value`). A returned closure keeps its
   backing code and captured state alive for as long as the host holds it.
+- A closure is **bound to the module instance that created it**. Only that instance may invoke
+  it; passing it to a different `Module` — even one compiled from the identical source — is a
+  runtime error, as is a script receiving a foreign closure (via a host function) and calling
+  it. A closure is not a portable value: it names a compiled body that only means anything
+  inside its own module, alongside that module's constants and host bindings. Holding one after
+  its module is dropped stays safe (the code stays mapped) but it can no longer be invoked, so
+  a host that intends to call a closure must keep its `Module` alive.
 - A closure still **cannot be persisted** into host memory or serialized — that would require
   capturing native-code identity and live captured state; closures are confined to the
   in-process value graph.

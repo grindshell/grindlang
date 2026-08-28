@@ -18,7 +18,7 @@
 mod rt;
 mod translate;
 
-pub use rt::{Handle, RtCtx};
+pub use rt::{ClosureOrigin, Handle, RtCtx};
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -79,11 +79,19 @@ type Direct8 = unsafe extern "C" fn(*mut RtCtx, f64, f64, f64, f64, f64, f64, f6
 /// all-`number` functions fall back to the trampoline.
 const MAX_DIRECT_ARGS: usize = 8;
 
+/// Source of the process-unique ids that bind a closure to the module that built it. Ids are
+/// never reused, so a closure can't be mistaken for one belonging to a later module that
+/// happens to occupy a dropped module's address.
+static NEXT_MODULE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A compiled module: native code plus the machinery to call it.
 pub struct JitModule {
-    /// Keeps the executable memory mapped. Shared (by [`Rc`]) into any closure that escapes to
-    /// the host, so a returned closure stays callable even if this `JitModule` is dropped.
-    module: Rc<JITModule>,
+    /// This module's identity, stamped into every closure it builds so a closure can only be
+    /// invoked by the module that created it. Also owns the [`Rc<JITModule>`] keeping the
+    /// executable memory mapped — shared into any closure that escapes to the host, so holding
+    /// a returned closure after this `JitModule` is dropped stays sound. Cloned into each
+    /// [`RtCtx`] so the runtime makes the same check compiled code does.
+    origin: Rc<rt::ClosureOrigin>,
     pools: Arc<Pools>,
     /// export name → its target (function or constant).
     exports: std::collections::BTreeMap<String, ExportTarget>,
@@ -289,8 +297,14 @@ impl JitModule {
             code_addrs.insert(name.clone(), ptr as u64);
         }
 
+        let module = Rc::new(module);
+        let origin = Rc::new(rt::ClosureOrigin {
+            module_id: NEXT_MODULE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            keepalive: module.clone(),
+        });
+
         Ok(JitModule {
-            module: Rc::new(module),
+            origin,
             pools: Arc::new(pools),
             exports: program.exports.clone(),
             fn_tramps,
@@ -476,11 +490,22 @@ impl JitModule {
 
     /// Host-invoke a closure value previously returned by [`call`](Self::call) (or by another
     /// `call_value`). The closure carries its captured cells, so upvalue mutations persist
-    /// across host calls. The closure also keeps this module's native code mapped, so it stays
-    /// callable even after the originating `JitModule` is dropped.
+    /// across host calls.
+    ///
+    /// The closure must be one **this** module built. A closure is only meaningful inside its
+    /// origin: its lifted name (`enclosing$c0`) collides freely across modules, and its
+    /// compiled body reads that module's constant pools by baked-in id — so invoking it
+    /// elsewhere is rejected rather than silently running an unrelated function. Holding a
+    /// closure after its module is dropped stays sound (it keeps the code mapped); it simply
+    /// can no longer be invoked.
     pub fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RunError> {
         let code = match &callee {
-            Value::Closure(c) => c.code.clone(),
+            Value::Closure(c) => {
+                if rt::closure_module_id(c) != Some(self.origin.module_id) {
+                    return Err(RunError::Runtime(rt::FOREIGN_CLOSURE.into()));
+                }
+                c.code.clone()
+            }
             other => {
                 return Err(RunError::Internal(format!(
                     "call_value on a {} value",
@@ -562,16 +587,15 @@ impl JitModule {
     }
 
     /// Build a fresh per-invocation [`RtCtx`], resolving host/memory bindings into pool-id
-    /// order and threading the indirect-call address table plus a code keepalive.
+    /// order and threading the indirect-call address table plus this module's closure origin.
     fn make_ctx(&self) -> RtCtx {
-        let keepalive: Rc<dyn std::any::Any> = self.module.clone();
         RtCtx::new(
             self.pools.clone(),
             self.resolve_host(),
             self.resolve_methods(),
             self.resolve_memory(),
             self.code_addrs.clone(),
-            Some(keepalive),
+            self.origin.clone(),
         )
     }
 
