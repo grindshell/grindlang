@@ -18,10 +18,18 @@
 //!
 //! ## Errors
 //!
-//! Fallible shims return the sentinel [`ERR`] (and stash the [`RunError`] in
-//! [`RtCtx::error`]); the generated code compares against it and branches to the function's
-//! error-exit. Script-to-script calls can't carry the sentinel in a scalar return, so the
-//! callee sets [`RtCtx::error`] and the caller checks it via [`rt_errored`].
+//! Fallible shims return the sentinel [`ERR`] (and latch the [`RunError`] in the context); the
+//! generated code compares against it and branches to the function's error-exit **at the call
+//! site**, so nothing after a failed op runs. Shims whose return type can't carry the sentinel
+//! report failure another way: a NaN comparison is detected natively and only *raises* through
+//! [`rt_raise_nan_compare`] on the failing edge, and [`rt_closure_code_addr`] returns address
+//! `0`. Script-to-script calls carry nothing at all — the callee latches the error and the
+//! caller loads the context's `errored` byte directly (see [`ERRORED_OFFSET`]), keeping the
+//! check off the shim-call path it would otherwise sit on.
+//!
+//! Latching without branching is not enough: the *value* of a failed op is harmless (a null
+//! handle unboxing to a default), but the *statements after it* are not — they would run host
+//! functions and write host memory that the interpreter oracles never reach.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -117,7 +125,16 @@ impl Pools {
 ///
 /// Has no lifetime parameter so it is sound to pass as a raw pointer: it owns its
 /// [`Value`]s and shares the [`Pools`] by [`Arc`].
+///
+/// `#[repr(C)]` is **load-bearing**: generated code reads [`errored`](Self::errored) with a
+/// plain load at offset 0 (see [`ERRORED_OFFSET`]), so that field must stay first and the
+/// layout must stay stable. Reordering the fields silently miscompiles error propagation.
+#[repr(C)]
 pub struct RtCtx {
+    /// Nonzero once an error has been latched — the same answer [`error`](Self::error) gives,
+    /// in a form the JIT can read without a call. Kept in sync by [`fail`](Self::fail),
+    /// [`reset`](Self::reset), and [`take_error`](Self::take_error); never written directly.
+    errored: u8,
     /// The value table; index `0` is permanently `nil`.
     values: Vec<Value>,
     pools: Arc<Pools>,
@@ -134,9 +151,16 @@ pub struct RtCtx {
     /// invocation that escapes to the host. Stamped into each [`Value::Closure`] by
     /// [`rt_closure_new`] so a returned closure outlives the call without dangling.
     keepalive: Option<Rc<dyn Any>>,
-    /// The first error raised during this invocation, if any.
-    pub error: Option<RunError>,
+    /// The first error raised during this invocation, if any. Private so it cannot drift out of
+    /// sync with [`errored`](Self::errored); read it with [`take_error`](Self::take_error).
+    error: Option<RunError>,
 }
+
+/// Byte offset of [`RtCtx::errored`] within the context. Generated code loads the flag from
+/// here instead of calling into a shim — the check sits on the hot script-call path, where a
+/// call would cost more than the branch it guards. Guaranteed by `#[repr(C)]` plus the field
+/// being declared first; asserted in the module's tests.
+pub const ERRORED_OFFSET: i32 = 0;
 
 impl RtCtx {
     /// Build a context for one invocation. `host`/`memory` are resolved into id order by the
@@ -150,6 +174,7 @@ impl RtCtx {
         keepalive: Option<Rc<dyn Any>>,
     ) -> Self {
         RtCtx {
+            errored: 0,
             values: vec![Value::Nil],
             pools,
             host,
@@ -208,6 +233,14 @@ impl RtCtx {
         self.values.clear();
         self.values.push(Value::Nil);
         self.error = None;
+        self.errored = 0;
+    }
+
+    /// Take the latched error, clearing the errored state. The only way out of the context, so
+    /// [`error`](Self::error) and [`errored`](Self::errored) can't drift apart.
+    pub fn take_error(&mut self) -> Option<RunError> {
+        self.errored = 0;
+        self.error.take()
     }
 
     /// Replace the host-function, method, and memory bindings, for when the user re-registers
@@ -231,6 +264,7 @@ impl RtCtx {
         if self.error.is_none() {
             self.error = Some(e);
         }
+        self.errored = 1;
         ERR
     }
 }
@@ -497,23 +531,17 @@ pub extern "C" fn rt_pow(a: f64, b: f64) -> f64 {
     a.powf(b)
 }
 
-/// Whether an error has been recorded — checked after a script-to-script call (whose scalar
-/// return can't carry the [`ERR`] sentinel).
-pub unsafe extern "C" fn rt_errored(ctx: *mut RtCtx) -> i8 {
-    ctx!(ctx).error.is_some() as i8
-}
-
-/// Reject ordering a NaN operand, matching the interpreter oracles (`interp::compare` and
+/// Latch the "ordered a NaN" error, matching the interpreter oracles (`interp::compare` and
 /// `ir::Vm::compare`, which fail when `partial_cmp` returns `None`). The JIT lowers `< <= > >=`
 /// on numbers to a native unboxed `fcmp`, but an IEEE *unordered* compare silently yields
-/// `false` for a NaN operand — so without this guard a NaN comparison would diverge from the
-/// two interpreters (which error), breaking the three-oracle invariant. The relational result
-/// is still computed natively; this leaf shim only latches the error, which surfaces as `Err`
-/// at the call boundary (the same latch-and-continue discipline every reference shim uses).
-pub unsafe extern "C" fn rt_check_compare(ctx: *mut RtCtx, a: f64, b: f64) {
-    if a.is_nan() || b.is_nan() {
-        ctx!(ctx).fail(RunError::Runtime("comparison with NaN".into()));
-    }
+/// `false` for a NaN operand — so without this the JIT would diverge from the two interpreters,
+/// breaking the three-oracle invariant.
+///
+/// **Detecting** the NaN is native (an `fcmp unordered` alongside the relational one), so
+/// ordinary comparisons never call here; only the failing branch does. That matters because
+/// comparisons sit in the hot path of exactly the calc/decision code Grindlang exists to run.
+pub unsafe extern "C" fn rt_raise_nan_compare(ctx: *mut RtCtx) {
+    ctx!(ctx).fail(RunError::Runtime("comparison with NaN".into()));
 }
 
 // ---- calls ------------------------------------------------------------------
@@ -742,8 +770,7 @@ pub fn shim_symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_value_eq", rt_value_eq as *const u8),
         ("rt_truthy", rt_truthy as *const u8),
         ("rt_pow", rt_pow as *const u8),
-        ("rt_errored", rt_errored as *const u8),
-        ("rt_check_compare", rt_check_compare as *const u8),
+        ("rt_raise_nan_compare", rt_raise_nan_compare as *const u8),
         ("rt_call_host", rt_call_host as *const u8),
         ("rt_call_method", rt_call_method as *const u8),
         ("rt_call_builtin_value", rt_call_builtin_value as *const u8),
@@ -758,4 +785,60 @@ pub fn shim_symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_closure_env_get", rt_closure_env_get as *const u8),
         ("rt_closure_code_addr", rt_closure_code_addr as *const u8),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_ctx() -> RtCtx {
+        RtCtx::new(
+            Arc::new(Pools::default()),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Arc::new(HashMap::new()),
+            None,
+        )
+    }
+
+    /// Generated code loads the errored flag from [`ERRORED_OFFSET`] instead of calling a shim.
+    /// If a field reorder moved it, every script-call error check would read an unrelated byte
+    /// and errors would stop propagating — silently, and only across function boundaries. Pin
+    /// the offset here so that becomes a test failure instead.
+    #[test]
+    fn errored_flag_sits_at_the_offset_codegen_loads() {
+        let ctx = empty_ctx();
+        let base = &ctx as *const RtCtx as usize;
+        let flag = &ctx.errored as *const u8 as usize;
+        assert_eq!(
+            (flag - base) as i32,
+            ERRORED_OFFSET,
+            "RtCtx::errored moved; codegen's load offset is now wrong"
+        );
+    }
+
+    /// The flag must track the latched error through every transition, since codegen trusts it
+    /// alone.
+    #[test]
+    fn errored_flag_tracks_the_latched_error() {
+        let mut ctx = empty_ctx();
+        assert_eq!(ctx.errored, 0);
+
+        assert_eq!(ctx.fail(RunError::Runtime("boom".into())), ERR);
+        assert_eq!(ctx.errored, 1, "fail must raise the flag");
+
+        // A second failure keeps the *first* error, and leaves the flag raised.
+        ctx.fail(RunError::Runtime("later".into()));
+        assert_eq!(ctx.errored, 1);
+
+        let taken = ctx.take_error();
+        assert!(matches!(taken, Some(RunError::Runtime(m)) if m == "boom"));
+        assert_eq!(ctx.errored, 0, "take_error must clear the flag");
+
+        ctx.fail(RunError::Runtime("again".into()));
+        ctx.reset();
+        assert_eq!(ctx.errored, 0, "reset must clear the flag");
+        assert!(ctx.take_error().is_none());
+    }
 }

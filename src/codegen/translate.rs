@@ -7,11 +7,24 @@
 //!
 //! ## Error propagation
 //!
-//! Shims record the first error in the context and the trampoline reports it after the call
-//! returns, so straight-line code needs no per-op error branch (a post-error handle is the
-//! null handle and unboxes to a harmless default). To preserve interpreter semantics and
-//! guarantee termination, a loop **back-edge** (a `Jump` to a lower-numbered block) first
-//! checks `rt_errored` and diverts to the function's error-exit instead of looping again.
+//! Every operation that can fail branches to the function's error-exit **at its own call
+//! site**, so a raised error aborts the rest of the function exactly as it does in the two
+//! interpreter oracles. [`Translator::call_fallible_shim`] splits the current block after each
+//! such op: the failure edge goes to the error-exit, and the following instructions land in a
+//! fresh continuation block.
+//!
+//! It is not enough to latch the error and keep going. The *value* a failed op produces is
+//! harmless — the null handle, which unboxes to a default — but the *statements after it* are
+//! not: they run host functions and write host memory the interpreters never reach, so an
+//! errored call would leave side effects (and durable memory state) the oracles disagree on.
+//!
+//! How a failure is signalled depends on what the callee can carry:
+//!
+//! - a shim returning a handle → the [`ERR`](super::rt::ERR) sentinel;
+//! - a NaN comparison → detected natively, raised on the failing edge only;
+//! - `rt_closure_code_addr` → address `0` (jumping there would fault);
+//! - a script / const / indirect call → nothing, so the caller loads the context's `errored`
+//!   byte directly (see [`ERRORED_OFFSET`](super::rt::ERRORED_OFFSET)).
 
 use std::collections::HashMap;
 
@@ -29,7 +42,7 @@ use crate::ir::{Function, LocalId, Op, Terminator, ValueId};
 use crate::runtime::repr::Repr;
 use crate::types::Type;
 
-use super::rt::Pools;
+use super::rt::{ERR, Pools};
 
 /// The cranelift type a [`Repr`] lowers to. `None` for [`Repr::Unit`] (no value).
 pub fn clif_ty(r: Repr) -> Option<types::Type> {
@@ -260,16 +273,9 @@ impl<'a, 'b> Translator<'a, 'b> {
                 };
             }
             Terminator::Jump(t) => {
-                let target = self.blocks[*t as usize];
-                if (*t as usize) < idx {
-                    // Loop back-edge: bail to the error-exit if an error was recorded.
-                    let errored = self.call_shim("rt_errored", &[self.ctx_val]).unwrap();
-                    self.builder
-                        .ins()
-                        .brif(errored, self.error_block, &[], target, &[]);
-                } else {
-                    self.builder.ins().jump(target, &[]);
-                }
+                // No back-edge error check: every fallible op now diverts to the error-exit at
+                // its own call site, so control can't reach a back-edge with an error pending.
+                self.builder.ins().jump(self.blocks[*t as usize], &[]);
             }
             Terminator::Branch {
                 cond,
@@ -313,6 +319,64 @@ impl<'a, 'b> Translator<'a, 'b> {
         let r = self.shim_ref(name);
         let call = self.builder.ins().call(r, args);
         self.builder.inst_results(call).first().copied()
+    }
+
+    /// Divert to the function's error-exit when `failed` (an `i8` flag) is nonzero, and
+    /// continue translating into a fresh block. Splitting here is what makes an error *abort*
+    /// the rest of the function rather than merely being recorded: everything emitted after
+    /// this point is reachable only on the success edge.
+    fn guard(&mut self, failed: ClifValue) {
+        let cont = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(failed, self.error_block, &[], cont, &[]);
+        self.builder.switch_to_block(cont);
+    }
+
+    /// Guard on a natively computed failure condition. Unlike [`guard`](Self::guard), the
+    /// error still has to be *recorded*, so the failing edge lands in a slow-path block that
+    /// calls `raise_shim` before taking the error-exit. The fast path stays call-free.
+    fn guard_raising(&mut self, failed: ClifValue, raise_shim: &'static str) {
+        let raise = self.builder.create_block();
+        let cont = self.builder.create_block();
+        self.builder.ins().brif(failed, raise, &[], cont, &[]);
+
+        self.builder.switch_to_block(raise);
+        self.call_shim(raise_shim, &[self.ctx_val]);
+        self.builder.ins().jump(self.error_block, &[]);
+
+        self.builder.switch_to_block(cont);
+    }
+
+    /// Call a shim that reports failure with the [`ERR`] handle sentinel, then guard on it.
+    /// The returned handle is only ever observed on the success edge, so callers may unbox it
+    /// without first checking for a poisoned value.
+    fn call_fallible_shim(&mut self, name: &'static str, args: &[ClifValue]) -> ClifValue {
+        let result = self
+            .call_shim(name, args)
+            .expect("a fallible shim returns a handle");
+        let failed = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, result, ERR as i64);
+        self.guard(failed);
+        result
+    }
+
+    /// Guard on the context's latched-error flag. Used after calls whose return value can't
+    /// carry a sentinel — script-to-script, constant, and indirect closure calls — where the
+    /// callee has already returned its error-exit default.
+    ///
+    /// Reads the flag straight out of the context rather than calling a shim: this sits on
+    /// every script call, so a call here would cost more than the branch it guards.
+    fn guard_errored(&mut self) {
+        let failed = self.builder.ins().load(
+            types::I8,
+            MemFlags::trusted(),
+            self.ctx_val,
+            super::rt::ERRORED_OFFSET,
+        );
+        self.guard(failed);
     }
 
     fn script_ref(&mut self, id: FuncId) -> cranelift_codegen::ir::FuncRef {
@@ -447,7 +511,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 let b = self.val(*base);
                 let i = self.val(*idx);
                 let val = self.box_handle(*v);
-                self.call_shim("rt_array_set", &[self.ctx_val, b, i, val]);
+                self.call_fallible_shim("rt_array_set", &[self.ctx_val, b, i, val]);
                 None
             }
             Op::MapGet(base, key) => {
@@ -505,15 +569,13 @@ impl<'a, 'b> Translator<'a, 'b> {
             Op::MemoryRef(name) => {
                 let idx = self.pools.intern_memory(name);
                 let i = self.iconst32(idx);
-                let h = self.call_shim("rt_memory_ref", &[self.ctx_val, i]).unwrap();
+                let h = self.call_fallible_shim("rt_memory_ref", &[self.ctx_val, i]);
                 Some(self.unbox_handle(h, self.dest_repr(dest)))
             }
             Op::NamespaceField(ns, field) => {
                 let idx = self.pools.intern_namespace_field(ns, field);
                 let i = self.iconst32(idx);
-                let h = self
-                    .call_shim("rt_namespace_field", &[self.ctx_val, i])
-                    .unwrap();
+                let h = self.call_fallible_shim("rt_namespace_field", &[self.ctx_val, i]);
                 Some(self.unbox_handle(h, self.dest_repr(dest)))
             }
             Op::MakeCell(v) => {
@@ -559,6 +621,10 @@ impl<'a, 'b> Translator<'a, 'b> {
         let addr = self
             .call_shim("rt_closure_code_addr", &[self.ctx_val, clo])
             .unwrap();
+        // An unresolvable closure latches an error and yields address 0; calling through it
+        // would jump to null, so take the error-exit before the `call_indirect` below.
+        let unresolved = self.builder.ins().icmp_imm(IntCC::Equal, addr, 0);
+        self.guard(unresolved);
         let (param_reprs, ret_repr) = match self.func.value_type(callee).clone() {
             Type::Function(ft) => (
                 ft.params.iter().map(repr_of).collect::<Vec<_>>(),
@@ -573,7 +639,9 @@ impl<'a, 'b> Translator<'a, 'b> {
             call_args.push(self.val(a));
         }
         let call = self.builder.ins().call_indirect(sigref, addr, &call_args);
-        self.builder.inst_results(call).first().copied()
+        let result = self.builder.inst_results(call).first().copied();
+        self.guard_errored();
+        result
     }
 
     fn translate_unary(&mut self, op: UnOp, v: ValueId) -> ClifValue {
@@ -634,10 +702,12 @@ impl<'a, 'b> Translator<'a, 'b> {
             };
             let result = self.builder.ins().fcmp(cc, a, b);
             // The native `fcmp` yields `false` for a NaN operand (IEEE unordered), but both
-            // interpreter oracles error on ordering a NaN. Latch that error so the JIT agrees;
-            // the relational result above stays native. (`==`/`!=` need no guard — IEEE
-            // equality matches the oracles' `partial_cmp`-free `scalar_eq`.)
-            self.call_shim("rt_check_compare", &[self.ctx_val, a, b]);
+            // interpreter oracles error on ordering a NaN. Detect that natively — a second
+            // `fcmp`, no call — and raise only on the failing edge, so ordinary comparisons
+            // cost one extra instruction rather than a trip into the runtime. (`==`/`!=` need
+            // no guard: IEEE equality matches the oracles' `partial_cmp`-free `scalar_eq`.)
+            let unordered = self.builder.ins().fcmp(FloatCC::Unordered, a, b);
+            self.guard_raising(unordered, "rt_raise_nan_compare");
             result
         } else {
             // String ordering via the runtime: rt_str_cmp -> {-1,0,1}.
@@ -724,14 +794,20 @@ impl<'a, 'b> Translator<'a, 'b> {
             call_args.push(self.val(a));
         }
         let call = self.builder.ins().call(fref, &call_args);
-        self.builder.inst_results(call).first().copied()
+        let result = self.builder.inst_results(call).first().copied();
+        // A callee that failed took its own error-exit and returned that block's default, which
+        // is indistinguishable from a real result — so propagate through the context flag.
+        self.guard_errored();
+        result
     }
 
     fn translate_const_ref(&mut self, name: &str) -> Option<ClifValue> {
         let id = self.cx.const_ids[name];
         let fref = self.script_ref(id);
         let call = self.builder.ins().call(fref, &[self.ctx_val]);
-        self.builder.inst_results(call).first().copied()
+        let result = self.builder.inst_results(call).first().copied();
+        self.guard_errored();
+        result
     }
 
     fn translate_call_host(&mut self, name: &str, args: &[ValueId], ret: Repr) -> ClifValue {
@@ -739,9 +815,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         let handles: Vec<ClifValue> = args.iter().map(|&a| self.box_handle(a)).collect();
         let (base, argc) = self.arg_array(&handles);
         let idc = self.iconst32(id);
-        let result = self
-            .call_shim("rt_call_host", &[self.ctx_val, idc, base, argc])
-            .unwrap();
+        let result = self.call_fallible_shim("rt_call_host", &[self.ctx_val, idc, base, argc]);
         self.unbox_handle(result, ret)
     }
 
@@ -760,9 +834,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         handles.extend(args.iter().map(|&a| self.box_handle(a)));
         let (base, argc) = self.arg_array(&handles);
         let idc = self.iconst32(id);
-        let result = self
-            .call_shim("rt_call_method", &[self.ctx_val, idc, base, argc])
-            .unwrap();
+        let result = self.call_fallible_shim("rt_call_method", &[self.ctx_val, idc, base, argc]);
         self.unbox_handle(result, ret)
     }
 
@@ -771,9 +843,8 @@ impl<'a, 'b> Translator<'a, 'b> {
         let handles: Vec<ClifValue> = args.iter().map(|&a| self.box_handle(a)).collect();
         let (base, argc) = self.arg_array(&handles);
         let idc = self.iconst32(id);
-        let result = self
-            .call_shim("rt_call_builtin_value", &[self.ctx_val, idc, base, argc])
-            .unwrap();
+        let result =
+            self.call_fallible_shim("rt_call_builtin_value", &[self.ctx_val, idc, base, argc]);
         self.unbox_handle(result, ret)
     }
 
@@ -807,9 +878,8 @@ impl<'a, 'b> Translator<'a, 'b> {
         let handles: Vec<ClifValue> = args.iter().map(|&a| self.box_handle(a)).collect();
         let (base, argc) = self.arg_array(&handles);
         let idc = self.iconst32(id);
-        let result = self
-            .call_shim("rt_call_builtin_member", &[self.ctx_val, idc, base, argc])
-            .unwrap();
+        let result =
+            self.call_fallible_shim("rt_call_builtin_member", &[self.ctx_val, idc, base, argc]);
         self.unbox_handle(result, ret)
     }
 

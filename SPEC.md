@@ -490,6 +490,27 @@ function pick_up(id)
 end
 ```
 
+### 7.3 Runtime errors
+
+Static typing rules out most failures, but a few survive to run time: an out-of-range array
+write, ordering a `NaN`, an unbound memory read, or an error returned by a host function or
+method.
+
+- **A runtime error aborts the call.** Evaluation stops at the failing operation. No later
+  statement in that function runs, no enclosing loop takes another iteration, and the error
+  propagates out through every caller — a script function that calls a failing one does not
+  continue either. The host sees `Err`; there is no in-script way to observe or recover from a
+  runtime error (`pcall` is not in the language, §8).
+- **The first error wins.** If an error is raised while one is already pending, the original is
+  the one reported.
+- **Effects already applied persist.** A call that fails partway leaves any host memory it
+  already wrote in its mutated state — there is no rollback. Only effects *before* the failing
+  operation are visible; effects that would have followed it never happen. Hosts that need
+  all-or-nothing updates must stage them (e.g. write through a method that commits at the end).
+
+These are the semantics every backend implements; they are what the three-oracle invariant
+(`Interpreter == Vm == JitModule`) is checked against, side effects included.
+
 ## 8. Rejected constructs (diagnostics, not silent)
 
 Each produces a targeted, span-pointing error:

@@ -420,7 +420,7 @@ impl JitModule {
         // bits-ABI word per declared parameter.
         let result = unsafe { tramp(ctx as *mut RtCtx, argv.as_ptr(), argv.len() as u32) };
 
-        if let Some(e) = ctx.error.take() {
+        if let Some(e) = ctx.take_error() {
             return Err(e);
         }
         Ok(ctx.decode_ret(result, ret))
@@ -468,7 +468,7 @@ impl JitModule {
                 _ => unreachable!("arity > MAX_DIRECT_ARGS is guarded by the caller"),
             }
         };
-        if let Some(e) = ctx.error.take() {
+        if let Some(e) = ctx.take_error() {
             return Err(e);
         }
         Ok(Value::Number(r))
@@ -528,7 +528,7 @@ impl JitModule {
         // bits-ABI word per declared (source-level) parameter.
         let result = unsafe { tramp(ctx as *mut RtCtx, env, argv.as_ptr(), argv.len() as u32) };
 
-        if let Some(e) = ctx.error.take() {
+        if let Some(e) = ctx.take_error() {
             return Err(e);
         }
         Ok(ctx.decode_ret(result, *ret))
@@ -693,8 +693,7 @@ fn declare_shims(
         ("rt_value_eq", &[I64, I64, I64], &[I8]),
         ("rt_truthy", &[I64, I64], &[I8]),
         ("rt_pow", &[F64, F64], &[F64]),
-        ("rt_errored", &[I64], &[I8]),
-        ("rt_check_compare", &[I64, F64, F64], &[]),
+        ("rt_raise_nan_compare", &[I64], &[]),
         ("rt_call_host", &[I64, I32, I64, I32], &[I64]),
         ("rt_call_method", &[I64, I32, I64, I32], &[I64]),
         ("rt_call_builtin_value", &[I64, I32, I64, I32], &[I64]),
