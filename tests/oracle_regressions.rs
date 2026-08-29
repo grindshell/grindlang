@@ -899,3 +899,69 @@ fn exact_arity_calls_still_succeed() {
         assert_eq!(c.expect("correct arity").to_string(), want);
     }
 }
+
+/// A map write goes through a *different* shim from a record-field write (`rt_map_set`, not
+/// `rt_field_set`), with its own constant check. Every other alias test writes a field or an
+/// array element, so nothing pinned this path.
+#[test]
+fn a_map_key_write_through_an_aliased_constant_is_refused() {
+    let src = "\
+C = { [\"a\"] = 1 }
+function f()
+  local t = C
+  t[\"a\"] = 2
+  return 0
+end
+";
+    let cfg = TypeConfig::default();
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("map-key write through an alias", &a, &b, &c);
+    let e = c.expect_err("a map constant must be unwritable through an alias");
+    assert!(
+        format!("{e}").contains("cannot modify a constant"),
+        "got {e:?}"
+    );
+}
+
+/// Reading a map constant stays legal, so the check above isn't rejecting the whole type.
+#[test]
+fn a_map_constant_is_readable() {
+    let src = "C = { [\"a\"] = 1 }\nfunction f()\n  local t = C\n  return t[\"a\"]\nend\n";
+    let cfg = TypeConfig::default();
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("map constant read", &a, &b, &c);
+    assert_eq!(c.expect("map read").to_string(), "1");
+}
+
+/// The freeze is scoped to the *invocation*, not to the function that read the constant: a
+/// callee's read must still forbid the caller's write. Nothing else pins that boundary — every
+/// other alias test reads and writes inside one function.
+#[test]
+fn a_constant_read_in_a_callee_is_frozen_for_the_caller() {
+    let src = "\
+C = {x = 1}
+function g() return C end
+function f()
+  local t = g()
+  t.x = 2
+  return t.x
+end
+";
+    let cfg = TypeConfig::default();
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("write to a constant returned by a callee", &a, &b, &c);
+    let e = c.expect_err("a constant returned by a callee must stay unwritable");
+    assert!(
+        format!("{e}").contains("cannot modify a constant"),
+        "got {e:?}"
+    );
+}

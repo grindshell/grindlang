@@ -719,7 +719,6 @@ fn declare_shims(
         ("rt_tuple_push", &[I64, I64, I64], &[]),
         ("rt_tuple_get", &[I64, I64, I32], &[I64]),
         ("rt_table_new", &[I64], &[I64]),
-        ("rt_table_set", &[I64, I64, I64, I64], &[]),
         ("rt_array_get", &[I64, I64, F64], &[I64]),
         ("rt_array_set", &[I64, I64, F64, I64], &[I64]),
         ("rt_map_get", &[I64, I64, I64], &[I64]),

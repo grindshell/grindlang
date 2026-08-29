@@ -529,15 +529,6 @@ pub unsafe extern "C" fn rt_table_new(ctx: *mut RtCtx) -> Handle {
     ctx!(ctx).intern(Value::empty_table())
 }
 
-pub unsafe extern "C" fn rt_table_set(ctx: *mut RtCtx, tbl: Handle, key: Handle, val: Handle) {
-    let ctx = ctx!(ctx);
-    let k = ctx.get(key).as_string();
-    let v = ctx.value(val);
-    if let (Some(k), Value::Table(t)) = (k, ctx.get(tbl)) {
-        t.borrow_mut().insert(k, v);
-    }
-}
-
 // ---- indexed access ---------------------------------------------------------
 
 pub unsafe extern "C" fn rt_array_get(ctx: *mut RtCtx, arr: Handle, idx: f64) -> Handle {
@@ -607,8 +598,23 @@ pub unsafe extern "C" fn rt_map_get(ctx: *mut RtCtx, map: Handle, key: Handle) -
     }
 }
 
-/// Assign through a map key (`m[k] = v`). Unlike [`rt_table_set`], which also builds table
-/// *literals*, this is only ever a user write, so it refuses one to a constant.
+/// Insert under a **dynamic** string key — the one thing [`rt_field_init`] can't do, since its
+/// key is a name-pool index fixed at compile time. Not a shim: generated code only ever reaches
+/// this through [`rt_map_set`].
+///
+/// # Safety
+/// `ctx` must be the live context pointer the shim was handed.
+unsafe fn table_insert(ctx: *mut RtCtx, tbl: Handle, key: Handle, val: Handle) {
+    let ctx = ctx!(ctx);
+    let k = ctx.get(key).as_string();
+    let v = ctx.value(val);
+    if let (Some(k), Value::Table(t)) = (k, ctx.get(tbl)) {
+        t.borrow_mut().insert(k, v);
+    }
+}
+
+/// Assign through a map key (`m[k] = v`). Always a user write — a map *literal* is built with
+/// [`rt_field_init`] — so it refuses a write to a constant.
 pub unsafe extern "C" fn rt_map_set(
     ctx: *mut RtCtx,
     map: Handle,
@@ -618,8 +624,8 @@ pub unsafe extern "C" fn rt_map_set(
     if let Some(e) = unsafe { reject_frozen(ctx, map) } {
         return e;
     }
-    // Same backing representation as a record/table write.
-    unsafe { rt_table_set(ctx, map, key, val) };
+    // A map shares the record/table backing representation.
+    unsafe { table_insert(ctx, map, key, val) };
     NIL
 }
 
@@ -942,7 +948,6 @@ pub fn shim_symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_tuple_push", rt_tuple_push as *const u8),
         ("rt_tuple_get", rt_tuple_get as *const u8),
         ("rt_table_new", rt_table_new as *const u8),
-        ("rt_table_set", rt_table_set as *const u8),
         ("rt_array_get", rt_array_get as *const u8),
         ("rt_array_set", rt_array_set as *const u8),
         ("rt_map_get", rt_map_get as *const u8),

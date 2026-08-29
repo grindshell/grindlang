@@ -58,10 +58,15 @@ fn repr_of(ty: &Type) -> Repr {
     Repr::of(ty)
 }
 
-/// A constant's return repr. Unknown names fall back to `Ptr`, the conservative choice: it only
-/// costs a cache lookup, whereas guessing scalar would drop a reference constant's identity.
+/// A constant's return repr.
+///
+/// Indexed, not defaulted: `const_rets` is filled for every constant in the program before any
+/// body is translated, and [`Translator::call_const_body`] indexes `const_ids` the same way one
+/// step later. A fallback here would not be conservative — guessing `Ptr` for a *scalar*
+/// constant makes [`Translator::translate_const_ref`] pass an `f64` where the memo path wants an
+/// `i64` handle, which fails cranelift's verifier rather than merely costing a lookup.
 fn repr_of_const(cx: &Context<'_>, name: &str) -> Repr {
-    cx.const_rets.get(name).copied().unwrap_or(Repr::Ptr)
+    cx.const_rets[name]
 }
 
 /// Build the typed signature of a script function: `(ctx, params...) -> ret`.
