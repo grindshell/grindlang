@@ -491,7 +491,10 @@ language's in-script discipline rather than silently coercing:
 
 - **Exact arity.** A call must supply exactly as many arguments as the export declares — the
   same rule §5.5 enforces in-script, now enforced at the host boundary too. A mismatch is a
-  call error, not a silent pad-with-`nil` / drop-surplus.
+  call error, not a silent pad-with-`nil` / drop-surplus. The rule covers host-invoking a
+  returned closure (`Module::call_value`) as well, checked against the closure's *source-level*
+  parameters — its captured environment is not one of them. Reading a constant through the same
+  entry point takes no arguments at all, so passing any is likewise an error.
 - **Argument types.** An argument's runtime shape must match the parameter's declared type. A
   string passed where `number` is declared is a call error, not a silent `0`. The check happens
   at the boundary because a scalar argument is converted to raw bits on the way in, leaving

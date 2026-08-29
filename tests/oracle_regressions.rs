@@ -851,3 +851,51 @@ fn a_parameter_type_is_always_justified_by_use() {
         .expect_err("an undetermined parameter type must be rejected");
     assert!(format!("{err:?}").contains("E0410"), "got {err:?}");
 }
+
+// ---- Found reviewing the fixes above --------------------------------------
+
+/// `SPEC.md` §7.1's *other* boundary rule. Exact arity was enforced by the JIT alone: both
+/// interpreters padded a missing argument with `nil` and dropped surplus ones, so a call the
+/// JIT rejected returned a value from the oracles. Found while reviewing the finding-5 fix,
+/// which added the argument-*type* rule one bullet below this one in the same list.
+#[test]
+fn surplus_arguments_are_rejected_by_every_backend() {
+    let src = "C = {x = 1}\nN = 7\nfunction f() return 1 end\nfunction g(n) return n + 1 end\n";
+    let cfg = TypeConfig::default();
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    // A function taking none, a function taking one, and both flavors of constant export.
+    for (export, args) in [
+        ("f", vec![Value::Number(1.0)]),
+        ("g", vec![Value::Number(1.0), Value::Number(2.0)]),
+        ("g", vec![]),
+        ("C", vec![Value::Number(1.0)]),
+        ("N", vec![Value::Number(1.0)]),
+    ] {
+        let a = interp.call(export, args.clone());
+        let b = vm.call(export, args.clone());
+        let c = jit.call(export, args.clone());
+        let label = format!("`{export}` with {} argument(s)", args.len());
+        assert_agree(&label, &a, &b, &c);
+        assert!(c.is_err(), "{label}: wrong arity must be a call error");
+    }
+}
+
+/// The arity rule must not fire on a *correct* call — the point is to reject a mismatch, not to
+/// make the boundary stricter than the export's own signature.
+#[test]
+fn exact_arity_calls_still_succeed() {
+    let src = "C = {x = 1}\nfunction f() return 1 end\nfunction g(n) return n + 1 end\n";
+    let cfg = TypeConfig::default();
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    for (export, args, want) in [
+        ("f", vec![], "1"),
+        ("g", vec![Value::Number(1.0)], "2"),
+        ("C", vec![], "{x = 1}"),
+    ] {
+        let a = interp.call(export, args.clone());
+        let b = vm.call(export, args.clone());
+        let c = jit.call(export, args);
+        assert_agree(export, &a, &b, &c);
+        assert_eq!(c.expect("correct arity").to_string(), want);
+    }
+}

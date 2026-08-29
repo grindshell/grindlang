@@ -264,6 +264,7 @@ impl<'a> Interpreter<'a> {
             .get(name)
             .cloned()
             .ok_or_else(|| RunError::UnknownExport(name.to_string()))?;
+        Self::check_arity(name, Self::export_arity(&export), args.len())?;
         self.begin_call();
         match export {
             Export::Const(n) => self.const_value(&n),
@@ -281,6 +282,34 @@ impl<'a> Interpreter<'a> {
         self.frozen.clear();
     }
 
+    /// How many arguments an export accepts, or `None` when there is no declared arity to check
+    /// (a host function reached through the export table — the host owns its own signature).
+    /// A constant, or any other plain value, is *read* rather than called, so it takes none.
+    fn export_arity(export: &Export) -> Option<usize> {
+        match export {
+            Export::Value(Value::Function(f)) => Some(f.params.len()),
+            Export::Value(Value::Native(_)) => None,
+            _ => Some(0),
+        }
+    }
+
+    /// Enforce exact arity at the host boundary (`SPEC.md` §7.1): a mismatch is a call error,
+    /// never a silent pad-with-`nil` or drop-surplus.
+    ///
+    /// This lives at the boundary entry points rather than in [`call_value`](Self::call_value),
+    /// which in-script calls also reach — those have already had their arity fixed statically by
+    /// the checker (`E0430`), so re-checking them would be dead work in the hot path.
+    fn check_arity(name: &str, expected: Option<usize>, got: usize) -> Result<(), RunError> {
+        match expected {
+            Some(expected) if expected != got => Err(RunError::ArityMismatch {
+                name: name.to_string(),
+                expected,
+                got,
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// Host-invoke a function value previously returned by [`call`](Self::call) (e.g. a
     /// closure). Mirrors the JIT's `call_value`, so the differential harness can validate
     /// host-invoke across all three backends.
@@ -289,6 +318,11 @@ impl<'a> Interpreter<'a> {
         callee: Value,
         args: Vec<Value>,
     ) -> Result<Value, RunError> {
+        let arity = match &callee {
+            Value::Function(f) => Some(f.params.len()),
+            _ => None,
+        };
+        Self::check_arity("closure", arity, args.len())?;
         self.begin_call();
         self.call_value(&callee, args)
     }

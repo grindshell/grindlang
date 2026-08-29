@@ -1546,6 +1546,24 @@ mod vm {
         values: HashMap<ValueId, Value>,
     }
 
+    /// Enforce exact arity at the host boundary (`SPEC.md` §7.1): a mismatch is a call error,
+    /// never a silent pad-with-`nil` or drop-surplus.
+    ///
+    /// Checked at the boundary entry points rather than in
+    /// [`run_function`](Vm::run_function), which in-script calls also reach — those have already
+    /// had their arity fixed statically by the checker (`E0430`), so re-checking them would be
+    /// dead work in the hot path.
+    fn check_arity(name: &str, expected: usize, got: usize) -> Result<(), RunError> {
+        if expected != got {
+            return Err(RunError::ArityMismatch {
+                name: name.to_string(),
+                expected,
+                got,
+            });
+        }
+        Ok(())
+    }
+
     impl<'a> Vm<'a> {
         pub fn new(program: &'a Program) -> Self {
             Vm {
@@ -1594,9 +1612,14 @@ mod vm {
             match target {
                 ExportTarget::Function(f) => {
                     let func = self.lookup_function(f)?;
+                    // A constant is read, not called, so its arity is zero.
+                    check_arity(name, func.params.len(), args.len())?;
                     self.run_function(func, args)
                 }
-                ExportTarget::Const(c) => self.const_value(c),
+                ExportTarget::Const(c) => {
+                    check_arity(name, 0, args.len())?;
+                    self.const_value(c)
+                }
             }
         }
 
@@ -1615,6 +1638,9 @@ mod vm {
                 }
             };
             let func = self.lookup_function(&code)?;
+            // `params[0]` is the hidden env (the closure value itself), so the source-level
+            // arity the host must match is one less.
+            check_arity(&code, func.params.len().saturating_sub(1), args.len())?;
             let mut argv = Vec::with_capacity(args.len() + 1);
             argv.push(callee);
             argv.extend(args);
