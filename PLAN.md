@@ -185,13 +185,26 @@ Two things surfaced while doing this, both fixed:
 - `SPEC.md` documented the *typing* of `==` but never its *semantics*, which is what let that
   drift go unnoticed. §3.5 now states value-vs-identity explicitly.
 
-**Still deferred:** the write rejection is syntactic, so `local t = C; t.x = …` escapes it. It
-is now well-defined and consistent across backends (all three mutate that call's memoized
-constant, and the next call starts fresh), just not rejected. Closing it means either making
-composite constants immutable at runtime — a frozen marker on `Value::Table`/`Value::Array`,
-touching every construction site — or restricting how a composite constant may escape, which
-costs read-only aliasing and does not generalize to passing one to a function or returning it.
-Pinned by `a_write_through_an_aliased_constant_agrees_and_does_not_persist`.
+The syntactic check keys on the assignment target's root, so `local t = C; t.x = …` gets past
+it. That is closed at run time: when a backend memoizes a constant it records the addresses of
+every table/array reachable from it (`Value::collect_reachable`), and the write paths refuse an
+assignment whose base is in that set. Nested tables and array elements are covered, reads
+through an alias are not affected, and the set is cleared with the memo each call.
+
+The escape-restriction alternative was rejected: forbidding a composite constant from appearing
+anywhere but as the base of a read would have made `local a = C; local b = C; a == b`
+unexpressible, i.e. it would have made the per-call identity above unobservable rather than
+correct. Freezing keeps aliasing available for reads, which is what makes identity meaningful.
+
+Cost is nil in the common case. The frozen set is empty for any call that has read no composite
+constant, so the write path pays one predictable branch; the `call/jit/fieldwrite` benchmark
+(added with this work, since every prior call benchmark was read-only or scalar) measures no
+change. Only a module that actually reads a composite constant pays a hash lookup per write.
+
+The one thing a frozen *marker on the value* would buy over this address set is protection for
+a constant escaping to the host — the host holds a `Value` and can mutate it through `Rc`
+regardless. That is not reachable from script code, and the host is trusted (`PLAN.md` §1
+trust model), so it is left alone.
 
 ### Phase 4 — Reference interpreter (semantics oracle)
 - Tree-walking interpreter over the typed AST/IR implementing the canonical semantics,

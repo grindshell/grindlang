@@ -1536,6 +1536,9 @@ mod vm {
         /// (reference values compare by identity) without letting it survive between calls,
         /// which `SPEC.md` §1 reserves for host memory.
         const_cache: HashMap<String, Value>,
+        /// Allocations reachable from the constants read so far this call, which may not be
+        /// written to (`SPEC.md` §3). Cleared alongside `const_cache`.
+        frozen: std::collections::HashSet<usize>,
     }
 
     struct Activation {
@@ -1551,6 +1554,7 @@ mod vm {
                 methods: HashMap::new(),
                 memory: HashMap::new(),
                 const_cache: HashMap::new(),
+                frozen: std::collections::HashSet::new(),
             }
         }
 
@@ -1581,6 +1585,7 @@ mod vm {
         /// Call an exported function by name.
         pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RunError> {
             self.const_cache.clear();
+            self.frozen.clear();
             let target = self
                 .program
                 .exports
@@ -1599,6 +1604,7 @@ mod vm {
         /// cells are shared (by `Rc`), so upvalue writes persist across host calls.
         pub fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RunError> {
             self.const_cache.clear();
+            self.frozen.clear();
             let code = match &callee {
                 Value::Closure(c) => c.code.clone(),
                 other => {
@@ -1632,8 +1638,21 @@ mod vm {
                 .get(name)
                 .ok_or_else(|| RunError::Internal(format!("missing IR constant `{name}`")))?;
             let v = self.run_function(func, Vec::new())?;
+            // Everything inside the constant becomes unwritable for the rest of the call.
+            v.collect_reachable(&mut self.frozen);
             self.const_cache.insert(name.to_string(), v.clone());
             Ok(v)
+        }
+
+        /// Refuse a write to a value that is (part of) a constant. `E0307` rejects the syntactic
+        /// form at check time; this catches the same write reached through an alias.
+        fn reject_frozen(&self, base: &Value) -> Result<(), RunError> {
+            if base.is_frozen(&self.frozen) {
+                return Err(RunError::Runtime(
+                    crate::value::IMMUTABLE_CONSTANT.to_string(),
+                ));
+            }
+            Ok(())
         }
 
         fn run_function(&mut self, func: &Function, args: Vec<Value>) -> Result<Value, RunError> {
@@ -1750,6 +1769,7 @@ mod vm {
                     let b = self.val(act, *base)?;
                     let i = self.val(act, *idx)?;
                     let val = self.val(act, *v)?;
+                    self.reject_frozen(&b)?;
                     array_set(&b, &i, val)?;
                     Value::Nil
                 }
@@ -1762,6 +1782,7 @@ mod vm {
                     let b = self.val(act, *base)?;
                     let k = self.val(act, *key)?;
                     let val = self.val(act, *v)?;
+                    self.reject_frozen(&b)?;
                     table_set(&b, &k, val)?;
                     Value::Nil
                 }
@@ -1772,6 +1793,7 @@ mod vm {
                 Op::FieldSet(base, name, v) => {
                     let b = self.val(act, *base)?;
                     let val = self.val(act, *v)?;
+                    self.reject_frozen(&b)?;
                     table_set(&b, &Value::string(name.clone()), val)?;
                     Value::Nil
                 }

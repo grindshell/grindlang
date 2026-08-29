@@ -112,6 +112,9 @@ pub struct Interpreter<'a> {
     /// values compare by identity) without letting it survive between calls, which `SPEC.md`
     /// §1 reserves for host memory.
     consts: HashMap<String, Value>,
+    /// Allocations reachable from the constants read so far this call, which may not be written
+    /// to (`SPEC.md` §3). Cleared alongside [`consts`](Self::consts).
+    frozen: std::collections::HashSet<usize>,
     /// The public surface callable via [`Interpreter::call`] — the curated export table if
     /// present, otherwise every top-level declaration.
     exports: HashMap<String, Export>,
@@ -135,6 +138,7 @@ impl<'a> Interpreter<'a> {
             funcs: HashMap::new(),
             const_exprs: HashMap::new(),
             consts: HashMap::new(),
+            frozen: std::collections::HashSet::new(),
             exports: HashMap::new(),
             host: HashMap::new(),
             memory: HashMap::new(),
@@ -213,6 +217,8 @@ impl<'a> Interpreter<'a> {
         let evaluated = self.eval_expr(&expr);
         self.env = saved;
         let v = evaluated?;
+        // Everything inside the constant becomes unwritable for the rest of the call.
+        v.collect_reachable(&mut self.frozen);
         self.consts.insert(name.to_string(), v.clone());
         Ok(v)
     }
@@ -272,6 +278,7 @@ impl<'a> Interpreter<'a> {
     /// re-evaluates what it reads (`SPEC.md` §1 — only host memory survives between calls).
     fn begin_call(&mut self) {
         self.consts.clear();
+        self.frozen.clear();
     }
 
     /// Host-invoke a function value previously returned by [`call`](Self::call) (e.g. a
@@ -611,11 +618,23 @@ impl<'a> Interpreter<'a> {
 
     // ---- assignment targets --------------------------------------------------
 
+    /// Refuse a write to a value that is (part of) a constant. `E0307` rejects the syntactic
+    /// form at check time; this catches the same write reached through an alias.
+    fn reject_frozen(&self, base: &Value) -> Result<(), RunError> {
+        if base.is_frozen(&self.frozen) {
+            return Err(RunError::Runtime(
+                crate::value::IMMUTABLE_CONSTANT.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn assign_to(&mut self, target: &Expr, value: Value) -> Result<(), RunError> {
         match &target.kind {
             ExprKind::Name(_) => self.assign_symbol(target.span, value),
             ExprKind::Field { base, name } => {
                 let base_v = self.eval_expr(base)?;
+                self.reject_frozen(&base_v)?;
                 match base_v {
                     Value::Table(t) => {
                         t.borrow_mut().insert(name.node.clone(), value);
@@ -630,6 +649,7 @@ impl<'a> Interpreter<'a> {
             }
             ExprKind::Index { base, index } => {
                 let base_v = self.eval_expr(base)?;
+                self.reject_frozen(&base_v)?;
                 match base_v {
                     Value::Array(a) => {
                         let idx = self.eval_number(index)?;

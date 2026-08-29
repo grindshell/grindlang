@@ -59,6 +59,23 @@ function fieldsum(n)
   return s
 end";
 
+/// The write counterpart of `fieldsum`: a field and an array element assigned per iteration.
+/// Assignment carries checks that reads do not — array bounds, and the constant-immutability
+/// guard — so a read-only benchmark cannot see their cost.
+const FIELDWRITE: &str = "\
+function fieldwrite(n)
+  local t = {a = 0, b = 0}
+  local arr = {0, 0}
+  local i = 1
+  while i <= n do
+    t.a = i
+    t.b = t.a
+    arr[1] = i
+    i = i + 1
+  end
+  return t.b
+end";
+
 // ---- workloads (Luau twins) -------------------------------------------------
 
 const FIB_LUAU: &str = "\
@@ -98,6 +115,20 @@ function fieldsum(n)
   return s
 end";
 
+const FIELDWRITE_LUAU: &str = "\
+function fieldwrite(n)
+  local t = {a = 0, b = 0}
+  local arr = {0, 0}
+  local i = 1
+  while i <= n do
+    t.a = i
+    t.b = t.a
+    arr[1] = i
+    i = i + 1
+  end
+  return t.b
+end";
+
 /// The three workloads as `(label, grindlang src, luau src, export name, args)`.
 fn workloads() -> Vec<(
     &'static str,
@@ -121,6 +152,13 @@ fn workloads() -> Vec<(
             FIELDSUM,
             FIELDSUM_LUAU,
             "fieldsum",
+            vec![1000.0],
+        ),
+        (
+            "fieldwrite",
+            FIELDWRITE,
+            FIELDWRITE_LUAU,
+            "fieldwrite",
             vec![1000.0],
         ),
     ]

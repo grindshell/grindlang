@@ -168,6 +168,10 @@ pub struct RtCtx {
     /// survives between calls (§1). Populated lazily, so a constant a call never reads costs
     /// nothing.
     const_cache: Vec<Option<Handle>>,
+    /// Allocations reachable from the constants read so far this call, which may not be written
+    /// to (`SPEC.md` §3). Empty for a call that has read no composite constant, which is what
+    /// keeps the check on the write path down to one branch.
+    frozen: std::collections::HashSet<usize>,
     /// The compiled module this context belongs to. Stamped into every closure
     /// [`rt_closure_new`] builds, and compared against a closure's own stamp before invoking it
     /// ([`rt_closure_code_addr`]).
@@ -242,6 +246,7 @@ impl RtCtx {
             errored: 0,
             values: vec![Value::Nil],
             const_cache: vec![None; pools.consts.len()],
+            frozen: std::collections::HashSet::new(),
             pools,
             host,
             methods,
@@ -313,6 +318,7 @@ impl RtCtx {
         // Constants are memoized per call: the next invocation re-evaluates what it reads, so
         // no constant (and nothing reachable from one) survives between calls.
         self.const_cache.fill(None);
+        self.frozen.clear();
         self.error = None;
         self.errored = 0;
     }
@@ -421,11 +427,34 @@ pub unsafe extern "C" fn rt_const_cached(ctx: *mut RtCtx, id: u32) -> Handle {
     }
 }
 
-/// Memoize a freshly evaluated constant for the rest of this call.
+/// Memoize a freshly evaluated constant for the rest of this call, and mark everything inside
+/// it unwritable — the runtime half of a constant's immutability (`SPEC.md` §3), which catches
+/// a write that reached it through an alias and so slipped past `E0307`.
 pub unsafe extern "C" fn rt_const_store(ctx: *mut RtCtx, id: u32, h: Handle) {
-    if let Some(slot) = ctx!(ctx).const_cache.get_mut(id as usize) {
+    let ctx = ctx!(ctx);
+    let v = ctx.value(h);
+    v.collect_reachable(&mut ctx.frozen);
+    if let Some(slot) = ctx.const_cache.get_mut(id as usize) {
         *slot = Some(h);
     }
+}
+
+/// Latch the immutable-constant error if `h` refers to (part of) a constant, returning [`ERR`]
+/// for the caller to propagate. `None` means the write may proceed.
+///
+/// # Safety
+/// `ctx` must be the live context pointer the shim was handed.
+unsafe fn reject_frozen(ctx: *mut RtCtx, h: Handle) -> Option<Handle> {
+    let ctx = ctx!(ctx);
+    if ctx.frozen.is_empty() {
+        return None; // the common case: no composite constant read this call
+    }
+    if ctx.get(h).is_frozen(&ctx.frozen) {
+        return Some(ctx.fail(RunError::Runtime(
+            crate::value::IMMUTABLE_CONSTANT.to_string(),
+        )));
+    }
+    None
 }
 
 /// Read a host memory binding. A binding the host declared but never provided is an error at
@@ -535,6 +564,9 @@ pub unsafe extern "C" fn rt_array_set(
     idx: f64,
     val: Handle,
 ) -> Handle {
+    if let Some(e) = unsafe { reject_frozen(ctx, arr) } {
+        return e;
+    }
     let ctx = ctx!(ctx);
     let v = ctx.value(val);
     let a = match ctx.get(arr) {
@@ -575,9 +607,20 @@ pub unsafe extern "C" fn rt_map_get(ctx: *mut RtCtx, map: Handle, key: Handle) -
     }
 }
 
-pub unsafe extern "C" fn rt_map_set(ctx: *mut RtCtx, map: Handle, key: Handle, val: Handle) {
+/// Assign through a map key (`m[k] = v`). Unlike [`rt_table_set`], which also builds table
+/// *literals*, this is only ever a user write, so it refuses one to a constant.
+pub unsafe extern "C" fn rt_map_set(
+    ctx: *mut RtCtx,
+    map: Handle,
+    key: Handle,
+    val: Handle,
+) -> Handle {
+    if let Some(e) = unsafe { reject_frozen(ctx, map) } {
+        return e;
+    }
     // Same backing representation as a record/table write.
-    unsafe { rt_table_set(ctx, map, key, val) }
+    unsafe { rt_table_set(ctx, map, key, val) };
+    NIL
 }
 
 pub unsafe extern "C" fn rt_field_get(ctx: *mut RtCtx, base: Handle, name_idx: u32) -> Handle {
@@ -590,13 +633,29 @@ pub unsafe extern "C" fn rt_field_get(ctx: *mut RtCtx, base: Handle, name_idx: u
     }
 }
 
-pub unsafe extern "C" fn rt_field_set(ctx: *mut RtCtx, base: Handle, name_idx: u32, val: Handle) {
+/// Populate a field while *building* a table literal. Never a user write — the table does not
+/// exist outside the constructor yet — so it needs no immutability check.
+pub unsafe extern "C" fn rt_field_init(ctx: *mut RtCtx, base: Handle, name_idx: u32, val: Handle) {
     let ctx = ctx!(ctx);
     let name = ctx.pools.names[name_idx as usize].clone();
     let v = ctx.value(val);
     if let Value::Table(t) = ctx.get(base) {
         t.borrow_mut().insert(name, v);
     }
+}
+
+/// Assign to a field (`t.x = v`). A user write, so it refuses one to a constant.
+pub unsafe extern "C" fn rt_field_set(
+    ctx: *mut RtCtx,
+    base: Handle,
+    name_idx: u32,
+    val: Handle,
+) -> Handle {
+    if let Some(e) = unsafe { reject_frozen(ctx, base) } {
+        return e;
+    }
+    unsafe { rt_field_init(ctx, base, name_idx, val) };
+    NIL
 }
 
 pub unsafe extern "C" fn rt_map_keys(ctx: *mut RtCtx, base: Handle) -> Handle {
@@ -889,6 +948,7 @@ pub fn shim_symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_map_get", rt_map_get as *const u8),
         ("rt_map_set", rt_map_set as *const u8),
         ("rt_field_get", rt_field_get as *const u8),
+        ("rt_field_init", rt_field_init as *const u8),
         ("rt_field_set", rt_field_set as *const u8),
         ("rt_map_keys", rt_map_keys as *const u8),
         ("rt_len", rt_len as *const u8),

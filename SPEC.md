@@ -129,10 +129,10 @@ exportstat ::= 'return' tablecons [';']
   through a constant is of course fine, and writing through **memory** stays fine (§7) — the
   rule keys on what the assignment target is rooted in, not on its shape.
 
-  _(v1 limitation: the check is syntactic, so binding a composite constant to a local first
-  (`local t = C; t.x = …`) is not caught. It is well-defined — see the per-call rule below —
-  just not rejected. Closing it needs runtime immutability for composite constants or a
-  restriction on how one may escape; see `PLAN.md` Phase 3.)_
+  The guarantee holds **however the constant was reached**, not just syntactically. Binding one
+  to a local first (`local t = C; t.x = …`) gets past `E0307`, which keys on the assignment
+  target's root, and is refused at run time instead — as is a write into a constant's *nested*
+  table or array. Reading through an alias stays fine; only writing is refused.
 - A constant is **memoized per call**. Within one invocation every read of `C` yields the same
   value — so `C == C`, which matters because reference values compare by *identity* (§3.5), not
   structurally — and the memo is discarded when the call ends, so no constant (nor anything

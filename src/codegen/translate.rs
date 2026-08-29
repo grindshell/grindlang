@@ -547,7 +547,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 let b = self.val(*base);
                 let k = self.val(*key);
                 let val = self.box_handle(*v);
-                self.call_shim("rt_map_set", &[self.ctx_val, b, k, val]);
+                self.call_fallible_shim("rt_map_set", &[self.ctx_val, b, k, val]);
                 None
             }
             Op::FieldGet(base, name) => {
@@ -564,7 +564,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 let idx = self.pools.intern_name(name);
                 let i = self.iconst32(idx);
                 let val = self.box_handle(*v);
-                self.call_shim("rt_field_set", &[self.ctx_val, b, i, val]);
+                self.call_fallible_shim("rt_field_set", &[self.ctx_val, b, i, val]);
                 None
             }
             Op::MapKeys(base) => {
@@ -804,7 +804,8 @@ impl<'a, 'b> Translator<'a, 'b> {
             let idx = self.pools.intern_name(k);
             let i = self.iconst32(idx);
             let h = self.box_handle(*v);
-            self.call_shim("rt_field_set", &[self.ctx_val, tbl, i, h]);
+            // Building the literal, not assigning through it — no immutability check needed.
+            self.call_shim("rt_field_init", &[self.ctx_val, tbl, i, h]);
         }
         tbl
     }

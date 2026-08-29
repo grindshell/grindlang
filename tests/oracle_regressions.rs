@@ -621,12 +621,11 @@ fn a_constant_read_as_an_export_matches_the_in_script_read() {
     }
 }
 
-/// Aliasing a constant into a local escapes the syntactic `E0307` check, so this is the one
-/// path that can still write through a constant. Per-call memoization makes all three backends
-/// agree on what that does — and, because the cache dies with the call, the write does not
-/// leak into the next one, which is what `SPEC.md` §1 requires.
+/// Aliasing a constant into a local gets past the syntactic `E0307` check, which keys on the
+/// *root* of the assignment target. The write is refused at runtime instead, so a constant is
+/// immutable however it was reached — matching what `E0307`'s message and `SPEC.md` §3 claim.
 #[test]
-fn a_write_through_an_aliased_constant_agrees_and_does_not_persist() {
+fn a_write_through_an_aliased_constant_is_refused() {
     let src = "\
 C = {x = 1}
 function f()
@@ -636,22 +635,67 @@ function f()
 end
 ";
     let cfg = TypeConfig::default();
-    if grindlang::analyze(src, &cfg).is_err() {
-        return; // a later change may close the alias hole outright
-    }
     let (mut interp, mut vm, mut jit) = triple(src, &cfg);
-    // Repeat: each call must start from the constant's declared value, not the mutated one.
+    // Repeated, because a per-call frozen set that leaked would change the verdict on call 2.
     for i in 0..3 {
         let a = interp.call("f", vec![]);
         let b = vm.call("f", vec![]);
         let c = jit.call("f", vec![]);
         assert_agree(&format!("aliased write, call {i}"), &a, &b, &c);
-        assert_eq!(
-            c.expect("aliased write").to_string(),
-            "2",
-            "call {i}: a constant leaked across calls"
+        let e = c.expect_err("writing through an aliased constant must fail");
+        assert!(
+            format!("{e}").contains("cannot modify a constant"),
+            "call {i}: got {e:?}"
         );
     }
+}
+
+/// The freeze reaches *into* a constant, not just its outermost table: a nested table and an
+/// array element are equally unwritable through an alias.
+#[test]
+fn a_write_into_a_nested_constant_is_refused() {
+    for (label, src) in [
+        (
+            "nested table",
+            "C = {a = {b = 1}}\nfunction f()\n  local t = C.a\n  t.b = 2\n  return C.a.b\nend\n",
+        ),
+        (
+            "array element",
+            "C = {arr = {1, 2}}\nfunction f()\n  local t = C.arr\n  t[1] = 9\n  return C.arr[1]\nend\n",
+        ),
+    ] {
+        let cfg = TypeConfig::default();
+        let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+        let a = interp.call("f", vec![]);
+        let b = vm.call("f", vec![]);
+        let c = jit.call("f", vec![]);
+        assert_agree(label, &a, &b, &c);
+        assert!(c.is_err(), "{label}: a nested constant must be unwritable");
+    }
+}
+
+/// The freeze must not leak onto ordinary tables. A module that *has* a constant still writes
+/// freely to everything else, including a table built with the same shape.
+#[test]
+fn freezing_a_constant_does_not_freeze_other_tables() {
+    let src = "\
+C = {x = 1}
+function f()
+  local t = {x = C.x}
+  t.x = t.x + 1
+  local arr = {1, 2}
+  arr[1] = 9
+  return t.x
+end
+";
+    let cfg = TypeConfig::default();
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("write to a normal table alongside a constant", &a, &b, &c);
+    // Reaching the return at all proves the array write was allowed too.
+    assert_eq!(c.expect("normal write").to_string(), "2");
 }
 
 /// Reference equality is by `Rc` identity in every backend. Found while fixing the constant

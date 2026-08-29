@@ -133,7 +133,76 @@ pub struct ClosureObj {
     pub origin: Option<Rc<dyn Any>>,
 }
 
+/// The error every backend raises when a script writes through a constant.
+///
+/// `E0307` rejects the syntactic form (`C.x = …`) at check time, but that check keys on the
+/// *root* of the assignment target, so aliasing a constant into a local first gets past it.
+/// This is the runtime half that makes "immutable all the way down" (`SPEC.md` §3) true however
+/// the constant was reached.
+#[cfg(any(feature = "interp", feature = "jit"))]
+pub const IMMUTABLE_CONSTANT: &str = "cannot modify a constant: constants are immutable, \
+     including through an alias. Use host memory (`SPEC.md` §7) for state that changes.";
+
 impl Value {
+    /// Collect the address of every table/array allocation reachable from this value.
+    ///
+    /// A backend calls this on a constant when it memoizes it, and refuses writes to anything
+    /// in the resulting set for the rest of the call. Addresses are stable to compare because
+    /// the memo keeps every one of these allocations alive for exactly as long as the set does,
+    /// so nothing can be freed and another object land at the same address.
+    ///
+    /// Recursion terminates on its own: a value already in the set is not descended into, and a
+    /// `constexpr` builds only from literals so it cannot be cyclic anyway.
+    #[cfg(any(feature = "interp", feature = "jit"))]
+    pub fn collect_reachable(&self, out: &mut std::collections::HashSet<usize>) {
+        // A container already recorded has had its contents walked. Stopping here is what makes
+        // this terminate, cycle or not.
+        if let Some(addr) = self.container_addr()
+            && !out.insert(addr)
+        {
+            return;
+        }
+        match self {
+            Value::Table(t) => {
+                for v in t.borrow().values() {
+                    v.collect_reachable(out);
+                }
+            }
+            Value::Array(a) => {
+                for v in a.borrow().iter() {
+                    v.collect_reachable(out);
+                }
+            }
+            // A tuple is never mutated after construction, so it needs no address of its own —
+            // but a value inside one still does.
+            Value::Tuple(t) => {
+                for v in t.borrow().iter() {
+                    v.collect_reachable(out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// This value's allocation address if it is a mutable container, for testing membership in
+    /// a set built by [`collect_reachable`](Self::collect_reachable).
+    #[cfg(any(feature = "interp", feature = "jit"))]
+    pub fn container_addr(&self) -> Option<usize> {
+        match self {
+            Value::Table(t) => Some(Rc::as_ptr(t) as *const () as usize),
+            Value::Array(a) => Some(Rc::as_ptr(a) as *const () as usize),
+            _ => None,
+        }
+    }
+
+    /// Whether writing to this value is forbidden because it is (part of) a constant.
+    #[cfg(any(feature = "interp", feature = "jit"))]
+    pub fn is_frozen(&self, frozen: &std::collections::HashSet<usize>) -> bool {
+        // The common case is a module with no composite constants, where the set is empty and
+        // this costs one predictable branch.
+        !frozen.is_empty() && self.container_addr().is_some_and(|a| frozen.contains(&a))
+    }
+
     /// Grindlang `==`: scalars compare **by value**, reference types **by `Rc` identity** (Lua
     /// semantics) — so two structurally identical tables are different values, and a table is
     /// equal to itself however it was reached.
