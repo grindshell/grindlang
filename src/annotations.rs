@@ -94,7 +94,10 @@ pub fn parse_doc_block(docs: &[DocComment]) -> (FnAnnotations, Vec<Diagnostic>) 
 /// on malformed input (the caller attaches a span).
 pub fn parse_type_ann(s: &str) -> Result<TypeAnn, String> {
     let toks = tokenize(s)?;
-    let mut p = TypeParser { toks: &toks, pos: 0 };
+    let mut p = TypeParser {
+        toks: &toks,
+        pos: 0,
+    };
     let ty = p.parse_type()?;
     if p.pos != p.toks.len() {
         return Err(format!("unexpected trailing `{}`", desc(&p.toks[p.pos])));
@@ -177,7 +180,9 @@ fn tokenize(s: &str) -> Result<Vec<Tk>, String> {
                 while i < b.len() && is_ident_continue(b[i]) {
                     i += 1;
                 }
-                out.push(Tk::Ident(String::from_utf8_lossy(&b[start..i]).into_owned()));
+                out.push(Tk::Ident(
+                    String::from_utf8_lossy(&b[start..i]).into_owned(),
+                ));
             }
             _ => return Err(format!("unexpected character `{}`", c as char)),
         }

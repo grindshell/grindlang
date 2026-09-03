@@ -857,11 +857,10 @@ impl<'a> Interpreter<'a> {
         let recv = self.eval_expr(receiver)?;
         let mut argv = self.eval_list(args)?;
         argv.insert(0, recv);
-        let f = self
-            .methods
-            .get(&symbol)
-            .cloned()
-            .ok_or_else(|| RunError::Runtime(format!("memory method `{symbol}` was not set")))?;
+        let f =
+            self.methods.get(&symbol).cloned().ok_or_else(|| {
+                RunError::Runtime(format!("memory method `{symbol}` was not set"))
+            })?;
         f(&argv)
     }
 

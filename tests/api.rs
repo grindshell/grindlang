@@ -8,11 +8,11 @@
 
 use std::collections::BTreeMap;
 
+use grindlang::FnType;
+use grindlang::RunError;
 use grindlang::Type;
 use grindlang::Value;
 use grindlang::api::{CallError, Engine, MarshalError};
-use grindlang::FnType;
-use grindlang::RunError;
 
 /// Typed args in, typed result out, plus a registered infallible host function.
 #[test]
@@ -75,7 +75,11 @@ fn call_with_wrong_arity_is_an_error() {
     assert!(
         matches!(
             too_few,
-            CallError::Run(RunError::ArityMismatch { expected: 2, got: 1, .. })
+            CallError::Run(RunError::ArityMismatch {
+                expected: 2,
+                got: 1,
+                ..
+            })
         ),
         "got {too_few:?}"
     );
@@ -85,7 +89,11 @@ fn call_with_wrong_arity_is_an_error() {
     assert!(
         matches!(
             too_many,
-            CallError::Run(RunError::ArityMismatch { expected: 2, got: 3, .. })
+            CallError::Run(RunError::ArityMismatch {
+                expected: 2,
+                got: 3,
+                ..
+            })
         ),
         "got {too_many:?}"
     );

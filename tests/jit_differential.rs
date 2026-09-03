@@ -264,7 +264,10 @@ fn native_math_builtins() {
 #[test]
 fn shim_math_builtins_pow_and_log10() {
     for (call, inputs) in [
-        ("math.log10(x)", [1.0, 10.0, 100.0, 1000.0, 11.0, 0.5, 1420.0]),
+        (
+            "math.log10(x)",
+            [1.0, 10.0, 100.0, 1000.0, 11.0, 0.5, 1420.0],
+        ),
         ("math.pow(x, 3.0)", [0.0, 1.0, 2.0, 2.5, 10.0, 0.5, 3.0]),
     ] {
         let src = format!("function f(x) return {call} end");
@@ -591,7 +594,11 @@ fn memory_method_dispatch_matches() {
         let ar = interp.call("pay", vec![Value::Number(n)]).unwrap();
         let br = vm.call("pay", vec![Value::Number(n)]).unwrap();
         let cr = jit.call("pay", vec![Value::Number(n)]).unwrap();
-        assert_eq!(format!("{ar}"), format!("{br}"), "interp vs vm for pay({n})");
+        assert_eq!(
+            format!("{ar}"),
+            format!("{br}"),
+            "interp vs vm for pay({n})"
+        );
         assert_eq!(format!("{br}"), format!("{cr}"), "vm vs jit for pay({n})");
     }
     // The persisted memory mutation agrees across all three oracles.
@@ -900,7 +907,11 @@ fn annotated_array_param_runs() {
                  for _, v in ipairs(xs) do s = s + v end\n\
                  return s\n\
                end";
-    let xs = Value::array(vec![Value::Number(3.0), Value::Number(5.0), Value::Number(9.0)]);
+    let xs = Value::array(vec![
+        Value::Number(3.0),
+        Value::Number(5.0),
+        Value::Number(9.0),
+    ]);
     assert_same(src, "total", vec![xs]);
 }
 
@@ -967,11 +978,7 @@ fn multi_return_pass_through() {
     // params to `number` (otherwise they'd be ambiguous — the unused-param case).
     let src = "function pair(a, b) return a + 0, b + 0 end\n\
                function forward(a, b) return pair(a, b) end";
-    assert_same(
-        src,
-        "forward",
-        vec![Value::Number(2.0), Value::Number(9.0)],
-    );
+    assert_same(src, "forward", vec![Value::Number(2.0), Value::Number(9.0)]);
 }
 
 #[test]

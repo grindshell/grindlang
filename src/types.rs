@@ -607,7 +607,11 @@ impl<'a> Checker<'a> {
                 "string" => Type::String,
                 "nil" => Type::Nil,
                 other => {
-                    self.error("E0462", format!("unknown type `{other}` in annotation"), span);
+                    self.error(
+                        "E0462",
+                        format!("unknown type `{other}` in annotation"),
+                        span,
+                    );
                     Type::Error
                 }
             },
@@ -1626,9 +1630,10 @@ impl<'a> Checker<'a> {
                 Binding::Memory(name) => Some(Place::Memory(name.clone())),
                 _ => None,
             },
-            ExprKind::Field { base, name } => {
-                Some(Place::Field(Box::new(self.place_of(base)?), name.node.clone()))
-            }
+            ExprKind::Field { base, name } => Some(Place::Field(
+                Box::new(self.place_of(base)?),
+                name.node.clone(),
+            )),
             _ => None,
         }
     }
@@ -1920,10 +1925,7 @@ mod tests {
     #[test]
     fn annotation_types_an_unused_param() {
         // The keystone: `---@param` pins an otherwise-untypeable parameter (no E0410).
-        let info = ok(
-            "---@param x number\nfunction f(x) return 1 end",
-            &empty(),
-        );
+        let info = ok("---@param x number\nfunction f(x) return 1 end", &empty());
         assert_eq!(info.exports["f"].to_string(), "fn(number) -> number");
     }
 
@@ -1967,7 +1969,10 @@ mod tests {
         // `x` annotated `string` but used in arithmetic — the annotation is respected, so the
         // numeric use fails.
         assert_eq!(
-            err_code("---@param x string\nfunction f(x) return x + 1 end", &empty()),
+            err_code(
+                "---@param x string\nfunction f(x) return x + 1 end",
+                &empty()
+            ),
             "E0401",
         );
     }
@@ -1975,7 +1980,10 @@ mod tests {
     #[test]
     fn annotation_unknown_param_is_error() {
         assert_eq!(
-            err_code("---@param y number\nfunction f(x) return x + 0 end", &empty()),
+            err_code(
+                "---@param y number\nfunction f(x) return x + 0 end",
+                &empty()
+            ),
             "E0461",
         );
     }
@@ -2084,7 +2092,10 @@ mod tests {
              function use(x, y) local q, r = divmod(x, y) return q + r end",
             &empty(),
         );
-        assert_eq!(info.exports["use"].to_string(), "fn(number, number) -> number");
+        assert_eq!(
+            info.exports["use"].to_string(),
+            "fn(number, number) -> number"
+        );
     }
 
     #[test]
@@ -2104,7 +2115,10 @@ mod tests {
              function forward() return pair() end",
             &empty(),
         );
-        assert_eq!(info.exports["forward"].to_string(), "fn() -> (number, number)");
+        assert_eq!(
+            info.exports["forward"].to_string(),
+            "fn() -> (number, number)"
+        );
     }
 
     #[test]
@@ -2116,7 +2130,10 @@ mod tests {
              function f(x) if x then return 1, \"a\" end return 2, \"b\" end",
             &empty(),
         );
-        assert_eq!(info.exports["f"].to_string(), "fn(bool) -> (number, string)");
+        assert_eq!(
+            info.exports["f"].to_string(),
+            "fn(bool) -> (number, string)"
+        );
     }
 
     #[test]
