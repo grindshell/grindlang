@@ -35,6 +35,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, Diagnostics, Span};
 use crate::resolve::{Binding, Resolution, SymbolId};
+use crate::runtime::builtins;
 
 /// A Grindlang type (`SPEC.md` §5.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -848,7 +849,7 @@ impl<'a> Checker<'a> {
                     }
                     other => {
                         self.error(
-                            "E0415",
+                            "E0412",
                             format!("`ipairs` expects an array, found {}", self.u.deep(&other)),
                             arg.span,
                         );
@@ -870,7 +871,7 @@ impl<'a> Checker<'a> {
                     }
                     other => {
                         self.error(
-                            "E0415",
+                            "E0412",
                             format!(
                                 "`pairs` expects a map, found {} (iterating records is not \
                                  yet supported)",
@@ -982,7 +983,7 @@ impl<'a> Checker<'a> {
         // Builtin namespace value-fields (`math.pi`, `math.huge`) — catalogued in the
         // runtime builtin catalog (single source of truth).
         if let Some(ns) = self.builtin_namespace(base) {
-            return match crate::runtime::builtins::namespace_field_type(ns, &name.node) {
+            return match builtins::namespace_field_type(ns, &name.node) {
                 Some(ty) => ty,
                 None => {
                     self.error(
@@ -1428,44 +1429,29 @@ impl<'a> Checker<'a> {
 
     // ---- builtins ------------------------------------------------------------
 
+    /// Type a plain builtin call (`tostring(…)`, `tonumber(…)`) against its catalog signature.
     fn check_builtin_value_call(&mut self, ns: &str, args: &[Expr], span: Span) -> Type {
-        match ns {
-            "tostring" => {
-                self.expect_arity(ns, args, 1, span);
-                if let Some(a) = args.first() {
-                    let t = self.check_expr(a);
-                    match self.u.shallow(&t) {
-                        Type::Number | Type::Bool | Type::String | Type::Error | Type::Var(_) => {}
-                        other => self.error(
-                            "E0460",
-                            format!(
-                                "`tostring` accepts a number, bool, or string, found {}",
-                                self.u.deep(&other)
-                            ),
-                            a.span,
-                        ),
-                    }
+        match builtins::value_sig(ns) {
+            Some(sig) => self.check_builtin_call(ns, sig, args, span),
+            // `math(…)` / `string(…)`: a namespace, not a function.
+            None => {
+                self.error(
+                    "E0431",
+                    format!(
+                        "`{ns}` is a builtin namespace, not a function; call one of its members"
+                    ),
+                    span,
+                );
+                for a in args {
+                    self.check_expr(a);
                 }
-                Type::String
+                Type::Error
             }
-            "tonumber" => {
-                self.expect_arity(ns, args, 1, span);
-                if let Some(a) = args.first() {
-                    let t = self.check_expr(a);
-                    self.require(
-                        a.span,
-                        &t,
-                        &Type::String,
-                        "E0461",
-                        "`tonumber` requires a string",
-                    );
-                }
-                Type::optional(Type::Number)
-            }
-            _ => Type::Error,
         }
     }
 
+    /// Type a namespace member call (`math.floor(…)`, `string.sub(…)`) against its catalog
+    /// signature.
     fn check_builtin_member_call(
         &mut self,
         ns: &str,
@@ -1473,13 +1459,9 @@ impl<'a> Checker<'a> {
         args: &[Expr],
         span: Span,
     ) -> Type {
-        // The signature table is owned by the runtime builtin catalog (single source of
-        // truth, shared with IR lowering and Phase 7 codegen). `string.format` is variadic
-        // and handled specially.
-        use crate::runtime::builtins::ArgRule;
-        let Some(sig) = crate::runtime::builtins::member_sig(ns, &name.node) else {
+        let Some(sig) = builtins::member_sig(ns, &name.node) else {
             self.error(
-                "E0462",
+                "E0471",
                 format!("`{ns}` has no builtin member `{}`", name.node),
                 name.span,
             );
@@ -1488,69 +1470,62 @@ impl<'a> Checker<'a> {
             }
             return Type::Error;
         };
-
-        match sig.rule {
-            ArgRule::FormatVariadic => {
-                // format(fmt: string, ...any) -> string.
-                if args.is_empty() {
-                    self.error(
-                        "E0463",
-                        "`string.format` requires at least a format string",
-                        span,
-                    );
-                } else {
-                    let ft = self.check_expr(&args[0]);
-                    self.require(
-                        args[0].span,
-                        &ft,
-                        &Type::String,
-                        "E0463",
-                        "format string must be a string",
-                    );
-                    for a in args.iter().skip(1) {
-                        self.check_expr(a);
-                    }
-                }
-                sig.ret
-            }
-            // No namespace member uses the `Scalar` rule (that's `tostring`, a value
-            // builtin); treat anything non-variadic as a fixed positional signature.
-            ArgRule::Fixed | ArgRule::Scalar => {
-                if args.len() != sig.params.len() {
-                    self.error(
-                        "E0430",
-                        format!(
-                            "`{ns}.{}` takes {} argument(s) but {} were supplied",
-                            name.node,
-                            sig.params.len(),
-                            args.len()
-                        ),
-                        span,
-                    );
-                }
-                for (arg, pt) in args.iter().zip(&sig.params) {
-                    let at = self.check_expr(arg);
-                    self.require_assignable(arg.span, &at, pt, "argument type mismatch");
-                }
-                for arg in args.iter().skip(sig.params.len()) {
-                    self.check_expr(arg);
-                }
-                sig.ret
-            }
-        }
+        self.check_builtin_call(&format!("{ns}.{}", name.node), sig, args, span)
     }
 
-    fn expect_arity(&mut self, name: &str, args: &[Expr], n: usize, span: Span) {
-        if args.len() != n {
+    /// Check a builtin call's arguments against its catalog [`Sig`](builtins::Sig) — the same
+    /// signature IR lowering reads its result type from, so the two cannot disagree.
+    ///
+    /// Arity follows [`Sig::arity`](builtins::Sig::arity). Arguments with a declared parameter
+    /// type are checked like any function argument; the [`ArgRule`](builtins::ArgRule) says what
+    /// the rest must be.
+    fn check_builtin_call(
+        &mut self,
+        name: &str,
+        sig: builtins::Sig,
+        args: &[Expr],
+        span: Span,
+    ) -> Type {
+        use builtins::{ArgRule, Arity};
+        let (arity_ok, expected) = match sig.arity {
+            Arity::Exact(n) => (args.len() == n, n.to_string()),
+            Arity::AtLeast(n) => (args.len() >= n, format!("at least {n}")),
+        };
+        if !arity_ok {
             self.error(
                 "E0430",
                 format!(
-                    "`{name}` takes {n} argument(s) but {} were supplied",
+                    "`{name}` takes {expected} argument(s) but {} were supplied",
                     args.len()
                 ),
                 span,
             );
         }
+        for (arg, pt) in args.iter().zip(&sig.params) {
+            let at = self.check_expr(arg);
+            self.require_assignable(arg.span, &at, pt, "argument type mismatch");
+        }
+        for arg in args.iter().skip(sig.params.len()) {
+            let t = self.check_expr(arg);
+            match sig.rule {
+                // Surplus arguments: already reported as an arity error.
+                ArgRule::Fixed => {}
+                // `string.format`'s values are formatted by their verbs, whatever their type.
+                ArgRule::FormatVariadic => {}
+                ArgRule::Scalar => match self.u.shallow(&t) {
+                    Type::Number | Type::Bool | Type::String | Type::Error | Type::Var(_) => {}
+                    other => self.error(
+                        "E0470",
+                        format!(
+                            "`{name}` accepts a number, bool, or string, found {}",
+                            self.u.deep(&other)
+                        ),
+                        arg.span,
+                    ),
+                },
+            }
+        }
+        sig.ret
     }
 
     /// If `expr` is a name bound to a builtin namespace, return its name.
@@ -1878,6 +1853,48 @@ mod tests {
     fn builtin_math_call_types() {
         let info = ok("function f(x) return math.floor(x) end", &empty());
         assert_eq!(info.exports["f"].to_string(), "fn(number) -> number");
+    }
+
+    #[test]
+    fn builtin_calls_are_checked_against_the_catalog() {
+        let cases = [
+            // `tonumber(string)`: an argument of the wrong type, like any function argument.
+            ("function f() return tonumber(1) end", "E0402"),
+            ("function f() return tostring(1, 2) end", "E0430"),
+            ("function f() return tostring({ 1 }) end", "E0470"),
+            ("function f() return math.floor(\"x\") end", "E0402"),
+            ("function f() return math.max(1) end", "E0430"),
+            ("function f() return math.nope(1) end", "E0471"),
+            ("function f() return string.format() end", "E0430"),
+            ("function f() return string.format(1) end", "E0402"),
+            ("function f() return math(1) end", "E0431"),
+        ];
+        for (src, code) in cases {
+            assert_eq!(err_code(src, &empty()), code, "{src}");
+        }
+        // `string.format` takes any values after the format string.
+        ok(
+            "function f() return string.format(\"%s %d\", \"a\", 1) end",
+            &empty(),
+        );
+    }
+
+    #[test]
+    fn iterating_a_non_collection_is_its_own_error() {
+        assert_eq!(
+            err_code(
+                "function f() for _, v in ipairs(\"abc\") do end end",
+                &empty()
+            ),
+            "E0412"
+        );
+        assert_eq!(
+            err_code(
+                "function f() local p = { a = 1 } for k in pairs(p) do end end",
+                &empty()
+            ),
+            "E0412"
+        );
     }
 
     #[test]
