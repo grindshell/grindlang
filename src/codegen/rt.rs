@@ -47,13 +47,14 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::runtime::builtins;
+use crate::ast::BinOp;
 use crate::runtime::repr::Repr;
+use crate::runtime::{builtins, ops};
 use crate::value::{ClosureObj, NativeFn, RunError, Value};
 
 /// A reference-value handle: an index into [`RtCtx::values`]. Handle `0` is always `nil`.
@@ -680,16 +681,10 @@ pub unsafe extern "C" fn rt_table_new(ctx: *mut RtCtx) -> Handle {
 pub unsafe extern "C" fn rt_array_get(ctx: *mut RtCtx, arr: Handle, idx: f64, tag: u32) -> u64 {
     let ctx = ctx!(ctx);
     let elem = match ctx.get(arr) {
-        Value::Array(a) => {
-            if idx < 1.0 || idx.fract() != 0.0 {
-                None
-            } else {
-                a.borrow().get(idx as usize - 1).cloned()
-            }
-        }
-        _ => None,
+        Value::Array(a) => ops::array_get(a, idx),
+        _ => Value::Nil,
     };
-    ctx.result(elem.unwrap_or(Value::Nil), tag)
+    ctx.result(elem, tag)
 }
 
 pub unsafe extern "C" fn rt_array_set(
@@ -704,28 +699,13 @@ pub unsafe extern "C" fn rt_array_set(
     }
     let ctx = ctx!(ctx);
     let v = ctx.operand(bits, tag);
-    let a = match ctx.get(arr) {
-        Value::Array(a) => a.clone(),
-        _ => return ctx.fail(RunError::Internal("array set on a non-array".into())),
+    let result = match ctx.get(arr) {
+        Value::Array(a) => ops::array_set(a, idx, v),
+        _ => Err(RunError::Internal("array set on a non-array".into())),
     };
-    if idx < 1.0 || idx.fract() != 0.0 {
-        return ctx.fail(RunError::Runtime(format!(
-            "array index {} is not a positive integer",
-            builtins::num_to_string(idx)
-        )));
-    }
-    let i = idx as usize;
-    let len = a.borrow().len();
-    if i <= len {
-        a.borrow_mut()[i - 1] = v;
-        NIL
-    } else if i == len + 1 {
-        a.borrow_mut().push(v);
-        NIL
-    } else {
-        ctx.fail(RunError::Runtime(format!(
-            "array index {i} is out of range (length {len}); arrays may only grow by one"
-        )))
+    match result {
+        Ok(()) => NIL,
+        Err(e) => ctx.fail(e),
     }
 }
 
@@ -736,18 +716,6 @@ pub unsafe extern "C" fn rt_map_get(ctx: *mut RtCtx, map: Handle, key: Handle, t
         _ => None,
     };
     ctx.result(v.unwrap_or(Value::Nil), tag)
-}
-
-/// Store `v` under `key`, allocating the key `String` only for a new entry. Overwriting an
-/// existing field or map key — what an assignment inside a loop does — allocates nothing.
-fn set_entry(table: &RefCell<BTreeMap<String, Value>>, key: &str, v: Value) {
-    let mut table = table.borrow_mut();
-    match table.get_mut(key) {
-        Some(slot) => *slot = v,
-        None => {
-            table.insert(key.to_owned(), v);
-        }
-    }
 }
 
 /// Assign through a map key (`m[k] = v`), refusing a write to a constant. Also inserts the
@@ -767,7 +735,7 @@ pub unsafe extern "C" fn rt_map_set(
     let v = ctx.operand(bits, tag);
     // A map shares the record/table backing representation.
     if let (Value::Str(k), Value::Table(t)) = (ctx.get(key), ctx.get(map)) {
-        set_entry(t, k, v);
+        ops::table_set(t, k, v);
     }
     NIL
 }
@@ -795,7 +763,7 @@ pub unsafe extern "C" fn rt_field_init(
     let ctx = ctx!(ctx);
     let v = ctx.operand(bits, tag);
     if let Value::Table(t) = ctx.get(base) {
-        set_entry(t, &ctx.pools.names[name_idx as usize], v);
+        ops::table_set(t, &ctx.pools.names[name_idx as usize], v);
     }
 }
 
@@ -829,12 +797,9 @@ pub unsafe extern "C" fn rt_map_keys(ctx: *mut RtCtx, base: Handle) -> Handle {
 
 // ---- scalar / value ops -----------------------------------------------------
 
+/// `#v`. The checker admits only strings and arrays, so the fallback `0` is never observed.
 pub unsafe extern "C" fn rt_len(ctx: *mut RtCtx, h: Handle) -> f64 {
-    match ctx!(ctx).get(h) {
-        Value::Str(s) => s.len() as f64,
-        Value::Array(a) => a.borrow().len() as f64,
-        _ => 0.0,
-    }
+    ops::len(ctx!(ctx).get(h)).unwrap_or(0.0)
 }
 
 /// A string operand's text, borrowed; a non-string reads as `""`.
@@ -861,23 +826,24 @@ pub unsafe extern "C" fn rt_str_cmp(ctx: *mut RtCtx, l: Handle, r: Handle) -> i3
     }
 }
 
-/// Value equality for reference / string operands (numbers and bools compare natively).
+/// Value equality for reference / string operands (numbers and bools compare natively), by the
+/// one rule every backend uses: [`Value::ref_eq`].
 pub unsafe extern "C" fn rt_value_eq(ctx: *mut RtCtx, l: Handle, r: Handle) -> i8 {
     let ctx = ctx!(ctx);
-    value_eq(ctx.get(l), ctx.get(r)) as i8
+    ctx.get(l).ref_eq(ctx.get(r)) as i8
 }
 
 pub unsafe extern "C" fn rt_truthy(ctx: *mut RtCtx, h: Handle) -> i8 {
-    !matches!(ctx!(ctx).get(h), Value::Nil | Value::Bool(false)) as i8
+    ctx!(ctx).get(h).is_truthy() as i8
 }
 
 /// `f64` exponentiation (no native cranelift op).
 pub extern "C" fn rt_pow(a: f64, b: f64) -> f64 {
-    a.powf(b)
+    ops::arith(BinOp::Pow, a, b)
 }
 
-/// Latch the "ordered a NaN" error, matching the interpreter oracles (`interp::compare` and
-/// `ir::Vm::compare`, which fail when `partial_cmp` returns `None`). The JIT lowers `< <= > >=`
+/// Latch the "ordered a NaN" error, matching the interpreters (both order operands with
+/// [`ops::compare`], which fails when `partial_cmp` returns `None`). The JIT lowers `< <= > >=`
 /// on numbers to a native unboxed `fcmp`, but an IEEE *unordered* compare silently yields
 /// `false` for a NaN operand — so without this the JIT would diverge from the two interpreters,
 /// breaking the three-oracle invariant.
@@ -886,7 +852,7 @@ pub extern "C" fn rt_pow(a: f64, b: f64) -> f64 {
 /// ordinary comparisons never call here; only the failing branch does. That matters because
 /// comparisons sit in the hot path of exactly the calc/decision code Grindlang exists to run.
 pub unsafe extern "C" fn rt_raise_nan_compare(ctx: *mut RtCtx) {
-    ctx!(ctx).fail(RunError::Runtime("comparison with NaN".into()));
+    ctx!(ctx).fail(RunError::Runtime(ops::NAN_COMPARISON.into()));
 }
 
 // ---- calls ------------------------------------------------------------------
@@ -1085,12 +1051,6 @@ pub unsafe extern "C" fn rt_closure_code_addr(ctx: *mut RtCtx, clo: Handle) -> i
             0
         }
     }
-}
-
-/// Grindlang `==` — shared with both interpreters via [`Value::ref_eq`] so the three cannot
-/// drift: scalars by value, reference types by `Rc` identity (Lua semantics).
-fn value_eq(a: &Value, b: &Value) -> bool {
-    a.ref_eq(b)
 }
 
 /// A shim's name and function pointer, for registration with the JIT linker.

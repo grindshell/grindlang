@@ -132,17 +132,8 @@ pub use imp::{field_value, member_call, value_call};
 #[cfg(any(feature = "interp", feature = "jit"))]
 mod imp {
     use super::num_to_string;
+    use crate::runtime::ops::{number, string};
     use crate::value::{RunError, Value};
-
-    fn number(v: &Value) -> Result<f64, RunError> {
-        v.as_f64()
-            .ok_or_else(|| RunError::Internal("builtin expected a number".into()))
-    }
-
-    fn string_of(v: &Value) -> Result<String, RunError> {
-        v.as_string()
-            .ok_or_else(|| RunError::Internal("builtin expected a string".into()))
-    }
 
     /// Evaluate a namespace value field: `math.pi`, `math.huge`.
     pub fn field_value(ns: &str, field: &str) -> Result<Value, RunError> {
@@ -185,11 +176,9 @@ mod imp {
 
     /// Evaluate a namespace member builtin: `math.floor`, `string.sub`, etc.
     pub fn member_call(ns: &str, name: &str, args: &[Value]) -> Result<Value, RunError> {
-        let num =
-            |i: usize| -> Result<f64, RunError> { number(args.get(i).unwrap_or(&Value::Nil)) };
-        let string = |i: usize| -> Result<String, RunError> {
-            string_of(args.get(i).unwrap_or(&Value::Nil))
-        };
+        let arg = |i: usize| args.get(i).unwrap_or(&Value::Nil);
+        let num = |i: usize| number(arg(i));
+        let text = |i: usize| string(arg(i));
         match (ns, name) {
             ("math", "floor") => Ok(Value::Number(num(0)?.floor())),
             ("math", "ceil") => Ok(Value::Number(num(0)?.ceil())),
@@ -199,25 +188,23 @@ mod imp {
             ("math", "min") => Ok(Value::Number(num(0)?.min(num(1)?))),
             ("math", "max") => Ok(Value::Number(num(0)?.max(num(1)?))),
             ("math", "pow") => Ok(Value::Number(num(0)?.powf(num(1)?))),
-            ("string", "len") => Ok(Value::Number(string(0)?.len() as f64)),
-            ("string", "upper") => Ok(Value::string(string(0)?.to_uppercase())),
-            ("string", "lower") => Ok(Value::string(string(0)?.to_lowercase())),
+            ("string", "len") => Ok(Value::Number(text(0)?.len() as f64)),
+            ("string", "upper") => Ok(Value::string(text(0)?.to_uppercase())),
+            ("string", "lower") => Ok(Value::string(text(0)?.to_lowercase())),
             ("string", "sub") => {
-                let s = string(0)?;
+                let s = text(0)?;
                 let i = num(1)? as isize;
                 let j = num(2)? as isize;
-                Ok(Value::string(lua_sub(&s, i, j)))
+                Ok(Value::string(lua_sub(s, i, j)))
             }
             ("string", "find") => {
-                let s = string(0)?;
-                let pat = string(1)?;
-                match s.find(pat.as_str()) {
+                match text(0)?.find(text(1)?) {
                     // 1-based start index of a plain (non-pattern) match.
                     Some(byte_idx) => Ok(Value::Number((byte_idx + 1) as f64)),
                     None => Ok(Value::Nil),
                 }
             }
-            ("string", "format") => Ok(Value::string(lua_format(&string(0)?, &args[1..])?)),
+            ("string", "format") => Ok(Value::string(lua_format(text(0)?, &args[1..])?)),
             _ => Err(RunError::Internal(format!(
                 "unknown builtin member `{ns}.{name}`"
             ))),

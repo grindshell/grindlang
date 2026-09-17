@@ -41,7 +41,8 @@ use std::rc::Rc;
 use crate::ast::*;
 use crate::diagnostics::Diagnostics;
 use crate::resolve::{Binding, Resolution, ResolveConfig, SymbolId};
-use crate::runtime::builtins::{field_value, member_call, num_to_string, value_call};
+use crate::runtime::builtins::{field_value, member_call, value_call};
+use crate::runtime::ops;
 use crate::value::{NativeFn, RunError, Value};
 
 /// A script function: its parameter symbols, body, and (for closures) the captured
@@ -84,13 +85,6 @@ enum Flow {
     Return(Value),
 }
 
-/// Structural-by-value for scalars, identity-by-`Rc` for reference types (Lua semantics).
-/// Shared with the IR VM and the JIT via [`Value::ref_eq`] so the three cannot drift.
-fn values_equal(a: &Value, b: &Value) -> bool {
-    a.ref_eq(b)
-}
-
-/// The reference interpreter for one resolved module.
 /// What an exported name refers to.
 #[derive(Clone)]
 enum Export {
@@ -101,6 +95,7 @@ enum Export {
     Const(String),
 }
 
+/// The reference interpreter for one resolved module.
 pub struct Interpreter<'a> {
     res: &'a Resolution,
     /// Top-level function declarations, by declared name.
@@ -672,7 +667,7 @@ impl<'a> Interpreter<'a> {
                 self.reject_frozen(&base_v)?;
                 match base_v {
                     Value::Table(t) => {
-                        t.borrow_mut().insert(name.node.clone(), value);
+                        ops::table_set(&t, &name.node, value);
                         Ok(())
                     }
                     other => Err(RunError::Internal(format!(
@@ -688,11 +683,11 @@ impl<'a> Interpreter<'a> {
                 match base_v {
                     Value::Array(a) => {
                         let idx = self.eval_number(index)?;
-                        self.array_set(&a, idx, value)
+                        ops::array_set(&a, idx, value)
                     }
                     Value::Table(t) => {
-                        let key = self.eval_string_key(index)?;
-                        t.borrow_mut().insert(key, value);
+                        let key = self.eval_expr(index)?;
+                        ops::table_set(&t, ops::string(&key)?, value);
                         Ok(())
                     }
                     other => Err(RunError::Internal(format!(
@@ -702,35 +697,6 @@ impl<'a> Interpreter<'a> {
                 }
             }
             _ => Err(RunError::Internal("invalid assignment target".into())),
-        }
-    }
-
-    fn array_set(
-        &self,
-        arr: &Rc<RefCell<Vec<Value>>>,
-        idx: f64,
-        value: Value,
-    ) -> Result<(), RunError> {
-        let len = arr.borrow().len();
-        if idx < 1.0 || idx.fract() != 0.0 {
-            return Err(RunError::Runtime(format!(
-                "array index {} is not a positive integer",
-                num_to_string(idx)
-            )));
-        }
-        let i = idx as usize;
-        if i <= len {
-            arr.borrow_mut()[i - 1] = value;
-            Ok(())
-        } else if i == len + 1 {
-            // Append at exactly len+1 (the canonical array-growth idiom).
-            arr.borrow_mut().push(value);
-            Ok(())
-        } else {
-            Err(RunError::Runtime(format!(
-                "array index {} is out of range (length {len}); arrays may only grow by one",
-                i
-            )))
         }
     }
 
@@ -756,23 +722,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn eval_number(&mut self, expr: &Expr) -> Result<f64, RunError> {
-        match self.eval_expr(expr)? {
-            Value::Number(n) => Ok(n),
-            other => Err(RunError::Internal(format!(
-                "expected a number, found {}",
-                other.type_name()
-            ))),
-        }
-    }
-
-    fn eval_string_key(&mut self, expr: &Expr) -> Result<String, RunError> {
-        match self.eval_expr(expr)? {
-            Value::Str(s) => Ok(s.to_string()),
-            other => Err(RunError::Internal(format!(
-                "expected a string key, found {}",
-                other.type_name()
-            ))),
-        }
+        ops::number(&self.eval_expr(expr)?)
     }
 
     fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RunError> {
@@ -885,15 +835,12 @@ impl<'a> Interpreter<'a> {
         match base_v {
             Value::Array(a) => {
                 let idx = self.eval_number(index)?;
-                if idx < 1.0 || idx.fract() != 0.0 {
-                    return Ok(Value::Nil);
-                }
-                let i = idx as usize;
-                Ok(a.borrow().get(i - 1).cloned().unwrap_or(Value::Nil))
+                Ok(ops::array_get(&a, idx))
             }
             Value::Table(t) => {
-                let key = self.eval_string_key(index)?;
-                Ok(t.borrow().get(&key).cloned().unwrap_or(Value::Nil))
+                let key = self.eval_expr(index)?;
+                let v = t.borrow().get(ops::string(&key)?).cloned();
+                Ok(v.unwrap_or(Value::Nil))
             }
             other => Err(RunError::Internal(format!(
                 "cannot index a {} value",
@@ -943,9 +890,9 @@ impl<'a> Interpreter<'a> {
                     map.insert(name.node.clone(), v);
                 }
                 Field::Keyed { key, value } => {
-                    let k = self.eval_string_key(key)?;
+                    let k = self.eval_expr(key)?;
                     let v = self.eval_expr(value)?;
-                    map.insert(k, v);
+                    map.insert(ops::string(&k)?.to_owned(), v);
                 }
                 Field::Positional(e) => {
                     // The checker rejects mixed shapes; treat as internal if reached.
@@ -961,83 +908,33 @@ impl<'a> Interpreter<'a> {
 
     fn eval_unary(&mut self, op: UnOp, operand: &Expr) -> Result<Value, RunError> {
         let v = self.eval_expr(operand)?;
-        match op {
-            UnOp::Neg => match v {
-                Value::Number(n) => Ok(Value::Number(-n)),
-                other => Err(RunError::Internal(format!(
-                    "unary `-` on a {} value",
-                    other.type_name()
-                ))),
-            },
-            UnOp::Not => Ok(Value::Bool(!v.is_truthy())),
-            UnOp::Len => match v {
-                Value::Str(s) => Ok(Value::Number(s.len() as f64)),
-                Value::Array(a) => Ok(Value::Number(a.borrow().len() as f64)),
-                other => Err(RunError::Internal(format!(
-                    "`#` on a {} value",
-                    other.type_name()
-                ))),
-            },
-        }
+        ops::unary(op, &v)
     }
 
     fn eval_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<Value, RunError> {
-        use BinOp::*;
         // Short-circuiting logical operators (Lua semantics, used post-typecheck).
         match op {
-            And => {
+            BinOp::And => {
                 let l = self.eval_expr(lhs)?;
-                return if l.is_truthy() {
+                if l.is_truthy() {
                     self.eval_expr(rhs)
                 } else {
                     Ok(l)
-                };
+                }
             }
-            Or => {
+            BinOp::Or => {
                 let l = self.eval_expr(lhs)?;
-                return if l.is_truthy() {
+                if l.is_truthy() {
                     Ok(l)
                 } else {
                     self.eval_expr(rhs)
-                };
+                }
             }
-            _ => {}
-        }
-
-        let l = self.eval_expr(lhs)?;
-        let r = self.eval_expr(rhs)?;
-        match op {
-            Add | Sub | Mul | Div | FloorDiv | Mod | Pow => {
-                let (a, b) = (number(&l)?, number(&r)?);
-                Ok(Value::Number(match op {
-                    Add => a + b,
-                    Sub => a - b,
-                    Mul => a * b,
-                    Div => a / b,
-                    FloorDiv => (a / b).floor(),
-                    Mod => a - (a / b).floor() * b,
-                    Pow => a.powf(b),
-                    _ => unreachable!(),
-                }))
+            _ => {
+                let l = self.eval_expr(lhs)?;
+                let r = self.eval_expr(rhs)?;
+                ops::binary(op, &l, &r)
             }
-            Concat => Ok(Value::string(format!(
-                "{}{}",
-                string_of(&l)?,
-                string_of(&r)?
-            ))),
-            Lt | Le | Gt | Ge => {
-                let ord = compare(&l, &r)?;
-                Ok(Value::Bool(match op {
-                    Lt => ord == std::cmp::Ordering::Less,
-                    Le => ord != std::cmp::Ordering::Greater,
-                    Gt => ord == std::cmp::Ordering::Greater,
-                    Ge => ord != std::cmp::Ordering::Less,
-                    _ => unreachable!(),
-                }))
-            }
-            Eq => Ok(Value::Bool(values_equal(&l, &r))),
-            Ne => Ok(Value::Bool(!values_equal(&l, &r))),
-            And | Or => unreachable!("handled above"),
         }
     }
 
@@ -1049,37 +946,6 @@ impl<'a> Interpreter<'a> {
             return Some(ns);
         }
         None
-    }
-}
-
-// ---- builtin helpers --------------------------------------------------------
-
-fn number(v: &Value) -> Result<f64, RunError> {
-    v.as_f64()
-        .ok_or_else(|| RunError::Internal(format!("expected a number, found {}", v.type_name())))
-}
-
-fn string_of(v: &Value) -> Result<String, RunError> {
-    match v {
-        Value::Str(s) => Ok(s.to_string()),
-        other => Err(RunError::Internal(format!(
-            "expected a string, found {}",
-            other.type_name()
-        ))),
-    }
-}
-
-fn compare(l: &Value, r: &Value) -> Result<std::cmp::Ordering, RunError> {
-    match (l, r) {
-        (Value::Number(a), Value::Number(b)) => a
-            .partial_cmp(b)
-            .ok_or_else(|| RunError::Runtime("comparison with NaN".into())),
-        (Value::Str(a), Value::Str(b)) => Ok(a.cmp(b)),
-        _ => Err(RunError::Internal(format!(
-            "cannot compare {} with {}",
-            l.type_name(),
-            r.type_name()
-        ))),
     }
 }
 

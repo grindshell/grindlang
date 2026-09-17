@@ -9,12 +9,16 @@
 //!   `math.*`/`string.*`/`tostring`/`tonumber` set: signatures (consumed by the checker and IR
 //!   lowering) plus the reference implementations the interpreters and the JIT's runtime shims
 //!   all call.
+//! * **Operators** (`ops`, whenever a backend is enabled). Arithmetic, ordering, the unary
+//!   operators, and array indexing, evaluated the one way all backends agree on.
 //!
 //! The runtime values themselves ([`crate::value::Value`]) live in their own always-compiled
 //! module. The JIT stores them in a per-call value table (`codegen::rt::RtCtx`) dropped when the
 //! call returns; a native arena with fixed heap layouts is deferred (`PLAN.md`).
 
 pub mod builtins;
+#[cfg(any(feature = "interp", feature = "jit"))]
+pub mod ops;
 pub mod repr;
 
 pub use repr::Repr;

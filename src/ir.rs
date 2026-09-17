@@ -1584,17 +1584,16 @@ mod vm {
 
     use super::*;
     use crate::runtime::builtins::{field_value, member_call, value_call};
-    use crate::value::{RunError, Value};
-
-    type Native = std::rc::Rc<dyn Fn(&[Value]) -> Result<Value, RunError>>;
+    use crate::runtime::ops;
+    use crate::value::{NativeFn, RunError, Value};
 
     /// Executes a lowered [`Program`].
     pub struct Vm<'a> {
         program: &'a Program,
-        host: HashMap<String, Native>,
+        host: HashMap<String, NativeFn>,
         /// Host-memory methods keyed by their `"mem:method"` symbol (`SPEC.md` §7). The impl is
         /// called with the receiver prepended to the call arguments.
-        methods: HashMap<String, Native>,
+        methods: HashMap<String, NativeFn>,
         memory: HashMap<String, Value>,
         /// Constants evaluated during the current call, cleared when a new top-level call
         /// starts. Memoizing per call keeps a constant equal to itself within one invocation
@@ -1775,7 +1774,7 @@ mod vm {
                         else_blk,
                     } => {
                         let c = self.val(&act, *cond)?;
-                        current = if truthy(&c) { *then_blk } else { *else_blk };
+                        current = if c.is_truthy() { *then_blk } else { *else_blk };
                     }
                     Terminator::Unreachable => {
                         return Err(RunError::Internal("reached an unreachable IR block".into()));
@@ -1807,16 +1806,13 @@ mod vm {
                     act.locals.insert(*id, val);
                     Value::Nil
                 }
-                Op::Unary(uop, v) => {
-                    let val = self.val(act, *v)?;
-                    eval_unary(*uop, val)?
-                }
+                Op::Unary(uop, v) => ops::unary(*uop, &self.val(act, *v)?)?,
                 Op::Binary(bop, l, r) => {
                     let lv = self.val(act, *l)?;
                     let rv = self.val(act, *r)?;
-                    eval_binary(*bop, lv, rv)?
+                    ops::binary(*bop, &lv, &rv)?
                 }
-                Op::Truthy(v) => Value::Bool(truthy(&self.val(act, *v)?)),
+                Op::Truthy(v) => Value::Bool(self.val(act, *v)?.is_truthy()),
                 // Values carry their runtime shape here, so narrowing changes nothing.
                 Op::Unwrap(v) => self.val(act, *v)?,
                 Op::MakeArray(elems) => {
@@ -1839,12 +1835,7 @@ mod vm {
                             RunError::Internal(format!("tuple index {idx} out of range"))
                         })?
                     }
-                    other => {
-                        return Err(RunError::Internal(format!(
-                            "TupleGet on a {} value",
-                            other.type_name()
-                        )));
-                    }
+                    other => return Err(shape_error("TupleGet", &other)),
                 },
                 Op::MakeTable(pairs) => {
                     let mut map = std::collections::BTreeMap::new();
@@ -1854,29 +1845,42 @@ mod vm {
                     Value::table(map)
                 }
                 Op::ArrayGet(base, idx) => {
-                    let b = self.val(act, *base)?;
-                    let i = self.val(act, *idx)?;
-                    array_get(&b, &i)?
+                    let i = ops::number(&self.val(act, *idx)?)?;
+                    match self.val(act, *base)? {
+                        Value::Array(a) => ops::array_get(&a, i),
+                        other => return Err(shape_error("ArrayGet", &other)),
+                    }
                 }
                 Op::ArraySet(base, idx, v) => {
                     let b = self.val(act, *base)?;
-                    let i = self.val(act, *idx)?;
+                    let i = ops::number(&self.val(act, *idx)?)?;
                     let val = self.val(act, *v)?;
                     self.reject_frozen(&b)?;
-                    array_set(&b, &i, val)?;
+                    match &b {
+                        Value::Array(a) => ops::array_set(a, i, val)?,
+                        other => return Err(shape_error("ArraySet", other)),
+                    }
                     Value::Nil
                 }
                 Op::MapGet(base, key) => {
-                    let b = self.val(act, *base)?;
                     let k = self.val(act, *key)?;
-                    table_get(&b, &k)?
+                    match self.val(act, *base)? {
+                        Value::Table(t) => {
+                            let v = t.borrow().get(ops::string(&k)?).cloned();
+                            v.unwrap_or(Value::Nil)
+                        }
+                        other => return Err(shape_error("MapGet", &other)),
+                    }
                 }
                 Op::MapSet(base, key, v) => {
                     let b = self.val(act, *base)?;
                     let k = self.val(act, *key)?;
                     let val = self.val(act, *v)?;
                     self.reject_frozen(&b)?;
-                    table_set(&b, &k, val)?;
+                    match &b {
+                        Value::Table(t) => ops::table_set(t, ops::string(&k)?, val),
+                        other => return Err(shape_error("MapSet", other)),
+                    }
                     Value::Nil
                 }
                 Op::FieldGet(base, name) => {
@@ -1887,13 +1891,23 @@ mod vm {
                     let b = self.val(act, *base)?;
                     let val = self.val(act, *v)?;
                     self.reject_frozen(&b)?;
-                    table_set(&b, &Value::string(name.clone()), val)?;
+                    match &b {
+                        Value::Table(t) => ops::table_set(t, name, val),
+                        other => return Err(shape_error("FieldSet", other)),
+                    }
                     Value::Nil
                 }
-                Op::MapKeys(base) => {
-                    let b = self.val(act, *base)?;
-                    map_keys(&b)?
-                }
+                Op::MapKeys(base) => match self.val(act, *base)? {
+                    Value::Table(t) => {
+                        let keys = t
+                            .borrow()
+                            .keys()
+                            .map(|k| Value::string(k.as_str()))
+                            .collect();
+                        Value::array(keys)
+                    }
+                    other => return Err(shape_error("MapKeys", &other)),
+                },
                 Op::CallScript(name, args) => {
                     let argv = self.eval_args(act, args)?;
                     let func = self.lookup_function(name)?;
@@ -1938,23 +1952,13 @@ mod vm {
                 }
                 Op::CellGet(cell) => match self.val(act, *cell)? {
                     Value::Cell(c) => c.borrow().clone(),
-                    other => {
-                        return Err(RunError::Internal(format!(
-                            "CellGet on a {} value",
-                            other.type_name()
-                        )));
-                    }
+                    other => return Err(shape_error("CellGet", &other)),
                 },
                 Op::CellSet(cell, v) => {
                     let val = self.val(act, *v)?;
                     match self.val(act, *cell)? {
                         Value::Cell(c) => *c.borrow_mut() = val,
-                        other => {
-                            return Err(RunError::Internal(format!(
-                                "CellSet on a {} value",
-                                other.type_name()
-                            )));
-                        }
+                        other => return Err(shape_error("CellSet", &other)),
                     }
                     Value::Nil
                 }
@@ -1963,12 +1967,7 @@ mod vm {
                         Value::Closure(c) => c.env.get(*i as usize).cloned().ok_or_else(|| {
                             RunError::Internal(format!("upvalue {i} out of range"))
                         })?,
-                        other => {
-                            return Err(RunError::Internal(format!(
-                                "ClosureEnvGet on a {} value",
-                                other.type_name()
-                            )));
-                        }
+                        other => return Err(shape_error("ClosureEnvGet", &other)),
                     }
                 }
                 Op::MakeClosure(code, cells) => {
@@ -1986,12 +1985,7 @@ mod vm {
                     let cv = self.val(act, *callee)?;
                     let code = match &cv {
                         Value::Closure(c) => c.code.clone(),
-                        other => {
-                            return Err(RunError::Internal(format!(
-                                "CallValue on a {} value",
-                                other.type_name()
-                            )));
-                        }
+                        other => return Err(shape_error("CallValue", other)),
                     };
                     let func = self.lookup_function(&code)?;
                     // The closure itself is the hidden env parameter (params[0]); real args
@@ -2015,159 +2009,9 @@ mod vm {
         }
     }
 
-    fn truthy(v: &Value) -> bool {
-        !matches!(v, Value::Nil | Value::Bool(false))
-    }
-
-    fn num(v: &Value) -> Result<f64, RunError> {
-        v.as_f64()
-            .ok_or_else(|| RunError::Internal("expected a number".into()))
-    }
-
-    fn eval_unary(op: UnOp, v: Value) -> Result<Value, RunError> {
-        Ok(match op {
-            UnOp::Neg => Value::Number(-num(&v)?),
-            UnOp::Not => Value::Bool(!truthy(&v)),
-            UnOp::Len => match v {
-                Value::Str(s) => Value::Number(s.len() as f64),
-                Value::Array(a) => Value::Number(a.borrow().len() as f64),
-                _ => return Err(RunError::Internal("`#` on a non-string/array".into())),
-            },
-        })
-    }
-
-    fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value, RunError> {
-        use BinOp::*;
-        Ok(match op {
-            Add | Sub | Mul | Div | FloorDiv | Mod | Pow => {
-                let (a, b) = (num(&l)?, num(&r)?);
-                Value::Number(match op {
-                    Add => a + b,
-                    Sub => a - b,
-                    Mul => a * b,
-                    Div => a / b,
-                    FloorDiv => (a / b).floor(),
-                    Mod => a - (a / b).floor() * b,
-                    Pow => a.powf(b),
-                    _ => unreachable!(),
-                })
-            }
-            Concat => {
-                let a = l
-                    .as_string()
-                    .ok_or_else(|| RunError::Internal("concat lhs".into()))?;
-                let b = r
-                    .as_string()
-                    .ok_or_else(|| RunError::Internal("concat rhs".into()))?;
-                Value::string(format!("{a}{b}"))
-            }
-            Lt | Le | Gt | Ge => {
-                let ord = compare(&l, &r)?;
-                Value::Bool(match op {
-                    Lt => ord == std::cmp::Ordering::Less,
-                    Le => ord != std::cmp::Ordering::Greater,
-                    Gt => ord == std::cmp::Ordering::Greater,
-                    Ge => ord != std::cmp::Ordering::Less,
-                    _ => unreachable!(),
-                })
-            }
-            Eq => Value::Bool(scalar_eq(&l, &r)),
-            Ne => Value::Bool(!scalar_eq(&l, &r)),
-            And | Or => unreachable!("short-circuited in lowering"),
-        })
-    }
-
-    fn compare(l: &Value, r: &Value) -> Result<std::cmp::Ordering, RunError> {
-        match (l, r) {
-            (Value::Number(a), Value::Number(b)) => a
-                .partial_cmp(b)
-                .ok_or_else(|| RunError::Runtime("NaN comparison".into())),
-            (Value::Str(a), Value::Str(b)) => Ok(a.cmp(b)),
-            _ => Err(RunError::Internal("bad comparison operands".into())),
-        }
-    }
-
-    /// Grindlang `==` — shared with the AST interpreter and the JIT via [`Value::ref_eq`] so
-    /// the three cannot drift. This copy used to answer `false` for *every* reference pair, so
-    /// a table was not equal to itself.
-    fn scalar_eq(l: &Value, r: &Value) -> bool {
-        l.ref_eq(r)
-    }
-
-    fn array_get(base: &Value, idx: &Value) -> Result<Value, RunError> {
-        match base {
-            Value::Array(a) => {
-                let i = num(idx)?;
-                if i < 1.0 || i.fract() != 0.0 {
-                    return Ok(Value::Nil);
-                }
-                Ok(a.borrow()
-                    .get(i as usize - 1)
-                    .cloned()
-                    .unwrap_or(Value::Nil))
-            }
-            _ => Err(RunError::Internal("ArrayGet on a non-array".into())),
-        }
-    }
-
-    fn array_set(base: &Value, idx: &Value, val: Value) -> Result<(), RunError> {
-        match base {
-            Value::Array(a) => {
-                let i = num(idx)?;
-                if i < 1.0 || i.fract() != 0.0 {
-                    return Err(RunError::Runtime("non-positive-integer array index".into()));
-                }
-                let i = i as usize;
-                let len = a.borrow().len();
-                if i <= len {
-                    a.borrow_mut()[i - 1] = val;
-                    Ok(())
-                } else if i == len + 1 {
-                    a.borrow_mut().push(val);
-                    Ok(())
-                } else {
-                    Err(RunError::Runtime(format!(
-                        "array index {i} out of range (len {len})"
-                    )))
-                }
-            }
-            _ => Err(RunError::Internal("ArraySet on a non-array".into())),
-        }
-    }
-
-    fn table_get(base: &Value, key: &Value) -> Result<Value, RunError> {
-        match (base, key) {
-            (Value::Table(t), Value::Str(k)) => {
-                Ok(t.borrow().get(k.as_ref()).cloned().unwrap_or(Value::Nil))
-            }
-            _ => Err(RunError::Internal(
-                "MapGet on a non-table/non-string key".into(),
-            )),
-        }
-    }
-
-    fn table_set(base: &Value, key: &Value, val: Value) -> Result<(), RunError> {
-        match (base, key) {
-            (Value::Table(t), Value::Str(k)) => {
-                t.borrow_mut().insert(k.to_string(), val);
-                Ok(())
-            }
-            _ => Err(RunError::Internal(
-                "MapSet on a non-table/non-string key".into(),
-            )),
-        }
-    }
-
-    fn map_keys(base: &Value) -> Result<Value, RunError> {
-        match base {
-            Value::Table(t) => Ok(Value::array(
-                t.borrow()
-                    .keys()
-                    .map(|k| Value::string(k.clone()))
-                    .collect(),
-            )),
-            _ => Err(RunError::Internal("MapKeys on a non-table".into())),
-        }
+    /// An op received a value whose runtime shape the checker should have ruled out.
+    fn shape_error(op: &str, v: &Value) -> RunError {
+        RunError::Internal(format!("{op} on a {} value", v.type_name()))
     }
 }
 

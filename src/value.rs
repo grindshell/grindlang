@@ -312,7 +312,7 @@ impl Value {
     }
 }
 
-#[cfg(feature = "interp")]
+#[cfg(any(feature = "interp", feature = "jit"))]
 impl Value {
     /// Lua-style truthiness: only `nil` and `false` are falsy.
     pub(crate) fn is_truthy(&self) -> bool {

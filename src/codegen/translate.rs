@@ -754,6 +754,8 @@ impl<'a, 'b> Translator<'a, 'b> {
         use BinOp::*;
         match op {
             Add | Sub | Mul | Div | FloorDiv | Mod | Pow => {
+                // The native form of `runtime::ops::arith`, which the interpreters evaluate; the
+                // two must compute the same formulas (`%` floored, `//` floor of the quotient).
                 let a = self.val(l);
                 let b = self.val(r);
                 match op {
