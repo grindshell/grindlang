@@ -261,11 +261,10 @@ impl<'a, 'b> Translator<'a, 'b> {
 
         match &block.term {
             Terminator::Return(Some(v)) => {
-                // Coerce to the function's declared return repr. A narrowed scalar optional
-                // (`number?`/`bool?` refined to `number`/`bool` in a guarded branch) is still
-                // an IR `Ptr` value here, but the signature return is unboxed — unbox it (and
-                // symmetrically box a scalar returned where an optional is declared). Without
-                // this, `if x ~= nil then return x end` fails cranelift verification.
+                // Coerce to the function's declared return repr: box a scalar returned where an
+                // optional is declared (`return 1` from a `number?` function), and unbox the
+                // reverse. Narrowed reads no longer need this — `Op::Unwrap` already unboxed
+                // them where they were read.
                 let from = self.value_repr(*v);
                 let to = repr_of(&self.func.ret);
                 let val = self.val(*v);
@@ -516,6 +515,15 @@ impl<'a, 'b> Translator<'a, 'b> {
             Op::Unary(uop, v) => Some(self.translate_unary(*uop, *v)),
             Op::Binary(bop, l, r) => Some(self.translate_binary(*bop, *l, *r)),
             Op::Truthy(v) => Some(self.translate_truthy(*v)),
+            Op::Unwrap(v) => {
+                // A narrowed `number?`/`bool?` handle becomes a native scalar here, so every
+                // later use (arithmetic, branches, call arguments) sees the unboxed repr its
+                // type promises. Reference optionals are already handles: identity.
+                let from = self.value_repr(*v);
+                let to = self.dest_repr(dest);
+                let val = self.val(*v);
+                Some(self.coerce(val, from, to))
+            }
             Op::MakeArray(elems) => Some(self.translate_make_array(elems)),
             Op::MakeTable(pairs) => Some(self.translate_make_table(pairs)),
             Op::MakeTuple(elems) => Some(self.translate_make_tuple(elems)),

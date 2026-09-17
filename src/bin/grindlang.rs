@@ -305,7 +305,7 @@ mod cache {
 
     /// On-disk envelope version. Bump when [`Program`]'s serialized shape or this envelope
     /// changes, so a cache written by an older build is rejected rather than misread.
-    const FORMAT: u32 = 1;
+    const FORMAT: u32 = 2;
     /// This binary's crate version — a coarse guard against IR semantics drifting between builds
     /// without the source changing.
     const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");

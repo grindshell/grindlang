@@ -50,6 +50,29 @@ fn assert_same(src: &str, func: &str, args: Vec<Value>) {
     }
 }
 
+/// Like [`assert_same`], but also pins the value every oracle must return (by `Display`). For
+/// cases where a language rule itself is under test, so three oracles agreeing on a different
+/// answer — or all failing — is still a failure.
+#[track_caller]
+fn assert_all_return(src: &str, func: &str, args: Vec<Value>, want: &str) {
+    let cfg = TypeConfig::default();
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    for (oracle, got) in [
+        ("AST", interp.call(func, args.clone())),
+        ("IR", vm.call(func, args.clone())),
+        ("JIT", jit.call(func, args.clone())),
+    ] {
+        match got {
+            Ok(v) => assert_eq!(
+                v.to_string(),
+                want,
+                "{oracle} result of `{func}` in:\n{src}"
+            ),
+            Err(e) => panic!("{oracle} failed on `{func}`: {e}\n{src}"),
+        }
+    }
+}
+
 #[test]
 fn arithmetic_and_precedence() {
     assert_same(
@@ -843,8 +866,8 @@ fn closures_fixture_host_returns_and_invokes() {
 //
 // `if <place> ~= nil then … <place>` refines a *field* (not just a bare local) to its
 // non-optional type inside the guarded branch. These lock the three oracles in agreement,
-// and — for the scalar cases — pin the `Return`-site repr coercion that a narrowed
-// `number?`/`bool?` needs (it is an IR `Ptr` handle but the signature returns unboxed).
+// and — for the scalar cases — pin `Op::Unwrap`, which turns a narrowed `number?`/`bool?`
+// (still a boxed handle at runtime) into the native scalar every later use expects.
 
 #[test]
 fn field_narrowing_reference_optional() {
@@ -874,13 +897,79 @@ fn field_narrowing_scalar_optional_return() {
 fn scalar_optional_bare_local_narrowing_return() {
     // Regression: even *bare-local* scalar narrowing (`SPEC.md` lists it as working) used to
     // miscompile — the JIT verifier rejected returning the boxed handle where the signature
-    // says f64. The `Return`-site coercion fixes it; all three oracles now agree.
+    // says f64.
     let src = "function f()\n\
                  local x = tonumber(\"7\")\n\
                  if x ~= nil then return x end\n\
                  return 0\n\
                end";
     assert_same(src, "f", vec![]);
+}
+
+#[test]
+fn narrowed_number_in_arithmetic_comparisons_and_calls() {
+    // Regression: a narrowed `number?` reached every use except a bare `return` as a boxed
+    // handle, so `x + 1` failed cranelift verification (`fadd` on an i64) and `x == 7` / a
+    // call argument passed an i64 where an f64 was expected.
+    let src = "function twice(n) return n * 2 end\n\
+               function f(s)\n\
+                 local x = tonumber(s)\n\
+                 if x ~= nil then\n\
+                   if x > 10 then return twice(x) + 1 end\n\
+                   if x == 7 then return -x end\n\
+                   return x + 1\n\
+                 end\n\
+                 return 0\n\
+               end";
+    for (s, want) in [("7", "-7"), ("12", "25"), ("3", "4"), ("nope", "0")] {
+        assert_all_return(src, "f", vec![Value::string(s)], want);
+    }
+}
+
+#[test]
+fn narrowed_array_element_in_arithmetic() {
+    // `SPEC.md` §5.4: indexing always yields `T?`, so reading an array outside `ipairs` means
+    // narrowing the element before using it.
+    let src = "---@param xs number[]\n\
+               function at_or_zero(xs, i)\n\
+                 local x = xs[i]\n\
+                 if x ~= nil then return x * 10 end\n\
+                 return 0\n\
+               end";
+    let xs = Value::array(vec![Value::Number(4.0), Value::Number(5.0)]);
+    for (i, want) in [(1.0, "40"), (2.0, "50"), (3.0, "0")] {
+        assert_all_return(src, "at_or_zero", vec![xs.clone(), Value::Number(i)], want);
+    }
+}
+
+#[test]
+fn narrowed_field_in_arithmetic() {
+    let src = "function f(s)\n\
+                 local p = { b = tonumber(s) }\n\
+                 if p.b ~= nil then return p.b * 3 end\n\
+                 return -1\n\
+               end";
+    for (s, want) in [("5", "15"), ("x", "-1")] {
+        assert_all_return(src, "f", vec![Value::string(s)], want);
+    }
+}
+
+#[test]
+fn narrowed_bool_drives_branches() {
+    // Regression: a narrowed `bool?` was branched on as its boxed handle, which is non-zero for
+    // `false` too, so the JIT silently took the `true` arm (and `not b` was always false).
+    let src = "function f(k)\n\
+                 local m = { [\"yes\"] = true, [\"no\"] = false }\n\
+                 local b = m[k]\n\
+                 if b ~= nil then\n\
+                   if b then return 1 end\n\
+                   if not b then return 2 end\n\
+                 end\n\
+                 return 3\n\
+               end";
+    for (k, want) in [("yes", "1"), ("no", "2"), ("missing", "3")] {
+        assert_all_return(src, "f", vec![Value::string(k)], want);
+    }
 }
 
 // ---- `---@` annotations (`SPEC.md` §5.6) ------------------------------------------------
@@ -1016,4 +1105,150 @@ fn tuple_with_optional_element() {
     assert_same(src, "f", vec![xs]);
     // Empty array → `xs[1]` is nil; the element Displays as `nil` across all three oracles.
     assert_same(src, "f", vec![Value::array(vec![])]);
+}
+
+// ---- loop iteration rules (`SPEC.md` §3.3) ----------------------------------
+//
+// The interpreter and the lowered IR implement loops independently, so a body that writes to
+// the loop variable or to the collection being iterated used to get different answers from the
+// AST oracle and from the VM/JIT. These pin the rule itself, not just agreement.
+
+#[test]
+fn numeric_for_ignores_writes_to_the_loop_variable() {
+    let src = "function up(n)\n\
+                 local count = 0\n\
+                 local sum = 0\n\
+                 for i = 1, n do\n\
+                   sum = sum + i\n\
+                   i = i + 5\n\
+                   count = count + 1\n\
+                 end\n\
+                 return count * 1000 + sum\n\
+               end\n\
+               function down()\n\
+                 local count = 0\n\
+                 for i = 10, 1, -3 do\n\
+                   i = 0\n\
+                   count = count + 1\n\
+                 end\n\
+                 return count\n\
+               end";
+    for (n, want) in [(0.0, "0"), (1.0, "1001"), (10.0, "10055")] {
+        assert_all_return(src, "up", vec![Value::Number(n)], want);
+    }
+    assert_all_return(src, "down", vec![], "4");
+}
+
+#[test]
+fn numeric_for_ignores_closure_writes_to_the_loop_variable() {
+    // The same rule when `i` is captured, so it lives in a shared cell the closure writes.
+    let src = "function f()\n\
+                 local count = 0\n\
+                 local last = 0\n\
+                 for i = 1, 6, 2 do\n\
+                   local bump = function() i = i + 100 end\n\
+                   bump()\n\
+                   last = i\n\
+                   count = count + 1\n\
+                 end\n\
+                 return count * 1000 + last\n\
+               end";
+    assert_all_return(src, "f", vec![], "3105");
+}
+
+#[test]
+fn ipairs_visits_only_the_elements_present_at_the_start() {
+    // Appends are bounded by `n < 5` so a regression to re-reading the length fails the
+    // assertion instead of looping forever.
+    let src = "function f()\n\
+                 local xs = { 1, 2 }\n\
+                 local n = 0\n\
+                 for _, v in ipairs(xs) do\n\
+                   n = n + 1\n\
+                   if n < 5 then xs[#xs + 1] = v end\n\
+                 end\n\
+                 return n * 100 + #xs\n\
+               end";
+    assert_all_return(src, "f", vec![], "204");
+}
+
+#[test]
+fn ipairs_reads_each_element_when_it_reaches_it() {
+    let src = "function f()\n\
+                 local xs = { 1, 2, 3 }\n\
+                 local s = 0\n\
+                 for i, v in ipairs(xs) do\n\
+                   if i == 1 then xs[3] = 30 end\n\
+                   s = s + v\n\
+                 end\n\
+                 return s\n\
+               end";
+    assert_all_return(src, "f", vec![], "33");
+}
+
+#[test]
+fn pairs_visits_starting_keys_and_reads_values_when_reached() {
+    // `b` is rewritten before the loop reaches it (seen: 100); `c` is added mid-loop (not
+    // visited). Keys iterate in sorted order.
+    let src = "function f()\n\
+                 local m = { [\"a\"] = 1, [\"b\"] = 2 }\n\
+                 local s = 0\n\
+                 local n = 0\n\
+                 for k, v in pairs(m) do\n\
+                   m[\"b\"] = 100\n\
+                   m[\"c\"] = 1000\n\
+                   s = s + v\n\
+                   n = n + 1\n\
+                 end\n\
+                 return s * 10 + n\n\
+               end";
+    assert_all_return(src, "f", vec![], "1012");
+}
+
+// ---- map literals with computed keys ----------------------------------------
+//
+// `{ [k] = v }` with a non-literal key type-checks, but lowering used to reject it with an
+// internal error because `MakeTable` only carries compile-time key names.
+
+#[test]
+fn map_literal_with_computed_keys() {
+    let src = "function f(name)\n\
+                 local prefix = \"id_\"\n\
+                 return { [name] = 1, [prefix .. name] = 2, [\"lit\"] = 3 }\n\
+               end";
+    assert_all_return(
+        src,
+        "f",
+        vec![Value::string("x")],
+        "{id_x = 2, lit = 3, x = 1}",
+    );
+    // A later duplicate key overwrites an earlier one, as with literal keys.
+    assert_all_return(
+        src,
+        "f",
+        vec![Value::string("lit")],
+        "{id_lit = 2, lit = 3}",
+    );
+}
+
+#[test]
+fn constant_map_with_computed_key() {
+    let src = "M = { [\"a\" .. \"b\"] = 1, [\"c\"] = 2 }\n\
+               function f() return M[\"ab\"] end";
+    assert_all_return(src, "M", vec![], "{ab = 1, c = 2}");
+    assert_all_return(src, "f", vec![], "1");
+}
+
+#[test]
+fn pairs_directly_over_map_literals() {
+    // Iterating a literal (rather than a local holding one) needs the literal itself to carry
+    // a map type; a literal-key map used to be typed `<error>` in the IR and failed to lower.
+    let src = "function f(k)\n\
+                 local total = 0\n\
+                 for _, v in pairs({ [k] = 5, [\"z\"] = 6 }) do total = total + v end\n\
+                 for _, v in pairs({ [\"p\"] = 10, [\"q\"] = 20 }) do total = total + v end\n\
+                 return total\n\
+               end";
+    assert_all_return(src, "f", vec![Value::string("a")], "41");
+    assert_all_return(src, "f", vec![Value::string("z")], "36");
 }

@@ -515,6 +515,7 @@ impl<'a> Interpreter<'a> {
                         )));
                     }
                 };
+                // The length is fixed when the loop starts; elements are read as reached.
                 let len = arr.borrow().len();
                 for idx in 0..len {
                     let item = arr.borrow()[idx].clone();
@@ -542,12 +543,12 @@ impl<'a> Interpreter<'a> {
                         )));
                     }
                 };
-                let entries: Vec<(String, Value)> = table
-                    .borrow()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                for (k, v) in entries {
+                // Like `ipairs`, the keys are fixed when the loop starts but each value is read
+                // when the loop reaches it, so a write earlier in the body is observed
+                // (`SPEC.md` §3.3).
+                let keys: Vec<String> = table.borrow().keys().cloned().collect();
+                for k in keys {
+                    let v = table.borrow().get(&k).cloned().unwrap_or(Value::Nil);
                     if let Some(kn) = names.first() {
                         self.declare(kn, Value::string(k))?;
                     }

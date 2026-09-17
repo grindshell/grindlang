@@ -613,8 +613,9 @@ unsafe fn table_insert(ctx: *mut RtCtx, tbl: Handle, key: Handle, val: Handle) {
     }
 }
 
-/// Assign through a map key (`m[k] = v`). Always a user write — a map *literal* is built with
-/// [`rt_field_init`] — so it refuses a write to a constant.
+/// Assign through a map key (`m[k] = v`), refusing a write to a constant. Also inserts the
+/// entries of a map literal with computed keys (`{ [k] = v }`), which [`rt_field_init`]'s
+/// compile-time names can't express; that table was just allocated, so it is never frozen.
 pub unsafe extern "C" fn rt_map_set(
     ctx: *mut RtCtx,
     map: Handle,

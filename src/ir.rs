@@ -151,6 +151,11 @@ pub enum Op {
     /// Lua truthiness of a value → bool (only `nil`/`false` are falsy). Used to branch on
     /// the operands of short-circuiting `and`/`or`.
     Truthy(ValueId),
+    /// Refine an optional value to the non-optional type a `~= nil` guard narrowed it to
+    /// (`SPEC.md` §5.3). The result carries the narrowed type, so a backend with unboxed
+    /// scalars turns a `number?`/`bool?` handle into a native `f64`/`i8` here, once, rather than
+    /// at every place the narrowed value is used.
+    Unwrap(ValueId),
 
     /// Build an array from element values.
     MakeArray(Vec<ValueId>),
@@ -622,6 +627,15 @@ impl<'a> FnLowerer<'a> {
         }
     }
 
+    /// Unwrap a read the checker narrowed (`if x ~= nil then … x`) to its refined type, leaving
+    /// any other read untouched.
+    fn narrow(&mut self, span: crate::diagnostics::Span, v: ValueId) -> ValueId {
+        match self.types.narrowed.get(&span) {
+            Some(ty) => self.emit_value(Op::Unwrap(v), ty.clone()),
+            None => v,
+        }
+    }
+
     /// Bind `v` to symbol `id` at its declaration, creating a fresh cell if `id` is a boxed
     /// own local.
     fn bind_local(&mut self, id: SymbolId, v: ValueId) {
@@ -927,7 +941,12 @@ impl<'a> FnLowerer<'a> {
         let var_id = self.local_id(var.span)?;
         self.ensure_local(var_id);
 
+        // The loop is driven by a hidden counter, not by the user's variable: the body may assign
+        // to `var`, but that must not change how many times the loop runs (`SPEC.md` §3.3). Each
+        // iteration copies the counter into `var` before the body.
         let start_v = self.lower_expr(start)?;
+        let counter_l = self.fresh_temp(Type::Number);
+        self.emit_stmt(Op::LocalSet(counter_l, start_v));
         let end_l = self.fresh_temp(Type::Number);
         let end_v = self.lower_expr(end)?;
         self.emit_stmt(Op::LocalSet(end_l, end_v));
@@ -961,9 +980,9 @@ impl<'a> FnLowerer<'a> {
             else_blk: neg_check,
         });
 
-        // pos_check: i <= end ?
+        // pos_check: counter <= end ?
         self.switch(pos_check);
-        let i1 = self.read_symbol(var_id);
+        let i1 = self.emit_value(Op::LocalGet(counter_l), Type::Number);
         let e1 = self.emit_value(Op::LocalGet(end_l), Type::Number);
         let le = self.emit_value(Op::Binary(BinOp::Le, i1, e1), Type::Bool);
         self.terminate(Terminator::Branch {
@@ -972,9 +991,9 @@ impl<'a> FnLowerer<'a> {
             else_blk: exit,
         });
 
-        // neg_check: i >= end ?
+        // neg_check: counter >= end ?
         self.switch(neg_check);
-        let i2 = self.read_symbol(var_id);
+        let i2 = self.emit_value(Op::LocalGet(counter_l), Type::Number);
         let e2 = self.emit_value(Op::LocalGet(end_l), Type::Number);
         let ge = self.emit_value(Op::Binary(BinOp::Ge, i2, e2), Type::Bool);
         self.terminate(Terminator::Branch {
@@ -983,8 +1002,10 @@ impl<'a> FnLowerer<'a> {
             else_blk: exit,
         });
 
-        // body
+        // body: var = counter, then the user's statements.
         self.switch(body_b);
+        let current = self.emit_value(Op::LocalGet(counter_l), Type::Number);
+        self.write_symbol(var_id, current);
         self.loop_exits.push(exit);
         let terminated = self.lower_block(body)?;
         self.loop_exits.pop();
@@ -992,12 +1013,12 @@ impl<'a> FnLowerer<'a> {
             self.terminate(Terminator::Jump(latch));
         }
 
-        // latch: i = i + step; back to header.
+        // latch: counter = counter + step; back to header.
         self.switch(latch);
-        let i3 = self.read_symbol(var_id);
+        let i3 = self.emit_value(Op::LocalGet(counter_l), Type::Number);
         let s3 = self.emit_value(Op::LocalGet(step_l), Type::Number);
         let next = self.emit_value(Op::Binary(BinOp::Add, i3, s3), Type::Number);
-        self.write_symbol(var_id, next);
+        self.emit_stmt(Op::LocalSet(counter_l, next));
         self.terminate(Terminator::Jump(header));
 
         self.switch(exit);
@@ -1051,6 +1072,12 @@ impl<'a> FnLowerer<'a> {
         let idx_l = self.fresh_temp(Type::Number);
         let one = self.emit_value(Op::ConstNumber(1.0), Type::Number);
         self.emit_stmt(Op::LocalSet(idx_l, one));
+        // The length is read once, before the first iteration: the loop visits the indices (or
+        // keys) present when it starts, so appending inside the body neither extends the loop
+        // nor keeps it from terminating (`SPEC.md` §3.3). Elements are still read as reached.
+        let len_l = self.fresh_temp(Type::Number);
+        let len_v = self.emit_value(Op::Unary(UnOp::Len, seq_v), Type::Number);
+        self.emit_stmt(Op::LocalSet(len_l, len_v));
 
         // Captured loop variables share a single cell, created once before the loop (matching
         // the interpreter's slot reuse), then written each iteration.
@@ -1069,10 +1096,9 @@ impl<'a> FnLowerer<'a> {
 
         self.terminate(Terminator::Jump(header));
 
-        // header: idx <= #seq ?
+        // header: idx <= len ?
         self.switch(header);
-        let seq_get = self.emit_value(Op::LocalGet(seq_l), seq_ty.clone());
-        let len = self.emit_value(Op::Unary(UnOp::Len, seq_get), Type::Number);
+        let len = self.emit_value(Op::LocalGet(len_l), Type::Number);
         let idx_get = self.emit_value(Op::LocalGet(idx_l), Type::Number);
         let in_range = self.emit_value(Op::Binary(BinOp::Le, idx_get, len), Type::Bool);
         self.terminate(Terminator::Branch {
@@ -1150,7 +1176,7 @@ impl<'a> FnLowerer<'a> {
             ExprKind::Paren(inner) => self.lower_expr(inner),
             ExprKind::Name(_) => self.lower_name(expr),
             ExprKind::Function(body) => self.lower_closure_literal(body),
-            ExprKind::Field { base, name } => self.lower_field(base, name),
+            ExprKind::Field { base, name } => self.lower_field(base, name, expr.span),
             ExprKind::Index { base, index } => self.lower_index(base, index),
             ExprKind::Call { callee, args } => self.lower_call(callee, args),
             ExprKind::MethodCall {
@@ -1178,7 +1204,10 @@ impl<'a> FnLowerer<'a> {
             .binding(expr.span)
             .ok_or_else(|| LowerError::Internal("unresolved name".into()))?;
         match binding.clone() {
-            Binding::Local(id) | Binding::Upvalue(id) => Ok(self.read_symbol(id)),
+            Binding::Local(id) | Binding::Upvalue(id) => {
+                let v = self.read_symbol(id);
+                Ok(self.narrow(expr.span, v))
+            }
             Binding::TopConst(n) => {
                 let ty = self.types.constants.get(&n).cloned().unwrap_or(Type::Error);
                 Ok(self.emit_value(Op::ConstRef(n), ty))
@@ -1198,7 +1227,12 @@ impl<'a> FnLowerer<'a> {
         }
     }
 
-    fn lower_field(&mut self, base: &Expr, name: &Ident) -> Result<ValueId, LowerError> {
+    fn lower_field(
+        &mut self,
+        base: &Expr,
+        name: &Ident,
+        span: crate::diagnostics::Span,
+    ) -> Result<ValueId, LowerError> {
         if let Some(ns) = self.builtin_namespace(base) {
             let ty = crate::runtime::builtins::namespace_field_type(ns, &name.node)
                 .unwrap_or(Type::Error);
@@ -1210,7 +1244,8 @@ impl<'a> FnLowerer<'a> {
             Type::Map(v) => Type::optional(*v),
             _ => Type::Error,
         };
-        Ok(self.emit_value(Op::FieldGet(b, name.node.clone()), ty))
+        let v = self.emit_value(Op::FieldGet(b, name.node.clone()), ty);
+        Ok(self.narrow(span, v))
     }
 
     fn lower_index(&mut self, base: &Expr, index: &Expr) -> Result<ValueId, LowerError> {
@@ -1344,8 +1379,15 @@ impl<'a> FnLowerer<'a> {
             }
             return Ok(self.emit_value(Op::MakeArray(elems), Type::array(elem_ty)));
         }
+        let computed_key = fields.iter().any(
+            |f| matches!(f, Field::Keyed { key, .. } if !matches!(key.kind, ExprKind::Str(_))),
+        );
+        if computed_key {
+            return self.lower_computed_map(fields);
+        }
         let mut pairs = Vec::with_capacity(fields.len());
         let mut rec = BTreeMap::new();
+        let mut map_value_ty = Type::Error;
         for f in fields {
             match f {
                 Field::Named { name, value } => {
@@ -1355,11 +1397,10 @@ impl<'a> FnLowerer<'a> {
                 }
                 Field::Keyed { key, value } => {
                     let ExprKind::Str(k) = &key.kind else {
-                        return Err(LowerError::Internal(
-                            "non-literal map key reached lowering".into(),
-                        ));
+                        unreachable!("computed keys take `lower_computed_map`");
                     };
                     let v = self.lower_expr(value)?;
+                    map_value_ty = self.values[v as usize].clone();
                     pairs.push((k.clone(), v));
                 }
                 Field::Positional(_) => {
@@ -1372,9 +1413,33 @@ impl<'a> FnLowerer<'a> {
         let ty = if rec.len() == pairs.len() {
             Type::Record(rec)
         } else {
-            Type::Error
+            Type::map(map_value_ty)
         };
         Ok(self.emit_value(Op::MakeTable(pairs), ty))
+    }
+
+    /// Lower a map literal with at least one computed key (`{ [k] = v }`). [`Op::MakeTable`]
+    /// only carries keys known at compile time, so the table is allocated empty and each entry
+    /// inserted with [`Op::MapSet`]. Keys and values are evaluated in source order, and a later
+    /// duplicate key overwrites an earlier one, as in the literal-key form.
+    fn lower_computed_map(&mut self, fields: &[Field]) -> Result<ValueId, LowerError> {
+        let mut entries = Vec::with_capacity(fields.len());
+        for f in fields {
+            let Field::Keyed { key, value } = f else {
+                return Err(LowerError::Internal("mixed table shape".into()));
+            };
+            let k = self.lower_expr(key)?;
+            let v = self.lower_expr(value)?;
+            entries.push((k, v));
+        }
+        let value_ty = entries
+            .first()
+            .map_or(Type::Error, |&(_, v)| self.values[v as usize].clone());
+        let table = self.emit_value(Op::MakeTable(Vec::new()), Type::map(value_ty));
+        for (k, v) in entries {
+            self.emit_stmt(Op::MapSet(table, k, v));
+        }
+        Ok(table)
     }
 
     fn lower_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<ValueId, LowerError> {
@@ -1752,6 +1817,8 @@ mod vm {
                     eval_binary(*bop, lv, rv)?
                 }
                 Op::Truthy(v) => Value::Bool(truthy(&self.val(act, *v)?)),
+                // Values carry their runtime shape here, so narrowing changes nothing.
+                Op::Unwrap(v) => self.val(act, *v)?,
                 Op::MakeArray(elems) => {
                     let items = elems
                         .iter()

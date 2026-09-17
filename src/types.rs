@@ -190,6 +190,11 @@ pub struct TypeInfo {
     /// a closure's parameter/return types (the checker computes them but, unlike top-level
     /// functions, they aren't otherwise persisted).
     pub function_literals: HashMap<Span, FnType>,
+    /// The refined type of every name or field read inside a `~= nil` guard (`SPEC.md` §5.3),
+    /// keyed by the read expression's span. The value still *holds* an optional at runtime, so
+    /// IR lowering unwraps each of these reads to the narrowed type — without that, a narrowed
+    /// `number?` would reach native code as a boxed handle where an `f64` is expected.
+    pub narrowed: HashMap<Span, Type>,
 }
 
 /// Type-check `module` (already resolved into `resolution`) against `cfg`.
@@ -232,6 +237,11 @@ pub fn typecheck(
             (*span, deep)
         })
         .collect();
+    let narrowed = c
+        .narrowed_reads
+        .iter()
+        .map(|(span, t)| (*span, c.u.deep(t)))
+        .collect();
 
     Ok(TypeInfo {
         exports,
@@ -239,6 +249,7 @@ pub fn typecheck(
         functions,
         constants,
         function_literals,
+        narrowed,
     })
 }
 
@@ -396,6 +407,9 @@ struct Checker<'a> {
     sym_types: Vec<Type>,
     /// Narrowing overlay: a [`Place`] temporarily refined to a non-optional type.
     narrowed: BTreeMap<Place, Type>,
+    /// Each read that resolved through [`narrowed`](Self::narrowed), by span (deep-resolved into
+    /// [`TypeInfo::narrowed`] at the end).
+    narrowed_reads: HashMap<Span, Type>,
     /// Top-level function signatures, by name.
     func_sigs: BTreeMap<String, FnType>,
     /// Top-level constant types, by name.
@@ -415,6 +429,7 @@ impl<'a> Checker<'a> {
             u: Unifier::default(),
             sym_types: vec![Type::Error; res.symbols.len()],
             narrowed: BTreeMap::new(),
+            narrowed_reads: HashMap::new(),
             func_sigs: BTreeMap::new(),
             const_types: BTreeMap::new(),
             func_literals: HashMap::new(),
@@ -926,7 +941,7 @@ impl<'a> Checker<'a> {
                 self.check_func_body(body, &sig);
                 Type::Function(sig)
             }
-            ExprKind::Field { base, name } => self.check_field(base, name),
+            ExprKind::Field { base, name } => self.check_field(base, name, expr.span),
             ExprKind::Index { base, index } => self.check_index(base, index),
             ExprKind::Call { callee, args } => self.check_call(callee, args, expr.span),
             ExprKind::MethodCall {
@@ -946,9 +961,7 @@ impl<'a> Checker<'a> {
         };
         match binding.clone() {
             Binding::Local(id) | Binding::Upvalue(id) => self
-                .narrowed
-                .get(&Place::Symbol(id))
-                .cloned()
+                .read_narrowed(&Place::Symbol(id), expr.span)
                 .unwrap_or_else(|| self.sym_types[id as usize].clone()),
             Binding::TopFunction(name) => Type::Function(self.func_sigs[&name].clone()),
             Binding::TopConst(name) => self.const_types[&name].clone(),
@@ -965,7 +978,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_field(&mut self, base: &Expr, name: &Ident) -> Type {
+    fn check_field(&mut self, base: &Expr, name: &Ident, span: Span) -> Type {
         // Builtin namespace value-fields (`math.pi`, `math.huge`) — catalogued in the
         // runtime builtin catalog (single source of truth).
         if let Some(ns) = self.builtin_namespace(base) {
@@ -985,7 +998,7 @@ impl<'a> Checker<'a> {
         // non-optional type inside the guarded branch (`SPEC.md` §5.3).
         if let Some(base_place) = self.place_of(base) {
             let place = Place::Field(Box::new(base_place), name.node.clone());
-            if let Some(t) = self.narrowed.get(&place).cloned() {
+            if let Some(t) = self.read_narrowed(&place, span) {
                 return t;
             }
         }
@@ -1653,6 +1666,14 @@ impl<'a> Checker<'a> {
                 _ => None,
             },
         }
+    }
+
+    /// The refined type of `place` if a `~= nil` guard currently narrows it, recorded against
+    /// the read at `span` so lowering unwraps that read to the same type the checker used.
+    fn read_narrowed(&mut self, place: &Place, span: Span) -> Option<Type> {
+        let t = self.narrowed.get(place)?.clone();
+        self.narrowed_reads.insert(span, t.clone());
+        Some(t)
     }
 
     /// Extract a narrowing fact from an `if` condition. Supports `<place> ~= nil` (refine in

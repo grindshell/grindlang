@@ -183,6 +183,14 @@ explist    ::= exp {',' exp}
   at the top level).
 - `genericfor`'s `iterexpr` is restricted to the builtins `ipairs(arr)` and `pairs(map)`
   / `pairs(record)` _(v1)_ — there are no user-defined iterators (no metatables).
+- A `numericfor` evaluates its start, limit, and step once, before the first iteration, and
+  counts with a hidden counter. The loop variable receives the counter's value at the start
+  of each iteration, so assigning to it inside the body does not change how many times the
+  loop runs.
+- A `genericfor` visits the indices (`ipairs`) or keys (`pairs`) present **when the loop
+  starts**; each element or value is read when the loop reaches it. Writes made earlier in the
+  body are therefore observed, but appending to the array or adding a key does not extend the
+  loop, so iteration always terminates.
 
 ```ebnf
 iterexpr ::= 'ipairs' '(' exp ')'
