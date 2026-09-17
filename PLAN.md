@@ -357,7 +357,7 @@ history before the commit that deleted it.
 > with no arguments, printing the returned value — a quick way to exercise a module without
 > writing an embedding harness. It caches the lowered IR (`ir::Program`, serde-derived behind the
 > `serde` feature; `serde_json` on disk) **pyc-style by default**: a run reads `<FILE>.glir` when
-> it is current (keyed by source hash + binary version) and otherwise compiles and writes it,
+> it is current (keyed by source hash + the executable's build) and otherwise compiles and writes it,
 > skipping the front end on an unchanged re-run. `--cache` writes the cache without running (a
 > pre-warm step); `--no-cache` runs without touching it. Note this caches the *IR*, not native
 > code (cranelift-jit cannot persist compiled code), and still JIT-compiles on load; the IR

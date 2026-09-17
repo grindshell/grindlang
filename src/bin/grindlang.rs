@@ -24,8 +24,9 @@
 //! output). By default — like Python's `*.pyc` — a normal run reads `<FILE>.glir` when it is
 //! present and current (skipping lex/parse/resolve/type-check/lower, still JIT-compiling on
 //! load), and otherwise compiles the source and writes the cache. The cache is keyed by a hash
-//! of the source plus this binary's version, so an edited script or a rebuilt `grindlang`
-//! invalidates it automatically.
+//! of the source plus an identity of this executable's build (its version, size, and
+//! modification time), so an edited script or a rebuilt `grindlang` invalidates it
+//! automatically.
 //!
 //! Two flags adjust this:
 //! * `--cache` writes the IR cache **without running** the script (a compile/pre-warm step).
@@ -299,21 +300,19 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String
 /// unchanged script can skip the front end.
 mod cache {
     use std::hash::{Hash, Hasher};
+    use std::time::UNIX_EPOCH;
 
     use grindlang::Program;
     use grindlang::ir::verify;
 
     /// On-disk envelope version. Bump when [`Program`]'s serialized shape or this envelope
     /// changes, so a cache written by an older build is rejected rather than misread.
-    const FORMAT: u32 = 2;
-    /// This binary's crate version — a coarse guard against IR semantics drifting between builds
-    /// without the source changing.
-    const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+    const FORMAT: u32 = 3;
 
     #[derive(serde::Serialize, serde::Deserialize)]
     struct Envelope {
         format: u32,
-        crate_version: String,
+        build: String,
         source_hash: u64,
         program: Program,
     }
@@ -324,13 +323,37 @@ mod cache {
         hasher.finish()
     }
 
-    /// Load a cached program if the file exists, deserializes, matches this binary + source, and
+    /// Identifies the build of this executable: the crate version plus the executable file's size
+    /// and modification time.
+    ///
+    /// The crate version alone stays the same across rebuilds, so it can't tell a cache written
+    /// before a lowering fix from one written after. Rebuilding rewrites the executable, which
+    /// changes its modification time. Reading metadata instead of hashing the executable keeps a
+    /// cache hit cheap; a false miss (a copy of the same binary, say) only costs a recompile.
+    ///
+    /// `None` when the executable can't be inspected, in which case the cache is not used.
+    fn build_id() -> Option<String> {
+        let meta = std::fs::metadata(std::env::current_exe().ok()?).ok()?;
+        let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        Some(format!(
+            "{}+{}+{}",
+            env!("CARGO_PKG_VERSION"),
+            meta.len(),
+            modified.as_nanos()
+        ))
+    }
+
+    /// Load a cached program if the file exists, deserializes, matches this build + source, and
     /// re-verifies. Any mismatch or error is a cache miss (`None`) — the caller recompiles.
     pub fn load(path: &str, src: &str) -> Option<Program> {
+        load_for(&build_id()?, path, src)
+    }
+
+    fn load_for(build: &str, path: &str, src: &str) -> Option<Program> {
         let bytes = std::fs::read(path).ok()?;
         let envelope: Envelope = serde_json::from_slice(&bytes).ok()?;
         if envelope.format != FORMAT
-            || envelope.crate_version != CRATE_VERSION
+            || envelope.build != build
             || envelope.source_hash != hash_source(src)
         {
             return None;
@@ -343,13 +366,47 @@ mod cache {
     /// Write `program` to `path`. Returns the error as a string on failure so the caller can
     /// decide whether it is fatal (`--cache`) or a warning (the default read-write mode).
     pub fn store(path: &str, src: &str, program: &Program) -> Result<(), String> {
+        let build = build_id().ok_or("cannot identify this executable's build")?;
+        store_for(&build, path, src, program)
+    }
+
+    fn store_for(build: &str, path: &str, src: &str, program: &Program) -> Result<(), String> {
         let envelope = Envelope {
             format: FORMAT,
-            crate_version: CRATE_VERSION.to_string(),
+            build: build.to_string(),
             source_hash: hash_source(src),
             program: program.clone(),
         };
         let bytes = serde_json::to_vec(&envelope).map_err(|e| e.to_string())?;
         std::fs::write(path, bytes).map_err(|e| e.to_string())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_cache_is_only_reused_by_the_build_and_source_that_wrote_it() {
+            let src = "function main() return 1 end";
+            let program = grindlang::compile(src, &Default::default()).expect("compile");
+            let path =
+                std::env::temp_dir().join(format!("grindlang-cache-{}.glir", std::process::id()));
+            let path = path.to_str().expect("utf-8 temp path");
+
+            store_for("build-a", path, src, &program).expect("store");
+            let hit = load_for("build-a", path, src);
+            let rebuilt = load_for("build-b", path, src);
+            let edited = load_for("build-a", path, "function main() return 2 end");
+            let _ = std::fs::remove_file(path);
+
+            assert!(hit.is_some(), "same build and source must reuse the cache");
+            assert!(rebuilt.is_none(), "a different build must recompile");
+            assert!(edited.is_none(), "an edited source must recompile");
+        }
+
+        #[test]
+        fn this_executable_has_a_build_id() {
+            assert!(build_id().is_some());
+        }
     }
 }

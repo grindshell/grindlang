@@ -100,7 +100,8 @@ native-code cache. What the runner caches is the **lowered IR** (`ir::Program`),
 Python's `*.pyc` — it does so **by default**: a normal run reads `<FILE>.glir` when it is present
 and current (deserializing the IR and skipping the front end, still JIT-compiling on load), and
 otherwise compiles the source and writes the cache. It is keyed by a source hash plus the
-binary's version, so editing the script or rebuilding `grindlang` invalidates it automatically.
+identity of the `grindlang` executable that wrote it (version, size, and modification time), so
+editing the script or rebuilding `grindlang` invalidates it automatically.
 
 Two flags adjust this:
 
