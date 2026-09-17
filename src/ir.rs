@@ -30,11 +30,8 @@
 //! / [`Op::CellSet`]) so writes are observed across the enclosing scope and sibling closures,
 //! matching the interpreter. A first-class function value is called with [`Op::CallValue`].
 //!
-//! ## Deliberately deferred (documented gaps)
-//!
-//! * **Named functions as first-class values.** Using a *named* top-level or host function as
-//!   a value (rather than calling it directly) raises [`LowerError::Unsupported`].
-//! * **Method calls** (`recv:m(...)`).
+//! Named top-level and host functions are not values: they are only ever called directly
+//! ([`Op::CallScript`] / [`Op::CallHost`]), which the checker enforces (`E0434`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -55,11 +52,11 @@ pub type LocalId = u32;
 pub type BlockId = u32;
 
 /// An error raised while lowering the AST to IR.
+///
+/// Lowering accepts every program the type checker does, so this is never a user error: any
+/// construct the IR can't express is rejected earlier with a coded, located diagnostic.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LowerError {
-    /// A construct the IR doesn't lower yet (see the module's deferred-gaps list).
-    #[error("unsupported in IR lowering: {0}")]
-    Unsupported(String),
     /// An invariant the resolver/checker should have guaranteed was violated.
     #[error("internal lowering error: {0}")]
     Internal(String),
@@ -307,20 +304,15 @@ fn lower_exports(
                     "export field is not `name = value`".into(),
                 ));
             };
-            // The export value must be a bare name referring to a top-level decl.
-            let ExprKind::Name(_) = &value.kind else {
-                return Err(LowerError::Unsupported(
-                    "module exports must be bare references to top-level functions or \
-                     constants"
-                        .into(),
-                ));
-            };
-            let target = match res.binding(value.span) {
-                Some(Binding::TopFunction(n)) => ExportTarget::Function(n.clone()),
-                Some(Binding::TopConst(n)) => ExportTarget::Const(n.clone()),
+            // The checker (`E0411`) only admits a bare name of a top-level function or constant.
+            let target = match (&value.kind, res.binding(value.span)) {
+                (ExprKind::Name(_), Some(Binding::TopFunction(n))) => {
+                    ExportTarget::Function(n.clone())
+                }
+                (ExprKind::Name(_), Some(Binding::TopConst(n))) => ExportTarget::Const(n.clone()),
                 _ => {
-                    return Err(LowerError::Unsupported(
-                        "module exports must reference a top-level function or constant".into(),
+                    return Err(LowerError::Internal(
+                        "export entry is not a top-level function or constant".into(),
                     ));
                 }
             };
@@ -1216,10 +1208,9 @@ impl<'a> FnLowerer<'a> {
                 let ty = self.cfg.memory.get(&n).cloned().unwrap_or(Type::Error);
                 Ok(self.emit_value(Op::MemoryRef(n), ty))
             }
-            Binding::TopFunction(_) | Binding::HostFunction(_) => Err(LowerError::Unsupported(
-                "using a named top-level or host function as a first-class value is not \
-                 supported; only anonymous and `local function` closures are first-class"
-                    .into(),
+            // The checker (`E0434`) rejects a named function anywhere but a direct call.
+            Binding::TopFunction(n) | Binding::HostFunction(n) => Err(LowerError::Internal(
+                format!("named function `{n}` used as a value"),
             )),
             Binding::Builtin(ns) => Err(LowerError::Internal(format!(
                 "builtin namespace `{ns}` used as a value"

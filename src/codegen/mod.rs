@@ -47,9 +47,6 @@ pub enum JitError {
     /// A cranelift module / codegen failure.
     #[error("cranelift error: {0}")]
     Cranelift(String),
-    /// A construct the backend doesn't compile yet.
-    #[error("unsupported by the JIT backend: {0}")]
-    Unsupported(String),
 }
 
 /// The uniform trampoline ABI the driver invokes: `(ctx, argv, argc) -> handle`.

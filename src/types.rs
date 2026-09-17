@@ -505,8 +505,25 @@ impl<'a> Checker<'a> {
         if let Some(export) = &module.export {
             for field in &export.node {
                 match field {
+                    // An entry names what it exports; it doesn't compute a value (`SPEC.md` §3.1).
                     Field::Named { name, value } => {
-                        let t = self.check_expr(value);
+                        let t = match (&value.kind, self.res.binding(value.span)) {
+                            (ExprKind::Name(_), Some(Binding::TopFunction(f))) => {
+                                Type::Function(self.func_sigs[f].clone())
+                            }
+                            (ExprKind::Name(_), Some(Binding::TopConst(c))) => {
+                                self.const_types[c].clone()
+                            }
+                            _ => {
+                                self.error(
+                                    "E0411",
+                                    "a module export entry must name a top-level function or \
+                                     constant",
+                                    value.span,
+                                );
+                                Type::Error
+                            }
+                        };
                         exports.insert(name.node.clone(), self.u.deep(&t));
                     }
                     Field::Positional(e) => self.error(
@@ -964,9 +981,20 @@ impl<'a> Checker<'a> {
             Binding::Local(id) | Binding::Upvalue(id) => self
                 .read_narrowed(&Place::Symbol(id), expr.span)
                 .unwrap_or_else(|| self.sym_types[id as usize].clone()),
-            Binding::TopFunction(name) => Type::Function(self.func_sigs[&name].clone()),
+            // A direct call types its callee without coming through here (`check_call`), so
+            // this is a named function used as a value.
+            Binding::TopFunction(name) | Binding::HostFunction(name) => {
+                self.error(
+                    "E0434",
+                    format!(
+                        "`{name}` is a named function and can only be called directly; to pass it \
+                         as a value, wrap the call in a closure (`function(x) return {name}(x) end`)"
+                    ),
+                    expr.span,
+                );
+                self.named_fn_type(binding).unwrap_or(Type::Error)
+            }
             Binding::TopConst(name) => self.const_types[&name].clone(),
-            Binding::HostFunction(name) => Type::Function(self.cfg.host_functions[&name].clone()),
             Binding::Memory(name) => self.cfg.memory[&name].clone(),
             Binding::Builtin(ns) => {
                 self.error(
@@ -1107,7 +1135,15 @@ impl<'a> Checker<'a> {
             return self.check_builtin_member_call(ns, name, args, span);
         }
 
-        let ct = self.check_expr(callee);
+        // A named top-level or host function is called directly; it is not a value.
+        let direct = match (&callee.kind, self.res.binding(callee.span)) {
+            (ExprKind::Name(_), Some(b)) => self.named_fn_type(b),
+            _ => None,
+        };
+        let ct = match direct {
+            Some(t) => t,
+            None => self.check_expr(callee),
+        };
         match self.u.shallow(&ct) {
             Type::Function(ft) => {
                 if args.len() != ft.params.len() {
@@ -1526,6 +1562,17 @@ impl<'a> Checker<'a> {
             }
         }
         sig.ret
+    }
+
+    /// The signature of a named top-level or host function, or `None` for any other binding.
+    fn named_fn_type(&self, binding: &Binding) -> Option<Type> {
+        match binding {
+            Binding::TopFunction(name) => Some(Type::Function(self.func_sigs[name].clone())),
+            Binding::HostFunction(name) => {
+                Some(Type::Function(self.cfg.host_functions[name].clone()))
+            }
+            _ => None,
+        }
     }
 
     /// If `expr` is a name bound to a builtin namespace, return its name.
@@ -2399,6 +2446,39 @@ mod tests {
     fn string_concat_types() {
         let info = ok("function f(a) return a .. \"!\" end", &empty());
         assert_eq!(info.exports["f"].to_string(), "fn(string) -> string");
+    }
+
+    #[test]
+    fn named_functions_are_called_not_used_as_values() {
+        let cases = [
+            "function g(x) return x + 1 end\nfunction f() local h = g return h(1) end",
+            "function g(x) return x + 1 end\nfunction f() return (g)(1) end",
+            "function g(x) return x + 1 end\nfunction f() return { g } end",
+        ];
+        for src in cases {
+            assert_eq!(err_code(src, &empty()), "E0434", "{src}");
+        }
+        // A closure over the call is the first-class form.
+        ok(
+            "function g(x) return x + 1 end\n\
+             function f() local h = function(x) return g(x) end return h(1) end",
+            &empty(),
+        );
+    }
+
+    #[test]
+    fn export_entries_name_a_top_level_declaration() {
+        assert_eq!(
+            err_code(
+                "function f() return 1 end\nreturn { run = f, two = 1 + 1 }",
+                &empty()
+            ),
+            "E0411"
+        );
+        assert_eq!(
+            err_code("function f() return 1 end\nreturn { run = (f) }", &empty()),
+            "E0411"
+        );
     }
 
     #[test]

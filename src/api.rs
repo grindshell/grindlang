@@ -72,7 +72,8 @@ pub enum BuildError {
     /// Lexing / parsing / resolution / type-checking diagnostics.
     #[error("{0}")]
     Check(#[from] crate::diagnostics::Diagnostics),
-    /// IR lowering failed (an unsupported construct or an internal invariant).
+    /// IR lowering failed. The checker rejects everything lowering can't express, so this is
+    /// always an internal invariant violation, never a problem in the script.
     #[error("{0}")]
     Lower(#[from] LowerError),
     /// Cranelift codegen failed.

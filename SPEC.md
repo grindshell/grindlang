@@ -142,7 +142,9 @@ exportstat ::= 'return' tablecons [';']
 - If present, the trailing `exportstat` **curates the public surface**: only the names it
   lists are exported, under the keys given. Without it, *all* top-level declarations are
   exported under their own names. (There is no `local M = {}` / `return M` idiom — the
-  module table is implicit.)
+  module table is implicit.) Each entry is `key = Name`, where `Name` is a top-level function
+  or constant; any other value — a literal, an expression, a host function — is an `E0411`
+  error.
 - `function M.foo()` style member syntax does **not** exist — all top-level functions are
   already module members.
 
@@ -393,6 +395,9 @@ end
   boundary) and held by the host, which can re-invoke it later — multiple times, observing
   mutations to its upvalues between calls (`Module::call_value`). A returned closure keeps its
   backing code and captured state alive for as long as the host holds it.
+- A **named** top-level or host function is not a value: it may only be called directly,
+  `f(args)`. Binding, returning, storing, or passing it (`local g = f`) is an `E0434` error. To
+  use one as a value, wrap the call in a closure: `local g = function(x) return f(x) end`.
 - A closure is **bound to the module instance that created it**. Only that instance may invoke
   it; passing it to a different `Module` — even one compiled from the identical source — is a
   runtime error, as is a script receiving a foreign closure (via a host function) and calling

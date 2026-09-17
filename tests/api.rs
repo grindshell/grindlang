@@ -311,6 +311,38 @@ fn build_error_on_type_mismatch() {
     }
 }
 
+/// Programs the IR can't express are rejected by the checker with a coded, located diagnostic,
+/// never as a lowering error: every `BuildError::Lower` is an internal bug.
+#[test]
+fn inexpressible_programs_are_check_errors() {
+    let mut engine = Engine::new();
+    engine.register_fn("roll", || 4.0);
+    let cases = [
+        (
+            "function helper() return 1 end\nfunction f() local g = helper return g() end",
+            "E0434",
+        ),
+        ("function f() local g = roll return g() end", "E0434"),
+        ("function f() return 1 end\nreturn { run = 1 }", "E0411"),
+        ("function f() return 1 end\nreturn { run = roll }", "E0411"),
+    ];
+    for (src, code) in cases {
+        match engine.compile(src) {
+            Err(grindlang::api::BuildError::Check(d)) => {
+                let d = d.iter().next().expect("a diagnostic");
+                assert_eq!(d.code, code, "{src}");
+                assert_ne!(
+                    d.span,
+                    grindlang::Span::dummy(),
+                    "{src}: diagnostic has no location"
+                );
+            }
+            Err(other) => panic!("{src}: expected a Check error, got {other:?}"),
+            Ok(_) => panic!("{src}: expected compilation to fail"),
+        }
+    }
+}
+
 /// A result-type mismatch surfaces as `CallError::Result`.
 #[test]
 fn call_error_on_result_mismatch() {
