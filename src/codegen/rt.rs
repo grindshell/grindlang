@@ -53,7 +53,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::runtime::builtins;
-use crate::runtime::repr::{Repr, Slot};
+use crate::runtime::repr::Repr;
 use crate::value::{ClosureObj, NativeFn, RunError, Value};
 
 /// A reference-value handle: an index into [`RtCtx::values`]. Handle `0` is always `nil`.
@@ -379,8 +379,8 @@ impl RtCtx {
     /// Decode an operand word generated code passed with tag `tag` (see [`repr_tag`]).
     fn operand(&self, bits: u64, tag: u32) -> Value {
         match tag {
-            TAG_NUMBER => Value::Number(Slot::from_bits(bits).as_number()),
-            TAG_BOOL => Value::Bool(Slot::from_bits(bits).as_bool()),
+            TAG_NUMBER => Value::Number(f64::from_bits(bits)),
+            TAG_BOOL => Value::Bool(bits != 0),
             _ => self.value(bits),
         }
     }
@@ -394,14 +394,14 @@ impl RtCtx {
     fn result(&mut self, v: Value, tag: u32) -> u64 {
         match tag {
             TAG_NUMBER => match v.as_f64() {
-                Some(n) => Slot::from_number(n).bits(),
+                Some(n) => n.to_bits(),
                 None => {
                     self.fail(unbox_type_error("number", &v));
                     0
                 }
             },
             TAG_BOOL => match v.as_bool() {
-                Some(b) => Slot::from_bool(b).bits(),
+                Some(b) => b as u64,
                 None => {
                     self.fail(unbox_type_error("bool", &v));
                     0
@@ -425,11 +425,11 @@ impl RtCtx {
         match repr {
             Repr::Number => {
                 let n = v.as_f64().ok_or_else(|| arg_type_error("number", &v))?;
-                Ok(Slot::from_number(n).bits())
+                Ok(n.to_bits())
             }
             Repr::Bool => {
                 let b = v.as_bool().ok_or_else(|| arg_type_error("bool", &v))?;
-                Ok(Slot::from_bool(b).bits())
+                Ok(b as u64)
             }
             Repr::Ptr => Ok(self.intern(v)),
             Repr::Unit => Ok(0),
@@ -440,8 +440,8 @@ impl RtCtx {
     /// [`Repr`]. Mirrors the trampoline's `encode_word`.
     pub fn decode_ret(&self, bits: u64, repr: Repr) -> Value {
         match repr {
-            Repr::Number => Value::Number(Slot::from_bits(bits).as_number()),
-            Repr::Bool => Value::Bool(Slot::from_bits(bits).as_bool()),
+            Repr::Number => Value::Number(f64::from_bits(bits)),
+            Repr::Bool => Value::Bool(bits != 0),
             Repr::Ptr => self.value(bits),
             Repr::Unit => Value::Nil,
         }

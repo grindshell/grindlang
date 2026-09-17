@@ -16,8 +16,8 @@
 //! * Phase 3: static type inference & checking.
 //! * Phase 4: reference interpreter (semantics oracle).
 //! * Phase 5: mid-level typed IR + lowering.
-//! * Phase 6: runtime & host ABI ([`runtime`]) — value representation, arena, heap layouts,
-//!   host calling convention, and the builtin catalog.
+//! * Phase 6: shared runtime ([`runtime`]) — the machine value representation and the builtin
+//!   catalog.
 //! * Phase 7: cranelift JIT ([`codegen`], `jit` feature) — compiles the IR to native code via
 //!   a hybrid value model (unboxed scalars, handle-based reference values). Closures with
 //!   upvalues and calling first-class function values are supported.
@@ -59,7 +59,7 @@ pub use ast::Module;
 pub use diagnostics::{Diagnostic, Diagnostics, Severity, Span};
 pub use ir::{LowerError, Program};
 pub use resolve::{Binding, Resolution, ResolveConfig};
-pub use runtime::{Arena, FnAbi, MemorySchema, Repr, Slot};
+pub use runtime::Repr;
 pub use types::{FnType, Type, TypeConfig, TypeInfo};
 pub use value::{RunError, Value};
 

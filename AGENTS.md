@@ -104,7 +104,7 @@ source (.lua-syntax text)
        ├─ Interpreter   tree-walking oracle      src/interp.rs        (feature: interp)
        ├─ Vm            IR interpreter oracle     src/ir.rs::vm        (feature: interp)
        └─ codegen       cranelift IR → native     src/codegen/         (feature: jit)
-            └─ runtime  arena, reprs, host ABI, builtins  src/runtime/
+            └─ runtime  reprs, builtins           src/runtime/
   host API: Engine / Module / Value marshaling   src/api.rs           (feature: jit)
   CLI runner: run a file (pyc-style IR cache)       src/bin/grindlang.rs (features: jit + serde)
 ```

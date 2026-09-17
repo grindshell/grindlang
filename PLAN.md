@@ -230,16 +230,17 @@ trust model), so it is left alone.
   (no global stdlib namespace pollution; deterministic only).
 - **Exit:** runtime callable from the interpreter; ABI documented and tested.
 
-> **Delivered (ABI-first; raw-pointer/`unsafe` arena addresses deferred to Phase 7).**
-> `src/runtime/` defines the value representation (`repr`: `Slot`/`Repr` — `number→f64`,
-> `bool→i8`, references/optionals→`i64` arena handles), a reset-per-invocation bump `Arena`
-> (offset-based, capacity-retaining), `#[repr(C)]` heap layouts for string/array/map/record
-> (`layout`), the host calling convention `FnAbi` + memory userdata `MemorySchema` (`host`),
-> and the **single-source-of-truth builtin catalog** (`builtins`) — signatures consumed by
-> the checker and IR lowering, reference impls run by both interpreters. The previously
-> duplicated builtin signature tables were collapsed onto the catalog. Tested via the runtime
-> unit tests, `tests/runtime_abi.rs`, and the existing interpreter/differential suites (which
-> now dispatch builtins through the runtime). Documented in the `runtime` module rustdoc.
+> **Delivered.** `src/runtime/` defines the value representation (`repr`: `Repr` —
+> `number→f64`, `bool→i8`, references/optionals→`i64` handles) and the
+> **single-source-of-truth builtin catalog** (`builtins`) — signatures consumed by the checker
+> and IR lowering, reference impls run by both interpreters and the JIT's shims. The previously
+> duplicated builtin signature tables were collapsed onto the catalog. Documented in the
+> `runtime` module rustdoc.
+>
+> Phase 6 originally also shipped an offset-based bump `Arena`, `#[repr(C)]` heap layouts, and
+> `FnAbi`/`MemorySchema` descriptors, ahead of the backend. Phase 7 took the hybrid handle model
+> instead (below), so no backend ever used them, and they were removed rather than maintained as
+> a contract nothing honoured. Their design is kept under **Deferred: native arena**.
 
 ### Phase 7 — Cranelift codegen / JIT  ✅ done (`src/codegen/`, `jit` feature)
 - Map IR → cranelift IR per function. Value reprs: `f64` for number, `i8` for bool,
@@ -297,6 +298,27 @@ its origin registers a new host function after the closure escaped, and what sho
 the origin module is dropped but the closure is still invoked — error, or run with no host
 bindings? Until a consumer actually needs cross-module closures, the bound-to-origin rule is
 the honest contract.
+
+#### Deferred: native arena
+
+The JIT keeps reference values as `Value`s in `RtCtx`'s per-call table and reaches them through
+`extern "C"` shims. A native arena would let compiled code load and store them directly. The
+design sketched in Phase 6, for whoever picks this up:
+
+- **Allocation.** A bump arena per invocation, reset wholesale when the call returns and keeping
+  its capacity, so steady-state calls stop allocating. Nothing is freed individually, so array
+  growth reallocates a larger object instead of growing in place.
+- **Layouts.** Every payload cell is one 8-byte word. A `string` is a `u32` length followed by
+  its UTF-8 bytes; an `array` is a `u32` length and capacity followed by its elements (element
+  `i` at cell `i - 1`); a `map` is a length and capacity followed by (key handle, value) pairs
+  sorted by key, so lookup is a binary search and iteration order matches the interpreters'
+  `BTreeMap`. A `record` needs no header or keys: its fields are a flat run of cells in
+  sorted-key order, so a field read is a constant-offset load.
+- **Host boundary.** A host function's calling convention is its parameter and return `Repr`s;
+  a record-typed memory binding becomes one typed accessor per field.
+
+The removed prototype (`runtime::{arena, layout, host}`, `tests/runtime_abi.rs`) is in the git
+history before the commit that deleted it.
 
 ### Phase 8 — Host embedding API
 - `Engine` (owns cranelift/JIT context, builtin registry), `Module` (compiled script +
