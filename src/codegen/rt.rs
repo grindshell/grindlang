@@ -11,10 +11,24 @@
 //! (arithmetic, comparisons, control flow) is genuinely native.
 //!
 //! Every shim takes the context pointer as its first argument. A reference op (build an
-//! array, read a field, call a builtin/host fn) becomes a call to one of these shims. Scalars
-//! are **boxed** into handles only at these boundaries (e.g. storing an `f64` into an array)
-//! and **unboxed** straight back out, so a number never lives in the value table longer than
-//! one op.
+//! array, read a field, call a builtin/host fn) becomes a call to one of these shims.
+//!
+//! ## Operands, results, and the value table
+//!
+//! The value table lives for the whole invocation and is never compacted, so anything a loop
+//! body interns per iteration is memory proportional to the iteration count. Two rules keep
+//! ordinary loops from growing it:
+//!
+//! * **Scalars cross as bits.** A value going into a shim (a stored element, a call argument)
+//!   or coming out of one (a field read, a call result) is an operand word plus a [`repr_tag`]
+//!   immediate — the same bits encoding the trampolines use: a `number` is its `f64` bits, a
+//!   `bool` is `0`/`1`, anything else is a handle. A `number` stored into a record or read back
+//!   out never creates a table entry. (An *optional* scalar is a handle by type, so reading one
+//!   still interns it.)
+//! * **Reads share handles.** A reference value read out of somewhere else — a field, a cell,
+//!   host memory, the string pool — is interned through [`RtCtx::intern_shared`], which reuses
+//!   the handle already given to the same object this call. Freshly *created* values (a table
+//!   literal, a concatenation) still take a new entry each: they are new objects.
 //!
 //! ## Errors
 //!
@@ -32,7 +46,9 @@
 //! functions and write host memory that the interpreter oracles never reach.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -50,12 +66,30 @@ pub const NIL: Handle = 0;
 /// [`RtCtx::error`]. Never a valid handle (handles are small table indices).
 pub const ERR: Handle = u64::MAX;
 
-/// Compile-time constant pools, interned during codegen and shared (by [`Arc`]) with every
+/// Operand/result tag: the word is an `f64`'s bits.
+pub const TAG_NUMBER: u32 = 0;
+/// Operand/result tag: the word is a `bool` (`0`/`1`).
+pub const TAG_BOOL: u32 = 1;
+/// Operand/result tag: the word is a value-table [`Handle`].
+pub const TAG_HANDLE: u32 = 2;
+
+/// The tag generated code passes alongside an operand or result word of representation `r`
+/// (see the module docs). `Unit` has no value; its word is the `nil` handle.
+pub fn repr_tag(r: Repr) -> u32 {
+    match r {
+        Repr::Number => TAG_NUMBER,
+        Repr::Bool => TAG_BOOL,
+        Repr::Ptr | Repr::Unit => TAG_HANDLE,
+    }
+}
+
+/// Compile-time constant pools, interned during codegen and shared (by [`Rc`]) with every
 /// [`RtCtx`]. Shims index into these with the immediates baked into the generated code.
 #[derive(Debug, Default)]
 pub struct Pools {
-    /// Constant string literals (`ConstString`).
-    pub strings: Vec<String>,
+    /// Constant string literals (`ConstString`), already in [`Value::Str`]'s form so evaluating
+    /// a literal shares the pooled string rather than allocating a copy.
+    pub strings: Vec<Rc<str>>,
     /// Field / map-key name literals (`FieldGet`/`FieldSet`).
     pub names: Vec<String>,
     /// Host function names, by host id.
@@ -95,7 +129,11 @@ impl Pools {
     }
 
     pub fn intern_string(&mut self, s: &str) -> u32 {
-        Self::intern(&mut self.strings, s)
+        if let Some(i) = self.strings.iter().position(|x| &**x == s) {
+            return i as u32;
+        }
+        self.strings.push(Rc::from(s));
+        (self.strings.len() - 1) as u32
     }
     pub fn intern_name(&mut self, s: &str) -> u32 {
         Self::intern(&mut self.names, s)
@@ -131,7 +169,7 @@ impl Pools {
 /// an opaque `*mut RtCtx`; shims reconstitute `&mut RtCtx` from it.
 ///
 /// Has no lifetime parameter so it is sound to pass as a raw pointer: it owns its
-/// [`Value`]s and shares the [`Pools`] by [`Arc`].
+/// [`Value`]s and shares the [`Pools`] by [`Rc`].
 ///
 /// `#[repr(C)]` is **load-bearing**: generated code reads [`errored`](Self::errored) with a
 /// plain load at offset 0 (see [`ERRORED_OFFSET`]), so that field must stay first and the
@@ -144,7 +182,10 @@ pub struct RtCtx {
     errored: u8,
     /// The value table; index `0` is permanently `nil`.
     values: Vec<Value>,
-    pools: Arc<Pools>,
+    /// The handle already given to each object interned by [`intern_shared`](Self::intern_shared)
+    /// this call, keyed by allocation address.
+    shared: HashMap<usize, Handle, BuildHasherDefault<AddrHasher>>,
+    pools: Rc<Pools>,
     /// Host functions resolved by id (parallel to [`Pools::host_fns`]).
     host: Vec<Option<NativeFn>>,
     /// Host-memory methods resolved by id (parallel to [`Pools::methods`]).
@@ -216,6 +257,49 @@ fn unbox_type_error(want: &str, got: &Value) -> RunError {
     RunError::Runtime(format!("expected a {want}, found {}", got.type_name()))
 }
 
+/// The allocation a reference value points at, or `None` for a value with no identity (`nil`,
+/// a scalar). Two values with the same address are the same object.
+fn identity(v: &Value) -> Option<usize> {
+    Some(match v {
+        Value::Str(s) => Rc::as_ptr(s) as *const u8 as usize,
+        Value::Array(a) => Rc::as_ptr(a) as *const () as usize,
+        Value::Table(t) => Rc::as_ptr(t) as *const () as usize,
+        Value::Tuple(t) => Rc::as_ptr(t) as *const () as usize,
+        Value::Cell(c) => Rc::as_ptr(c) as *const () as usize,
+        Value::Closure(c) => Rc::as_ptr(c) as *const () as usize,
+        _ => return None,
+    })
+}
+
+/// Hasher for [`RtCtx::shared`]'s address keys. An address is already unique, so SipHash's
+/// flood resistance buys nothing, and this lookup sits on every reference read. The multiply
+/// spreads the address and the fold brings high bits down, since aligned addresses have their
+/// low bits clear and the table indexes buckets by the low bits.
+#[derive(Default)]
+struct AddrHasher(u64);
+
+impl Hasher for AddrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    // Only `usize` keys are hashed; this byte fold exists because the trait requires it.
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3);
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        let h = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 32);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+}
+
 /// The id of the module that built `c`, or `None` if it carries no JIT origin stamp (an IR VM
 /// closure, which the JIT can't run either).
 pub fn closure_module_id(c: &ClosureObj) -> Option<u64> {
@@ -235,7 +319,7 @@ impl RtCtx {
     /// Build a context for one invocation. `host`/`memory` are resolved into id order by the
     /// caller (the compiled module) from the user-registered bindings.
     pub fn new(
-        pools: Arc<Pools>,
+        pools: Rc<Pools>,
         host: Vec<Option<NativeFn>>,
         methods: Vec<Option<NativeFn>>,
         memory: Vec<Option<Value>>,
@@ -245,6 +329,7 @@ impl RtCtx {
         RtCtx {
             errored: 0,
             values: vec![Value::Nil],
+            shared: HashMap::default(),
             const_cache: vec![None; pools.consts.len()],
             frozen: std::collections::HashSet::new(),
             pools,
@@ -266,20 +351,76 @@ impl RtCtx {
         (self.values.len() - 1) as Handle
     }
 
+    /// Intern a value that was *read* rather than created, reusing the handle this call already
+    /// gave the same object. Reading one table field a thousand times is one object and takes
+    /// one entry, not a thousand.
+    ///
+    /// Keying on the allocation address is sound because the table holds a clone of every value
+    /// it interns until [`reset`](Self::reset): no interned object can be freed mid-call, so no
+    /// other object can come to occupy its address. Handles are interchangeable references —
+    /// nothing ever overwrites a table entry — so two SSA values sharing one is harmless.
+    pub fn intern_shared(&mut self, v: Value) -> Handle {
+        let Some(addr) = identity(&v) else {
+            return self.intern(v);
+        };
+        if let Some(&h) = self.shared.get(&addr) {
+            return h;
+        }
+        let h = self.intern(v);
+        self.shared.insert(addr, h);
+        h
+    }
+
     /// Read a handle's value (cloning; reference values clone their `Rc`).
     pub fn value(&self, h: Handle) -> Value {
         self.values.get(h as usize).cloned().unwrap_or(Value::Nil)
     }
 
+    /// Decode an operand word generated code passed with tag `tag` (see [`repr_tag`]).
+    fn operand(&self, bits: u64, tag: u32) -> Value {
+        match tag {
+            TAG_NUMBER => Value::Number(Slot::from_bits(bits).as_number()),
+            TAG_BOOL => Value::Bool(Slot::from_bits(bits).as_bool()),
+            _ => self.value(bits),
+        }
+    }
+
+    /// Encode a value a shim produced as the result word its destination's tag asks for.
+    ///
+    /// A scalar destination gets raw bits and never touches the value table. Its static type
+    /// promises a `number`/`bool`, but a host-supplied value (an off-schema memory binding, a
+    /// host function returning the wrong shape) can contradict that at runtime; that latches an
+    /// error and returns `0`, and generated code guards on the errored flag before using it.
+    fn result(&mut self, v: Value, tag: u32) -> u64 {
+        match tag {
+            TAG_NUMBER => match v.as_f64() {
+                Some(n) => Slot::from_number(n).bits(),
+                None => {
+                    self.fail(unbox_type_error("number", &v));
+                    0
+                }
+            },
+            TAG_BOOL => match v.as_bool() {
+                Some(b) => Slot::from_bool(b).bits(),
+                None => {
+                    self.fail(unbox_type_error("bool", &v));
+                    0
+                }
+            },
+            _ => self.intern_shared(v),
+        }
+    }
+
     /// Encode a call argument into a raw ABI word per its declared [`Repr`] (the **bits ABI**
     /// the trampolines decode). Scalars become raw bits with no value-table entry; only
-    /// reference values are interned to a handle. Mirrors the trampoline's `decode_param`.
+    /// reference values are interned to a handle. Mirrors the trampoline's `decode_word`.
     ///
     /// A value that doesn't fit the declared scalar repr is **rejected**, not coerced. This is
     /// the one place the host boundary has to check: a scalar becomes raw `f64`/`i8` bits here,
     /// so by the time compiled code sees it there is nothing left to tell a string from the
     /// `0.0` it would have been silently turned into. Reference params keep their value and are
-    /// checked at the point of use instead ([`rt_unbox_number`]).
+    /// checked where they are first forced into a scalar instead ([`RtCtx::result`],
+    /// [`rt_unbox_number`]).
     pub fn encode_arg(&mut self, v: Value, repr: Repr) -> Result<u64, RunError> {
         match repr {
             Repr::Number => {
@@ -296,7 +437,7 @@ impl RtCtx {
     }
 
     /// Decode a trampoline's raw ABI result word back into a [`Value`] per the return
-    /// [`Repr`]. Mirrors the trampoline's `encode_ret`.
+    /// [`Repr`]. Mirrors the trampoline's `encode_word`.
     pub fn decode_ret(&self, bits: u64, repr: Repr) -> Value {
         match repr {
             Repr::Number => Value::Number(Slot::from_bits(bits).as_number()),
@@ -315,6 +456,7 @@ impl RtCtx {
     pub fn reset(&mut self) {
         self.values.clear();
         self.values.push(Value::Nil);
+        self.shared.clear();
         // Constants are memoized per call: the next invocation re-evaluates what it reads, so
         // no constant (and nothing reachable from one) survives between calls.
         self.const_cache.fill(None);
@@ -341,6 +483,12 @@ impl RtCtx {
         self.host = host;
         self.methods = methods;
         self.memory = memory;
+    }
+
+    /// Number of entries in the value table (including the permanent `nil`).
+    #[cfg(test)]
+    pub(crate) fn value_count(&self) -> usize {
+        self.values.len()
     }
 
     fn get(&self, h: Handle) -> &Value {
@@ -411,10 +559,12 @@ pub unsafe extern "C" fn rt_unbox_bool(ctx: *mut RtCtx, h: Handle) -> i8 {
 
 // ---- constants / refs -------------------------------------------------------
 
+/// Evaluate a string literal. The pooled string is shared, not copied, so a literal inside a
+/// loop takes one table entry for the whole call.
 pub unsafe extern "C" fn rt_const_string(ctx: *mut RtCtx, idx: u32) -> Handle {
     let ctx = ctx!(ctx);
-    let s = ctx.pools.strings[idx as usize].clone();
-    ctx.intern(Value::string(s))
+    let s = Rc::clone(&ctx.pools.strings[idx as usize]);
+    ctx.intern_shared(Value::Str(s))
 }
 
 /// The constant already evaluated during this call, or [`ERR`] as a *miss* marker. A miss can't
@@ -457,12 +607,12 @@ unsafe fn reject_frozen(ctx: *mut RtCtx, h: Handle) -> Option<Handle> {
     None
 }
 
-/// Read a host memory binding. A binding the host declared but never provided is an error at
-/// the point of use, matching both interpreters — not a silent `nil`.
-pub unsafe extern "C" fn rt_memory_ref(ctx: *mut RtCtx, id: u32) -> Handle {
+/// Read a host memory binding, as a result word per `tag`. A binding the host declared but never
+/// provided is an error at the point of use, matching both interpreters — not a silent `nil`.
+pub unsafe extern "C" fn rt_memory_ref(ctx: *mut RtCtx, id: u32, tag: u32) -> u64 {
     let ctx = ctx!(ctx);
     match ctx.memory.get(id as usize).cloned().flatten() {
-        Some(v) => ctx.intern(v),
+        Some(v) => ctx.result(v, tag),
         None => {
             let name = ctx.pools.memories[id as usize].clone();
             ctx.fail(RunError::Runtime(format!(
@@ -472,11 +622,11 @@ pub unsafe extern "C" fn rt_memory_ref(ctx: *mut RtCtx, id: u32) -> Handle {
     }
 }
 
-pub unsafe extern "C" fn rt_namespace_field(ctx: *mut RtCtx, id: u32) -> Handle {
+pub unsafe extern "C" fn rt_namespace_field(ctx: *mut RtCtx, id: u32, tag: u32) -> u64 {
     let ctx = ctx!(ctx);
-    let (ns, field) = ctx.pools.namespace_fields[id as usize].clone();
-    match builtins::field_value(&ns, &field) {
-        Ok(v) => ctx.intern(v),
+    let (ns, field) = &ctx.pools.namespace_fields[id as usize];
+    match builtins::field_value(ns, field) {
+        Ok(v) => ctx.result(v, tag),
         Err(e) => ctx.fail(e),
     }
 }
@@ -488,9 +638,9 @@ pub unsafe extern "C" fn rt_array_new(ctx: *mut RtCtx, cap: u32) -> Handle {
     ctx.intern(Value::array(Vec::with_capacity(cap as usize)))
 }
 
-pub unsafe extern "C" fn rt_array_push(ctx: *mut RtCtx, arr: Handle, elem: Handle) {
+pub unsafe extern "C" fn rt_array_push(ctx: *mut RtCtx, arr: Handle, bits: u64, tag: u32) {
     let ctx = ctx!(ctx);
-    let v = ctx.value(elem);
+    let v = ctx.operand(bits, tag);
     if let Value::Array(a) = ctx.get(arr) {
         a.borrow_mut().push(v);
     }
@@ -503,26 +653,22 @@ pub unsafe extern "C" fn rt_tuple_new(ctx: *mut RtCtx, cap: u32) -> Handle {
     ctx.intern(Value::tuple(Vec::with_capacity(cap as usize)))
 }
 
-pub unsafe extern "C" fn rt_tuple_push(ctx: *mut RtCtx, tup: Handle, elem: Handle) {
+pub unsafe extern "C" fn rt_tuple_push(ctx: *mut RtCtx, tup: Handle, bits: u64, tag: u32) {
     let ctx = ctx!(ctx);
-    let v = ctx.value(elem);
+    let v = ctx.operand(bits, tag);
     if let Value::Tuple(t) = ctx.get(tup) {
         t.borrow_mut().push(v);
     }
 }
 
-/// Read the `idx`-th (0-based, always in range) element of a tuple. The result is a boxed
-/// handle the caller unboxes to the element's declared [`Repr`].
-pub unsafe extern "C" fn rt_tuple_get(ctx: *mut RtCtx, tup: Handle, idx: u32) -> Handle {
+/// Read the `idx`-th (0-based, always in range) element of a tuple, as a result word per `tag`.
+pub unsafe extern "C" fn rt_tuple_get(ctx: *mut RtCtx, tup: Handle, idx: u32, tag: u32) -> u64 {
     let ctx = ctx!(ctx);
     let elem = match ctx.get(tup) {
         Value::Tuple(t) => t.borrow().get(idx as usize).cloned(),
         _ => None,
     };
-    match elem {
-        Some(v) => ctx.intern(v),
-        None => NIL,
-    }
+    ctx.result(elem.unwrap_or(Value::Nil), tag)
 }
 
 pub unsafe extern "C" fn rt_table_new(ctx: *mut RtCtx) -> Handle {
@@ -531,7 +677,7 @@ pub unsafe extern "C" fn rt_table_new(ctx: *mut RtCtx) -> Handle {
 
 // ---- indexed access ---------------------------------------------------------
 
-pub unsafe extern "C" fn rt_array_get(ctx: *mut RtCtx, arr: Handle, idx: f64) -> Handle {
+pub unsafe extern "C" fn rt_array_get(ctx: *mut RtCtx, arr: Handle, idx: f64, tag: u32) -> u64 {
     let ctx = ctx!(ctx);
     let elem = match ctx.get(arr) {
         Value::Array(a) => {
@@ -543,23 +689,21 @@ pub unsafe extern "C" fn rt_array_get(ctx: *mut RtCtx, arr: Handle, idx: f64) ->
         }
         _ => None,
     };
-    match elem {
-        Some(v) => ctx.intern(v),
-        None => NIL,
-    }
+    ctx.result(elem.unwrap_or(Value::Nil), tag)
 }
 
 pub unsafe extern "C" fn rt_array_set(
     ctx: *mut RtCtx,
     arr: Handle,
     idx: f64,
-    val: Handle,
+    bits: u64,
+    tag: u32,
 ) -> Handle {
     if let Some(e) = unsafe { reject_frozen(ctx, arr) } {
         return e;
     }
     let ctx = ctx!(ctx);
-    let v = ctx.value(val);
+    let v = ctx.operand(bits, tag);
     let a = match ctx.get(arr) {
         Value::Array(a) => a.clone(),
         _ => return ctx.fail(RunError::Internal("array set on a non-array".into())),
@@ -585,31 +729,24 @@ pub unsafe extern "C" fn rt_array_set(
     }
 }
 
-pub unsafe extern "C" fn rt_map_get(ctx: *mut RtCtx, map: Handle, key: Handle) -> Handle {
+pub unsafe extern "C" fn rt_map_get(ctx: *mut RtCtx, map: Handle, key: Handle, tag: u32) -> u64 {
     let ctx = ctx!(ctx);
-    let k = ctx.get(key).as_string();
-    let v = match (k, ctx.get(map)) {
-        (Some(k), Value::Table(t)) => t.borrow().get(&k).cloned(),
+    let v = match (ctx.get(key), ctx.get(map)) {
+        (Value::Str(k), Value::Table(t)) => t.borrow().get(&**k).cloned(),
         _ => None,
     };
-    match v {
-        Some(v) => ctx.intern(v),
-        None => NIL,
-    }
+    ctx.result(v.unwrap_or(Value::Nil), tag)
 }
 
-/// Insert under a **dynamic** string key — the one thing [`rt_field_init`] can't do, since its
-/// key is a name-pool index fixed at compile time. Not a shim: generated code only ever reaches
-/// this through [`rt_map_set`].
-///
-/// # Safety
-/// `ctx` must be the live context pointer the shim was handed.
-unsafe fn table_insert(ctx: *mut RtCtx, tbl: Handle, key: Handle, val: Handle) {
-    let ctx = ctx!(ctx);
-    let k = ctx.get(key).as_string();
-    let v = ctx.value(val);
-    if let (Some(k), Value::Table(t)) = (k, ctx.get(tbl)) {
-        t.borrow_mut().insert(k, v);
+/// Store `v` under `key`, allocating the key `String` only for a new entry. Overwriting an
+/// existing field or map key — what an assignment inside a loop does — allocates nothing.
+fn set_entry(table: &RefCell<BTreeMap<String, Value>>, key: &str, v: Value) {
+    let mut table = table.borrow_mut();
+    match table.get_mut(key) {
+        Some(slot) => *slot = v,
+        None => {
+            table.insert(key.to_owned(), v);
+        }
     }
 }
 
@@ -620,34 +757,45 @@ pub unsafe extern "C" fn rt_map_set(
     ctx: *mut RtCtx,
     map: Handle,
     key: Handle,
-    val: Handle,
+    bits: u64,
+    tag: u32,
 ) -> Handle {
     if let Some(e) = unsafe { reject_frozen(ctx, map) } {
         return e;
     }
+    let ctx = ctx!(ctx);
+    let v = ctx.operand(bits, tag);
     // A map shares the record/table backing representation.
-    unsafe { table_insert(ctx, map, key, val) };
+    if let (Value::Str(k), Value::Table(t)) = (ctx.get(key), ctx.get(map)) {
+        set_entry(t, k, v);
+    }
     NIL
 }
 
-pub unsafe extern "C" fn rt_field_get(ctx: *mut RtCtx, base: Handle, name_idx: u32) -> Handle {
+pub unsafe extern "C" fn rt_field_get(
+    ctx: *mut RtCtx,
+    base: Handle,
+    name_idx: u32,
+    tag: u32,
+) -> u64 {
     let ctx = ctx!(ctx);
-    let name = ctx.pools.names[name_idx as usize].clone();
-    let v = ctx.get(base).field(&name);
-    match v {
-        Some(v) => ctx.intern(v),
-        None => NIL,
-    }
+    let v = ctx.get(base).field(&ctx.pools.names[name_idx as usize]);
+    ctx.result(v.unwrap_or(Value::Nil), tag)
 }
 
 /// Populate a field while *building* a table literal. Never a user write — the table does not
 /// exist outside the constructor yet — so it needs no immutability check.
-pub unsafe extern "C" fn rt_field_init(ctx: *mut RtCtx, base: Handle, name_idx: u32, val: Handle) {
+pub unsafe extern "C" fn rt_field_init(
+    ctx: *mut RtCtx,
+    base: Handle,
+    name_idx: u32,
+    bits: u64,
+    tag: u32,
+) {
     let ctx = ctx!(ctx);
-    let name = ctx.pools.names[name_idx as usize].clone();
-    let v = ctx.value(val);
+    let v = ctx.operand(bits, tag);
     if let Value::Table(t) = ctx.get(base) {
-        t.borrow_mut().insert(name, v);
+        set_entry(t, &ctx.pools.names[name_idx as usize], v);
     }
 }
 
@@ -656,12 +804,13 @@ pub unsafe extern "C" fn rt_field_set(
     ctx: *mut RtCtx,
     base: Handle,
     name_idx: u32,
-    val: Handle,
+    bits: u64,
+    tag: u32,
 ) -> Handle {
     if let Some(e) = unsafe { reject_frozen(ctx, base) } {
         return e;
     }
-    unsafe { rt_field_init(ctx, base, name_idx, val) };
+    unsafe { rt_field_init(ctx, base, name_idx, bits, tag) };
     NIL
 }
 
@@ -688,19 +837,24 @@ pub unsafe extern "C" fn rt_len(ctx: *mut RtCtx, h: Handle) -> f64 {
     }
 }
 
+/// A string operand's text, borrowed; a non-string reads as `""`.
+fn str_of(v: &Value) -> &str {
+    match v {
+        Value::Str(s) => s,
+        _ => "",
+    }
+}
+
 pub unsafe extern "C" fn rt_concat(ctx: *mut RtCtx, l: Handle, r: Handle) -> Handle {
     let ctx = ctx!(ctx);
-    let a = ctx.get(l).as_string().unwrap_or_default();
-    let b = ctx.get(r).as_string().unwrap_or_default();
-    ctx.intern(Value::string(format!("{a}{b}")))
+    let joined = [str_of(ctx.get(l)), str_of(ctx.get(r))].concat();
+    ctx.intern(Value::string(joined))
 }
 
 /// String ordering: `-1` / `0` / `1`. (Number comparison is native; only strings call here.)
 pub unsafe extern "C" fn rt_str_cmp(ctx: *mut RtCtx, l: Handle, r: Handle) -> i32 {
     let ctx = ctx!(ctx);
-    let a = ctx.get(l).as_string().unwrap_or_default();
-    let b = ctx.get(r).as_string().unwrap_or_default();
-    match a.cmp(&b) {
+    match str_of(ctx.get(l)).cmp(str_of(ctx.get(r))) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
@@ -737,26 +891,29 @@ pub unsafe extern "C" fn rt_raise_nan_compare(ctx: *mut RtCtx) {
 
 // ---- calls ------------------------------------------------------------------
 
-/// Collect `argc` argument values from a handle array.
+/// Decode `argc` call arguments. Each takes two words at `argv`: the operand bits, then its tag
+/// (see [`repr_tag`]), so a scalar argument never passes through the value table.
 ///
 /// # Safety
-/// `argv` must point to `argc` readable `u64` handles.
-unsafe fn collect_args(ctx: &RtCtx, argv: *const Handle, argc: u32) -> Vec<Value> {
-    let mut out = Vec::with_capacity(argc as usize);
-    for i in 0..argc as usize {
-        // SAFETY: caller guarantees `argv` has `argc` handles.
-        let h = unsafe { *argv.add(i) };
-        out.push(ctx.value(h));
-    }
-    out
+/// `argv` must point to `2 * argc` readable `u64` words.
+unsafe fn collect_args(ctx: &RtCtx, argv: *const u64, argc: u32) -> Vec<Value> {
+    (0..argc as usize)
+        .map(|i| {
+            // SAFETY: caller guarantees `argv` holds `argc` (bits, tag) pairs.
+            let (bits, tag) = unsafe { (*argv.add(2 * i), *argv.add(2 * i + 1)) };
+            ctx.operand(bits, tag as u32)
+        })
+        .collect()
 }
 
+/// Call a host function; the result is a word per `tag`.
 pub unsafe extern "C" fn rt_call_host(
     ctx: *mut RtCtx,
     id: u32,
-    argv: *const Handle,
+    argv: *const u64,
     argc: u32,
-) -> Handle {
+    tag: u32,
+) -> u64 {
     let ctx = ctx!(ctx);
     let args = unsafe { collect_args(ctx, argv, argc) };
     let f = match ctx.host.get(id as usize).and_then(|f| f.clone()) {
@@ -769,20 +926,20 @@ pub unsafe extern "C" fn rt_call_host(
         }
     };
     match f(&args) {
-        Ok(v) => ctx.intern(v),
+        Ok(v) => ctx.result(v, tag),
         Err(e) => ctx.fail(e),
     }
 }
 
-/// Invoke a host-memory method (`mem:method(args)`, `SPEC.md` §7). `argv[0]` is the receiver;
-/// the remaining handles are the call arguments. The receiver is passed through to the impl as
-/// its first argument.
+/// Invoke a host-memory method (`mem:method(args)`, `SPEC.md` §7). The first argument is the
+/// receiver, passed through to the impl as its first argument; the result is a word per `tag`.
 pub unsafe extern "C" fn rt_call_method(
     ctx: *mut RtCtx,
     id: u32,
-    argv: *const Handle,
+    argv: *const u64,
     argc: u32,
-) -> Handle {
+    tag: u32,
+) -> u64 {
     let ctx = ctx!(ctx);
     let args = unsafe { collect_args(ctx, argv, argc) };
     let f = match ctx.methods.get(id as usize).and_then(|f| f.clone()) {
@@ -795,7 +952,7 @@ pub unsafe extern "C" fn rt_call_method(
         }
     };
     match f(&args) {
-        Ok(v) => ctx.intern(v),
+        Ok(v) => ctx.result(v, tag),
         Err(e) => ctx.fail(e),
     }
 }
@@ -803,14 +960,14 @@ pub unsafe extern "C" fn rt_call_method(
 pub unsafe extern "C" fn rt_call_builtin_value(
     ctx: *mut RtCtx,
     id: u32,
-    argv: *const Handle,
+    argv: *const u64,
     argc: u32,
-) -> Handle {
+    tag: u32,
+) -> u64 {
     let ctx = ctx!(ctx);
     let args = unsafe { collect_args(ctx, argv, argc) };
-    let ns = ctx.pools.builtin_values[id as usize].clone();
-    match builtins::value_call(&ns, &args) {
-        Ok(v) => ctx.intern(v),
+    match builtins::value_call(&ctx.pools.builtin_values[id as usize], &args) {
+        Ok(v) => ctx.result(v, tag),
         Err(e) => ctx.fail(e),
     }
 }
@@ -818,41 +975,42 @@ pub unsafe extern "C" fn rt_call_builtin_value(
 pub unsafe extern "C" fn rt_call_builtin_member(
     ctx: *mut RtCtx,
     id: u32,
-    argv: *const Handle,
+    argv: *const u64,
     argc: u32,
-) -> Handle {
+    tag: u32,
+) -> u64 {
     let ctx = ctx!(ctx);
     let args = unsafe { collect_args(ctx, argv, argc) };
-    let (ns, member) = ctx.pools.builtin_members[id as usize].clone();
-    match builtins::member_call(&ns, &member, &args) {
-        Ok(v) => ctx.intern(v),
+    let (ns, member) = &ctx.pools.builtin_members[id as usize];
+    match builtins::member_call(ns, member, &args) {
+        Ok(v) => ctx.result(v, tag),
         Err(e) => ctx.fail(e),
     }
 }
 
 // ---- closures (upvalues) ----------------------------------------------------
 
-/// Box a value into a fresh shared upvalue cell; returns its handle.
-pub unsafe extern "C" fn rt_cell_new(ctx: *mut RtCtx, val: Handle) -> Handle {
+/// Put a value into a fresh shared upvalue cell; returns the cell's handle.
+pub unsafe extern "C" fn rt_cell_new(ctx: *mut RtCtx, bits: u64, tag: u32) -> Handle {
     let ctx = ctx!(ctx);
-    let v = ctx.value(val);
-    ctx.intern(Value::Cell(Rc::new(std::cell::RefCell::new(v))))
+    let v = ctx.operand(bits, tag);
+    ctx.intern(Value::Cell(Rc::new(RefCell::new(v))))
 }
 
-/// Read the value currently held in a cell.
-pub unsafe extern "C" fn rt_cell_get(ctx: *mut RtCtx, cell: Handle) -> Handle {
+/// Read the value currently held in a cell, as a result word per `tag`.
+pub unsafe extern "C" fn rt_cell_get(ctx: *mut RtCtx, cell: Handle, tag: u32) -> u64 {
     let ctx = ctx!(ctx);
     let v = match ctx.get(cell) {
         Value::Cell(c) => c.borrow().clone(),
         _ => Value::Nil,
     };
-    ctx.intern(v)
+    ctx.result(v, tag)
 }
 
 /// Write a value into a cell.
-pub unsafe extern "C" fn rt_cell_set(ctx: *mut RtCtx, cell: Handle, val: Handle) {
+pub unsafe extern "C" fn rt_cell_set(ctx: *mut RtCtx, cell: Handle, bits: u64, tag: u32) {
     let ctx = ctx!(ctx);
-    let v = ctx.value(val);
+    let v = ctx.operand(bits, tag);
     if let Value::Cell(c) = ctx.get(cell) {
         *c.borrow_mut() = v;
     }
@@ -869,7 +1027,10 @@ pub unsafe extern "C" fn rt_closure_new(
     argc: u32,
 ) -> Handle {
     let ctx = ctx!(ctx);
-    let env = unsafe { collect_args(ctx, argv, argc) };
+    let env = (0..argc as usize)
+        // SAFETY: generated code passes `argc` cell handles at `argv`.
+        .map(|i| ctx.value(unsafe { *argv.add(i) }))
+        .collect();
     let code = ctx.pools.closure_names[name_id as usize].clone();
     let origin: Rc<dyn Any> = ctx.origin.clone();
     ctx.intern(Value::Closure(Rc::new(ClosureObj {
@@ -879,7 +1040,8 @@ pub unsafe extern "C" fn rt_closure_new(
     })))
 }
 
-/// Read the i-th captured cell from a closure's environment.
+/// Read the i-th captured cell from a closure's environment. Every upvalue access starts here,
+/// so the cell's handle is shared rather than re-interned on each one.
 pub unsafe extern "C" fn rt_closure_env_get(ctx: *mut RtCtx, clo: Handle, i: u32) -> Handle {
     let ctx = ctx!(ctx);
     let cell = match ctx.get(clo) {
@@ -887,7 +1049,7 @@ pub unsafe extern "C" fn rt_closure_env_get(ctx: *mut RtCtx, clo: Handle, i: u32
         _ => None,
     };
     match cell {
-        Some(v) => ctx.intern(v),
+        Some(v) => ctx.intern_shared(v),
         None => NIL,
     }
 }
@@ -986,7 +1148,7 @@ mod tests {
 
     fn empty_ctx() -> RtCtx {
         RtCtx::new(
-            Arc::new(Pools::default()),
+            Rc::new(Pools::default()),
             Vec::new(),
             Vec::new(),
             Vec::new(),

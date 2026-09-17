@@ -752,9 +752,9 @@ fn scalar_constants_still_read_correctly() {
 //
 //   * a scalar *argument* is converted to raw bits at the boundary, so it must be checked
 //     there (`encode_arg`) — nothing downstream can still tell a string from `0.0`;
-//   * everything else (a memory binding, a host function's result) reaches compiled code as a
-//     handle and is only forced into a scalar at the point of use (`rt_unbox_number`), which
-//     is exactly where both interpreters check.
+//   * everything else (a memory binding, a host function's result) is checked where the
+//     runtime first decodes it into a scalar for compiled code — the shim that reads or
+//     returns it, or `rt_unbox_number` for a narrowed optional.
 
 /// A memory bound off-schema (the schema declares a record of numbers, the host supplies `nil`)
 /// used to read as a silent `0`. Found while fixing finding 3 — a different entry point from
@@ -774,8 +774,8 @@ fn ill_typed_memory_binding_is_an_error() {
     assert!(c.is_err(), "an off-schema memory binding must fail");
 }
 
-/// A host function that returns the wrong shape is caught at the same use site — its result
-/// crosses as a handle and only becomes a scalar when the script does arithmetic on it.
+/// A host function that returns the wrong shape is caught too — its declared `number` result is
+/// decoded to a native scalar as the call returns, and that decode checks the shape.
 #[test]
 fn ill_typed_host_function_result_is_an_error() {
     let src = "function f() return tick() + 1 end";
@@ -790,6 +790,56 @@ fn ill_typed_host_function_result_is_an_error() {
     let c = jit.call("f", vec![]);
     assert_agree("host function returning a string", &a, &b, &c);
     assert!(c.is_err(), "an off-signature host result must fail");
+}
+
+/// The `bool` half of the rule above. A scalar result is decoded inside the shim that produced
+/// it, with one mismatch branch per scalar kind, so `number` passing says nothing about `bool`.
+///
+/// JIT-only, for the reason `trampoline_call_rejects_mistyped_arguments` gives: the interpreters
+/// treat any value as a condition by Lua truthiness, so they return 1 for a result the type
+/// system says cannot occur.
+#[test]
+fn ill_typed_bool_host_result_is_an_error_in_the_jit() {
+    let src = "function f() if ready() then return 1 end return 0 end";
+    let mut cfg = TypeConfig::default();
+    cfg.host_functions.insert(
+        "ready".to_string(),
+        FnType {
+            params: vec![],
+            ret: Box::new(Type::Bool),
+        },
+    );
+    let jit = &mut triple(src, &cfg).2;
+    jit.set_host_function("ready", |_: &[Value]| Ok(Value::Number(1.0)));
+    let e = jit
+        .call("f", vec![])
+        .expect_err("a number where `bool` is declared must be rejected");
+    assert!(format!("{e}").contains("expected a bool"), "got {e:?}");
+}
+
+/// Scalar results cross the runtime boundary as raw bits, and a NaN can have *any* bit pattern —
+/// including all ones, which is the handle-level error sentinel `ERR`. A scalar result must
+/// therefore be checked through the errored flag, never compared against `ERR`, or this legal
+/// return value would be reported as a failure.
+#[test]
+fn nan_with_the_error_sentinels_bits_is_an_ordinary_number() {
+    let src = "function f() return tick() + 1 end";
+    let cfg = tick_config();
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let all_ones = || Ok(Value::Number(f64::from_bits(u64::MAX)));
+    interp.set_host_function("tick", move |_: &[Value]| all_ones());
+    vm.set_host_function("tick", move |_: &[Value]| all_ones());
+    jit.set_host_function("tick", move |_: &[Value]| all_ones());
+    let a = interp.call("f", vec![]);
+    let b = vm.call("f", vec![]);
+    let c = jit.call("f", vec![]);
+    assert_agree("host function returning an all-ones NaN", &a, &b, &c);
+    assert!(
+        c.expect("a NaN is a valid number")
+            .as_f64()
+            .unwrap()
+            .is_nan()
+    );
 }
 
 /// The raw `call` path checked arity but not runtime shapes, so a string passed to a `number`

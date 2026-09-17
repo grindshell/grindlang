@@ -92,7 +92,7 @@ pub struct JitModule {
     /// a returned closure after this `JitModule` is dropped stays sound. Cloned into each
     /// [`RtCtx`] so the runtime makes the same check compiled code does.
     origin: Rc<rt::ClosureOrigin>,
-    pools: Arc<Pools>,
+    pools: Rc<Pools>,
     /// export name → its target (function or constant).
     exports: std::collections::BTreeMap<String, ExportTarget>,
     /// function name → trampoline.
@@ -306,7 +306,7 @@ impl JitModule {
 
         Ok(JitModule {
             origin,
-            pools: Arc::new(pools),
+            pools: Rc::new(pools),
             exports: program.exports.clone(),
             fn_tramps,
             const_tramps,
@@ -711,21 +711,22 @@ fn declare_shims(
         ("rt_const_string", &[I64, I32], &[I64]),
         ("rt_const_cached", &[I64, I32], &[I64]),
         ("rt_const_store", &[I64, I32, I64], &[]),
-        ("rt_memory_ref", &[I64, I32], &[I64]),
-        ("rt_namespace_field", &[I64, I32], &[I64]),
+        // A trailing I32 after an operand/result word is its repr tag (`rt::repr_tag`).
+        ("rt_memory_ref", &[I64, I32, I32], &[I64]),
+        ("rt_namespace_field", &[I64, I32, I32], &[I64]),
         ("rt_array_new", &[I64, I32], &[I64]),
-        ("rt_array_push", &[I64, I64, I64], &[]),
+        ("rt_array_push", &[I64, I64, I64, I32], &[]),
         ("rt_tuple_new", &[I64, I32], &[I64]),
-        ("rt_tuple_push", &[I64, I64, I64], &[]),
-        ("rt_tuple_get", &[I64, I64, I32], &[I64]),
+        ("rt_tuple_push", &[I64, I64, I64, I32], &[]),
+        ("rt_tuple_get", &[I64, I64, I32, I32], &[I64]),
         ("rt_table_new", &[I64], &[I64]),
-        ("rt_array_get", &[I64, I64, F64], &[I64]),
-        ("rt_array_set", &[I64, I64, F64, I64], &[I64]),
-        ("rt_map_get", &[I64, I64, I64], &[I64]),
-        ("rt_map_set", &[I64, I64, I64, I64], &[I64]),
-        ("rt_field_get", &[I64, I64, I32], &[I64]),
-        ("rt_field_init", &[I64, I64, I32, I64], &[]),
-        ("rt_field_set", &[I64, I64, I32, I64], &[I64]),
+        ("rt_array_get", &[I64, I64, F64, I32], &[I64]),
+        ("rt_array_set", &[I64, I64, F64, I64, I32], &[I64]),
+        ("rt_map_get", &[I64, I64, I64, I32], &[I64]),
+        ("rt_map_set", &[I64, I64, I64, I64, I32], &[I64]),
+        ("rt_field_get", &[I64, I64, I32, I32], &[I64]),
+        ("rt_field_init", &[I64, I64, I32, I64, I32], &[]),
+        ("rt_field_set", &[I64, I64, I32, I64, I32], &[I64]),
         ("rt_map_keys", &[I64, I64], &[I64]),
         ("rt_len", &[I64, I64], &[F64]),
         ("rt_concat", &[I64, I64, I64], &[I64]),
@@ -734,13 +735,13 @@ fn declare_shims(
         ("rt_truthy", &[I64, I64], &[I8]),
         ("rt_pow", &[F64, F64], &[F64]),
         ("rt_raise_nan_compare", &[I64], &[]),
-        ("rt_call_host", &[I64, I32, I64, I32], &[I64]),
-        ("rt_call_method", &[I64, I32, I64, I32], &[I64]),
-        ("rt_call_builtin_value", &[I64, I32, I64, I32], &[I64]),
-        ("rt_call_builtin_member", &[I64, I32, I64, I32], &[I64]),
-        ("rt_cell_new", &[I64, I64], &[I64]),
-        ("rt_cell_get", &[I64, I64], &[I64]),
-        ("rt_cell_set", &[I64, I64, I64], &[]),
+        ("rt_call_host", &[I64, I32, I64, I32, I32], &[I64]),
+        ("rt_call_method", &[I64, I32, I64, I32, I32], &[I64]),
+        ("rt_call_builtin_value", &[I64, I32, I64, I32, I32], &[I64]),
+        ("rt_call_builtin_member", &[I64, I32, I64, I32, I32], &[I64]),
+        ("rt_cell_new", &[I64, I64, I32], &[I64]),
+        ("rt_cell_get", &[I64, I64, I32], &[I64]),
+        ("rt_cell_set", &[I64, I64, I64, I32], &[]),
         ("rt_closure_new", &[I64, I32, I64, I32], &[I64]),
         ("rt_closure_env_get", &[I64, I64, I32], &[I64]),
         ("rt_closure_code_addr", &[I64, I64], &[I64]),
@@ -827,4 +828,99 @@ fn define_env_trampoline(
         .map_err(|e| JitError::Cranelift(e.to_string()))?;
     module.clear_context(&mut ctx);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::types::{FnType, Type, TypeConfig};
+
+    /// A config with a `double(number) -> number` host function and a `mem` record memory.
+    fn host_config() -> TypeConfig {
+        let mut cfg = TypeConfig::default();
+        cfg.host_functions.insert(
+            "double".into(),
+            FnType {
+                params: vec![Type::Number],
+                ret: Box::new(Type::Number),
+            },
+        );
+        let mut rec = BTreeMap::new();
+        rec.insert("gold".to_string(), Type::Number);
+        cfg.memory.insert("mem".into(), Type::Record(rec));
+        cfg
+    }
+
+    fn module(src: &str) -> JitModule {
+        let program = crate::compile(src, &host_config()).expect("compile");
+        let mut jit = JitModule::compile(&program).expect("jit compile");
+        jit.set_host_function("double", |a| {
+            Ok(Value::Number(a[0].as_f64().unwrap() * 2.0))
+        });
+        let mut mem = BTreeMap::new();
+        mem.insert("gold".to_string(), Value::Number(3.0));
+        jit.set_memory("mem", Value::table(mem));
+        jit
+    }
+
+    /// Value-table entries the pooled context holds after one `f(n)` call.
+    fn entries_after(jit: &mut JitModule, n: f64) -> usize {
+        jit.call("f", vec![Value::Number(n)]).expect("call");
+        jit.cached_ctx.as_ref().expect("pooled ctx").value_count()
+    }
+
+    /// The value table lives for a whole call and is never compacted, so anything a loop body
+    /// adds to it per iteration is memory proportional to the iteration count. None of these
+    /// loops creates a value that outlives its iteration — they only move scalars across the
+    /// runtime boundary or re-read the same objects — so the table must end the same size
+    /// whether the loop ran 10 times or 1000.
+    #[test]
+    fn loops_do_not_grow_the_value_table_per_iteration() {
+        let bodies = [
+            ("record field read", "local t = {a = 1}", "s = s + t.a"),
+            (
+                "record field write",
+                "local t = {a = 0}",
+                "t.a = i s = s + 1",
+            ),
+            (
+                "array element write",
+                "local xs = {0}",
+                "xs[1] = i s = s + 1",
+            ),
+            (
+                "captured variable",
+                "local add = function(x) s = s + x end",
+                "add(i)",
+            ),
+            ("shim builtin", "", "s = s + math.max(i % 7, 3)"),
+            ("string literal", "", "s = s + string.len(\"abc\")"),
+            ("host function", "", "s = s + double(i)"),
+            ("host memory field", "", "s = s + mem.gold"),
+            (
+                "repeated string field read",
+                "local p = {name = \"abc\"}",
+                "s = s + #p.name",
+            ),
+            (
+                "repeated nested table read",
+                "local t = {inner = {a = 2}}",
+                "s = s + t.inner.a",
+            ),
+        ];
+        for (label, setup, body) in bodies {
+            let src = format!(
+                "function f(n)\n  local s = 0\n  {setup}\n  for i = 1, n do\n    {body}\n  end\n  return s\nend"
+            );
+            let mut jit = module(&src);
+            let small = entries_after(&mut jit, 10.0);
+            let large = entries_after(&mut jit, 1000.0);
+            assert_eq!(
+                small, large,
+                "{label}: the value table grew with the iteration count\n{src}"
+            );
+        }
+    }
 }
