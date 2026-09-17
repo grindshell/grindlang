@@ -76,6 +76,61 @@ function fieldwrite(n)
   return t.b
 end";
 
+/// A closure-captured accumulator: every `s = s + x` inside `add` reads the captured cell out of
+/// the closure's environment, reads the cell, and writes it back — the upvalue path.
+const UPVALUE: &str = "\
+function upvalue(n)
+  local s = 0
+  local add = function(x) s = s + x end
+  local i = 1
+  while i <= n do
+    add(i)
+    i = i + 1
+  end
+  return s
+end";
+
+/// Builtins that go through the runtime shim rather than a native instruction (`math.min` /
+/// `math.max` keep the reference NaN semantics), so arguments and results cross the boundary.
+const MINMAX: &str = "\
+function minmax(n)
+  local s = 0
+  local i = 1
+  while i <= n do
+    s = s + math.max(i % 7, 3) - math.min(i % 5, 2)
+    i = i + 1
+  end
+  return s
+end";
+
+/// The `SPEC.md` §5.4 array idiom: an indexed read yields `number?`, narrowed before use.
+const ARRAYSUM: &str = "\
+function arraysum(n)
+  local xs = {1, 2, 3, 4, 5, 6, 7, 8}
+  local s = 0
+  local i = 1
+  while i <= n do
+    local x = xs[(i % 8) + 1]
+    if x ~= nil then s = s + x end
+    i = i + 1
+  end
+  return s
+end";
+
+/// A string-keyed map read per iteration: a string literal key plus a map lookup.
+const MAPREAD: &str = "\
+function mapread(n)
+  local m = {[\"a\"] = 1, [\"b\"] = 2}
+  local s = 0
+  local i = 1
+  while i <= n do
+    local v = m[\"b\"]
+    if v ~= nil then s = s + v end
+    i = i + 1
+  end
+  return s
+end";
+
 // ---- workloads (Luau twins) -------------------------------------------------
 
 const FIB_LUAU: &str = "\
@@ -129,7 +184,13 @@ function fieldwrite(n)
   return t.b
 end";
 
-/// The three workloads as `(label, grindlang src, luau src, export name, args)`.
+// The remaining workloads are valid Luau as written, so each is its own twin.
+const UPVALUE_LUAU: &str = UPVALUE;
+const MINMAX_LUAU: &str = MINMAX;
+const ARRAYSUM_LUAU: &str = ARRAYSUM;
+const MAPREAD_LUAU: &str = MAPREAD;
+
+/// The workloads as `(label, grindlang src, luau src, export name, args)`.
 fn workloads() -> Vec<(
     &'static str,
     &'static str,
@@ -161,6 +222,16 @@ fn workloads() -> Vec<(
             "fieldwrite",
             vec![1000.0],
         ),
+        ("upvalue", UPVALUE, UPVALUE_LUAU, "upvalue", vec![1000.0]),
+        ("minmax", MINMAX, MINMAX_LUAU, "minmax", vec![1000.0]),
+        (
+            "arraysum",
+            ARRAYSUM,
+            ARRAYSUM_LUAU,
+            "arraysum",
+            vec![1000.0],
+        ),
+        ("mapread", MAPREAD, MAPREAD_LUAU, "mapread", vec![1000.0]),
     ]
 }
 
