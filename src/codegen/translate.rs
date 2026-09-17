@@ -71,7 +71,8 @@ fn repr_of_const(cx: &Context<'_>, name: &str) -> Repr {
     cx.const_rets[name]
 }
 
-/// Build the typed signature of a script function: `(ctx, params...) -> ret`.
+/// Build the typed signature of a compiled function: `(ctx, params...) -> ret`. A lifted
+/// closure's hidden env parameter is simply its first `Ptr` param.
 pub fn typed_signature(call_conv: CallConv, params: &[Repr], ret: Repr) -> Signature {
     let mut sig = Signature::new(call_conv);
     sig.params.push(AbiParam::new(types::I64)); // ctx
@@ -86,43 +87,18 @@ pub fn typed_signature(call_conv: CallConv, params: &[Repr], ret: Repr) -> Signa
     sig
 }
 
-/// The uniform trampoline signature: `(ctx, argv, argc) -> handle`.
-pub fn trampoline_signature(call_conv: CallConv) -> Signature {
+/// The uniform trampoline signature: `(ctx, argv, argc) -> word`, or with `env`,
+/// `(ctx, env, argv, argc) -> word` — the form the host invokes a returned closure through
+/// ([`crate::codegen::JitModule::call_value`]), passing the closure value as `env`.
+pub fn trampoline_signature(call_conv: CallConv, env: bool) -> Signature {
     let mut sig = Signature::new(call_conv);
     sig.params.push(AbiParam::new(types::I64)); // ctx
+    if env {
+        sig.params.push(AbiParam::new(types::I64)); // env (closure value handle)
+    }
     sig.params.push(AbiParam::new(types::I64)); // argv: *const u64
     sig.params.push(AbiParam::new(types::I32)); // argc
-    sig.returns.push(AbiParam::new(types::I64)); // result handle
-    sig
-}
-
-/// The typed signature of a *lifted closure*: `(ctx, env, params...) -> ret`. The `env`
-/// (a `Ptr` handle to the closure value carrying the captured cells) is the closure's hidden
-/// first parameter. Used to build the `SigRef` for an indirect `call_indirect`.
-pub fn closure_signature(call_conv: CallConv, params: &[Repr], ret: Repr) -> Signature {
-    let mut sig = Signature::new(call_conv);
-    sig.params.push(AbiParam::new(types::I64)); // ctx
-    sig.params.push(AbiParam::new(types::I64)); // env (closure value handle)
-    for &p in params {
-        if let Some(t) = clif_ty(p) {
-            sig.params.push(AbiParam::new(t));
-        }
-    }
-    if let Some(t) = clif_ty(ret) {
-        sig.returns.push(AbiParam::new(t));
-    }
-    sig
-}
-
-/// The uniform env-trampoline signature: `(ctx, env, argv, argc) -> handle`. Used by the host
-/// to invoke a returned closure value ([`crate::codegen::JitModule::call_value`]).
-pub fn env_trampoline_signature(call_conv: CallConv) -> Signature {
-    let mut sig = Signature::new(call_conv);
-    sig.params.push(AbiParam::new(types::I64)); // ctx
-    sig.params.push(AbiParam::new(types::I64)); // env (closure value handle)
-    sig.params.push(AbiParam::new(types::I64)); // argv: *const u64
-    sig.params.push(AbiParam::new(types::I32)); // argc
-    sig.returns.push(AbiParam::new(types::I64)); // result handle
+    sig.returns.push(AbiParam::new(types::I64)); // result word
     sig
 }
 
@@ -722,14 +698,17 @@ impl<'a, 'b> Translator<'a, 'b> {
         // would jump to null, so take the error-exit before the `call_indirect` below.
         let unresolved = self.builder.ins().icmp_imm(IntCC::Equal, addr, 0);
         self.guard(unresolved);
+        // The lifted function's typed signature: the closure (env) first, then the real params.
         let (param_reprs, ret_repr) = match self.func.value_type(callee).clone() {
             Type::Function(ft) => (
-                ft.params.iter().map(repr_of).collect::<Vec<_>>(),
+                std::iter::once(Repr::Ptr)
+                    .chain(ft.params.iter().map(repr_of))
+                    .collect::<Vec<_>>(),
                 repr_of(&ft.ret),
             ),
-            _ => (Vec::new(), Repr::Ptr),
+            _ => (vec![Repr::Ptr], Repr::Ptr),
         };
-        let sig = closure_signature(self.cx.call_conv, &param_reprs, ret_repr);
+        let sig = typed_signature(self.cx.call_conv, &param_reprs, ret_repr);
         let sigref = self.builder.import_signature(sig);
         let mut call_args = vec![self.ctx_val, clo];
         for &a in args {
@@ -1088,9 +1067,12 @@ fn encode_word(builder: &mut FunctionBuilder<'_>, ret: Repr, res: Option<ClifVal
     }
 }
 
-/// Build a uniform trampoline `(ctx, argv, argc) -> bits` that decodes `argv` per the callee's
+/// Build a uniform trampoline (see [`trampoline_signature`]) that decodes `argv` per the callee's
 /// parameter reprs, calls the typed function, and re-encodes the result. Used by the driver,
 /// which can't form an arbitrary-arity native call.
+///
+/// With `env` (a lifted closure), the closure value is threaded through as the typed function's
+/// hidden first argument and `params` are the *source-level* parameters, excluding the env.
 ///
 /// The buffer uses the **bits ABI** (see [`decode_word`]/[`encode_word`]): scalar args and
 /// results cross the boundary as raw native words, so a number/bool call never touches the
@@ -1102,52 +1084,17 @@ pub fn build_trampoline(
     typed_id: FuncId,
     params: &[Repr],
     ret: Repr,
+    env: bool,
 ) {
     let entry = builder.create_block();
     builder.append_block_params_for_function_params(entry);
     builder.switch_to_block(entry);
     let bp = builder.block_params(entry).to_vec();
-    let (ctx, argv) = (bp[0], bp[1]);
+    // `(ctx, [env,] argv, argc)`: everything before argv is forwarded as-is.
+    let leading = if env { 2 } else { 1 };
+    let argv = bp[leading];
 
-    let mut call_args = vec![ctx];
-    for (i, &r) in params.iter().enumerate() {
-        let slot = builder
-            .ins()
-            .load(types::I64, MemFlags::trusted(), argv, (i * 8) as i32);
-        if let Some(a) = decode_word(&mut builder, r, slot) {
-            call_args.push(a);
-        }
-    }
-
-    let fref = module.declare_func_in_func(typed_id, builder.func);
-    let call = builder.ins().call(fref, &call_args);
-    let res = builder.inst_results(call).first().copied();
-
-    let out = encode_word(&mut builder, ret, res);
-    builder.ins().return_(&[out]);
-    builder.seal_all_blocks();
-    builder.finalize();
-}
-
-/// Build an env-trampoline `(ctx, env, argv, argc) -> bits` for a lifted closure: like
-/// [`build_trampoline`] but threading the closure value `env` through as the typed function's
-/// hidden first argument. Used by the host to invoke a returned closure
-/// ([`crate::codegen::JitModule::call_value`]). `params` are the *source-level* parameters
-/// (excluding the env).
-pub fn build_env_trampoline(
-    mut builder: FunctionBuilder<'_>,
-    module: &mut dyn Module,
-    typed_id: FuncId,
-    params: &[Repr],
-    ret: Repr,
-) {
-    let entry = builder.create_block();
-    builder.append_block_params_for_function_params(entry);
-    builder.switch_to_block(entry);
-    let bp = builder.block_params(entry).to_vec();
-    let (ctx, env, argv) = (bp[0], bp[1], bp[2]);
-
-    let mut call_args = vec![ctx, env];
+    let mut call_args = bp[..leading].to_vec();
     for (i, &r) in params.iter().enumerate() {
         let slot = builder
             .ins()

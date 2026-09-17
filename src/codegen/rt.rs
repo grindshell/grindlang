@@ -52,6 +52,8 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use cranelift_codegen::ir::types;
+
 use crate::ast::BinOp;
 use crate::runtime::repr::Repr;
 use crate::runtime::{builtins, ops};
@@ -1053,53 +1055,101 @@ pub unsafe extern "C" fn rt_closure_code_addr(ctx: *mut RtCtx, clo: Handle) -> i
     }
 }
 
-/// A shim's name and function pointer, for registration with the JIT linker.
-pub fn shim_symbols() -> Vec<(&'static str, *const u8)> {
-    vec![
-        ("rt_box_number", rt_box_number as *const u8),
-        ("rt_box_bool", rt_box_bool as *const u8),
-        ("rt_unbox_number", rt_unbox_number as *const u8),
-        ("rt_unbox_bool", rt_unbox_bool as *const u8),
-        ("rt_const_string", rt_const_string as *const u8),
-        ("rt_const_cached", rt_const_cached as *const u8),
-        ("rt_const_store", rt_const_store as *const u8),
-        ("rt_memory_ref", rt_memory_ref as *const u8),
-        ("rt_namespace_field", rt_namespace_field as *const u8),
-        ("rt_array_new", rt_array_new as *const u8),
-        ("rt_array_push", rt_array_push as *const u8),
-        ("rt_tuple_new", rt_tuple_new as *const u8),
-        ("rt_tuple_push", rt_tuple_push as *const u8),
-        ("rt_tuple_get", rt_tuple_get as *const u8),
-        ("rt_table_new", rt_table_new as *const u8),
-        ("rt_array_get", rt_array_get as *const u8),
-        ("rt_array_set", rt_array_set as *const u8),
-        ("rt_map_get", rt_map_get as *const u8),
-        ("rt_map_set", rt_map_set as *const u8),
-        ("rt_field_get", rt_field_get as *const u8),
-        ("rt_field_init", rt_field_init as *const u8),
-        ("rt_field_set", rt_field_set as *const u8),
-        ("rt_map_keys", rt_map_keys as *const u8),
-        ("rt_len", rt_len as *const u8),
-        ("rt_concat", rt_concat as *const u8),
-        ("rt_str_cmp", rt_str_cmp as *const u8),
-        ("rt_value_eq", rt_value_eq as *const u8),
-        ("rt_truthy", rt_truthy as *const u8),
-        ("rt_pow", rt_pow as *const u8),
-        ("rt_raise_nan_compare", rt_raise_nan_compare as *const u8),
-        ("rt_call_host", rt_call_host as *const u8),
-        ("rt_call_method", rt_call_method as *const u8),
-        ("rt_call_builtin_value", rt_call_builtin_value as *const u8),
-        (
-            "rt_call_builtin_member",
-            rt_call_builtin_member as *const u8,
-        ),
-        ("rt_cell_new", rt_cell_new as *const u8),
-        ("rt_cell_get", rt_cell_get as *const u8),
-        ("rt_cell_set", rt_cell_set as *const u8),
-        ("rt_closure_new", rt_closure_new as *const u8),
-        ("rt_closure_env_get", rt_closure_env_get as *const u8),
-        ("rt_closure_code_addr", rt_closure_code_addr as *const u8),
-    ]
+// ---- the shim table ---------------------------------------------------------
+
+/// A Rust type that crosses the shim ABI, and the cranelift type it is passed as.
+trait AbiType {
+    const CLIF: types::Type;
+}
+
+macro_rules! abi_types {
+    ($($rust:ty => $clif:ident),* $(,)?) => {
+        $(impl AbiType for $rust {
+            const CLIF: types::Type = types::$clif;
+        })*
+    };
+}
+
+abi_types! {
+    f64 => F64,
+    i8 => I8,
+    i32 => I32,
+    u32 => I32,
+    i64 => I64,
+    u64 => I64,
+    *mut RtCtx => I64,
+    *const u64 => I64,
+}
+
+/// One runtime shim, as the JIT links and declares it.
+pub struct Shim {
+    pub name: &'static str,
+    pub addr: *const u8,
+    /// Parameter types, the context pointer included.
+    pub params: Vec<types::Type>,
+    pub returns: Vec<types::Type>,
+}
+
+/// Declares [`shims`] from each shim's Rust signature. The `as` cast in each entry only compiles
+/// if the signature matches the function's definition, and the cranelift signature is derived
+/// from it, so the linker symbol, the declared import, and the Rust function can't disagree.
+macro_rules! shim_table {
+    ($($name:ident($($param:ty),*) $(-> $ret:ty)?;)*) => {
+        /// Every runtime shim generated code may call.
+        pub fn shims() -> Vec<Shim> {
+            vec![$(
+                Shim {
+                    name: stringify!($name),
+                    addr: ($name as unsafe extern "C" fn($($param),*) $(-> $ret)?) as *const u8,
+                    params: vec![$(<$param as AbiType>::CLIF),*],
+                    returns: vec![$(<$ret as AbiType>::CLIF)?],
+                },
+            )*]
+        }
+    };
+}
+
+shim_table! {
+    rt_box_number(*mut RtCtx, f64) -> Handle;
+    rt_box_bool(*mut RtCtx, i8) -> Handle;
+    rt_unbox_number(*mut RtCtx, Handle) -> f64;
+    rt_unbox_bool(*mut RtCtx, Handle) -> i8;
+    rt_const_string(*mut RtCtx, u32) -> Handle;
+    rt_const_cached(*mut RtCtx, u32) -> Handle;
+    rt_const_store(*mut RtCtx, u32, Handle);
+    rt_memory_ref(*mut RtCtx, u32, u32) -> u64;
+    rt_namespace_field(*mut RtCtx, u32, u32) -> u64;
+    rt_array_new(*mut RtCtx, u32) -> Handle;
+    rt_array_push(*mut RtCtx, Handle, u64, u32);
+    rt_tuple_new(*mut RtCtx, u32) -> Handle;
+    rt_tuple_push(*mut RtCtx, Handle, u64, u32);
+    rt_tuple_get(*mut RtCtx, Handle, u32, u32) -> u64;
+    rt_table_new(*mut RtCtx) -> Handle;
+    rt_array_get(*mut RtCtx, Handle, f64, u32) -> u64;
+    rt_array_set(*mut RtCtx, Handle, f64, u64, u32) -> Handle;
+    rt_map_get(*mut RtCtx, Handle, Handle, u32) -> u64;
+    rt_map_set(*mut RtCtx, Handle, Handle, u64, u32) -> Handle;
+    rt_field_get(*mut RtCtx, Handle, u32, u32) -> u64;
+    rt_field_init(*mut RtCtx, Handle, u32, u64, u32);
+    rt_field_set(*mut RtCtx, Handle, u32, u64, u32) -> Handle;
+    rt_map_keys(*mut RtCtx, Handle) -> Handle;
+    rt_len(*mut RtCtx, Handle) -> f64;
+    rt_concat(*mut RtCtx, Handle, Handle) -> Handle;
+    rt_str_cmp(*mut RtCtx, Handle, Handle) -> i32;
+    rt_value_eq(*mut RtCtx, Handle, Handle) -> i8;
+    rt_truthy(*mut RtCtx, Handle) -> i8;
+    rt_pow(f64, f64) -> f64;
+    rt_raise_nan_compare(*mut RtCtx);
+    rt_call_host(*mut RtCtx, u32, *const u64, u32, u32) -> u64;
+    rt_call_method(*mut RtCtx, u32, *const u64, u32, u32) -> u64;
+    rt_call_builtin_value(*mut RtCtx, u32, *const u64, u32, u32) -> u64;
+    rt_call_builtin_member(*mut RtCtx, u32, *const u64, u32, u32) -> u64;
+    rt_cell_new(*mut RtCtx, u64, u32) -> Handle;
+    rt_cell_get(*mut RtCtx, Handle, u32) -> u64;
+    rt_cell_set(*mut RtCtx, Handle, u64, u32);
+    rt_closure_new(*mut RtCtx, u32, *const Handle, u32) -> Handle;
+    rt_closure_env_get(*mut RtCtx, Handle, u32) -> Handle;
+    rt_closure_code_addr(*mut RtCtx, Handle) -> i64;
 }
 
 #[cfg(test)]

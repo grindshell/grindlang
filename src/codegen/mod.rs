@@ -36,10 +36,7 @@ use crate::runtime::repr::Repr;
 use crate::value::{NativeFn, RunError, Value};
 
 use rt::Pools;
-use translate::{
-    Context, Translator, build_env_trampoline, build_trampoline, env_trampoline_signature,
-    trampoline_signature, typed_signature,
-};
+use translate::{Context, Translator, build_trampoline, trampoline_signature, typed_signature};
 
 /// An error from JIT compilation.
 #[derive(Debug, thiserror::Error)]
@@ -136,14 +133,15 @@ impl JitModule {
             .map_err(|e| JitError::Cranelift(e.to_string()))?;
         let call_conv = isa.default_call_conv();
 
+        let shim_table = rt::shims();
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        for (name, ptr) in rt::shim_symbols() {
-            builder.symbol(name, ptr);
+        for shim in &shim_table {
+            builder.symbol(shim.name, shim.addr);
         }
         let mut module = JITModule::new(builder);
 
         // Declare the runtime shims as imports.
-        let shims = declare_shims(&mut module, call_conv)?;
+        let shims = declare_shims(&mut module, call_conv, &shim_table)?;
 
         // Declare every function and constant (typed bodies + uniform trampolines).
         let mut typed_ids: HashMap<String, FuncId> = HashMap::new();
@@ -159,7 +157,7 @@ impl JitModule {
         let mut closure_sigs: HashMap<String, (Vec<Repr>, Repr)> = HashMap::new();
 
         for (name, f) in &program.functions {
-            let params: Vec<Repr> = f.params.iter().map(|p| Repr::of(&f.locals[p])).collect();
+            let params = param_reprs(f);
             let ret = Repr::of(&f.ret);
             let sig = typed_signature(call_conv, &params, ret);
             let id = module
@@ -167,8 +165,8 @@ impl JitModule {
                 .map_err(|e| JitError::Cranelift(e.to_string()))?;
             typed_ids.insert(name.clone(), id);
 
+            let tsig = trampoline_signature(call_conv, f.is_closure);
             if f.is_closure {
-                let tsig = env_trampoline_signature(call_conv);
                 let tid = module
                     .declare_function(&format!("et_{name}"), Linkage::Export, &tsig)
                     .map_err(|e| JitError::Cranelift(e.to_string()))?;
@@ -176,7 +174,6 @@ impl JitModule {
                 // Source-level params exclude the hidden env (params[0]).
                 closure_sigs.insert(name.clone(), (params[1..].to_vec(), ret));
             } else {
-                let tsig = trampoline_signature(call_conv);
                 let tid = module
                     .declare_function(&format!("tr_{name}"), Linkage::Export, &tsig)
                     .map_err(|e| JitError::Cranelift(e.to_string()))?;
@@ -192,7 +189,7 @@ impl JitModule {
                 .map_err(|e| JitError::Cranelift(e.to_string()))?;
             const_ids.insert(name.clone(), id);
 
-            let tsig = trampoline_signature(call_conv);
+            let tsig = trampoline_signature(call_conv, false);
             let tid = module
                 .declare_function(&format!("ct_{name}"), Linkage::Export, &tsig)
                 .map_err(|e| JitError::Cranelift(e.to_string()))?;
@@ -220,33 +217,23 @@ impl JitModule {
 
         // Trampolines (declared functions whose only job is arg/result marshaling).
         for (name, f) in &program.functions {
-            let ret = Repr::of(&f.ret);
-            if f.is_closure {
-                // Source-level params exclude the hidden env (params[0]); the env-trampoline
-                // threads the closure value through separately.
-                let real: Vec<Repr> = f.params[1..]
-                    .iter()
-                    .map(|p| Repr::of(&f.locals[p]))
-                    .collect();
-                define_env_trampoline(
-                    &mut module,
-                    &mut fbctx,
-                    closure_tramp_ids[name],
-                    typed_ids[name],
-                    &real,
-                    ret,
-                )?;
+            let params = param_reprs(f);
+            let (tramp_id, buffered) = if f.is_closure {
+                // The closure value is passed as the env, separately from the argument buffer,
+                // which holds only the source-level params.
+                (closure_tramp_ids[name], &params[1..])
             } else {
-                let params: Vec<Repr> = f.params.iter().map(|p| Repr::of(&f.locals[p])).collect();
-                define_trampoline(
-                    &mut module,
-                    &mut fbctx,
-                    fn_tramp_ids[name],
-                    typed_ids[name],
-                    &params,
-                    ret,
-                )?;
-            }
+                (fn_tramp_ids[name], &params[..])
+            };
+            define_trampoline(
+                &mut module,
+                &mut fbctx,
+                tramp_id,
+                typed_ids[name],
+                buffered,
+                Repr::of(&f.ret),
+                f.is_closure,
+            )?;
         }
         for (name, c) in &program.constants {
             let ret = Repr::of(&c.ret);
@@ -257,6 +244,7 @@ impl JitModule {
                 const_ids[name],
                 &[],
                 ret,
+                false,
             )?;
         }
 
@@ -698,58 +686,15 @@ fn sig(call_conv: CallConv, params: &[types::Type], rets: &[types::Type]) -> Sig
 fn declare_shims(
     module: &mut JITModule,
     cc: CallConv,
+    table: &[rt::Shim],
 ) -> Result<HashMap<&'static str, FuncId>, JitError> {
-    use types::{F64, I8, I32, I64};
-    let table: &[(&str, &[types::Type], &[types::Type])] = &[
-        ("rt_box_number", &[I64, F64], &[I64]),
-        ("rt_box_bool", &[I64, I8], &[I64]),
-        ("rt_unbox_number", &[I64, I64], &[F64]),
-        ("rt_unbox_bool", &[I64, I64], &[I8]),
-        ("rt_const_string", &[I64, I32], &[I64]),
-        ("rt_const_cached", &[I64, I32], &[I64]),
-        ("rt_const_store", &[I64, I32, I64], &[]),
-        // A trailing I32 after an operand/result word is its repr tag (`rt::repr_tag`).
-        ("rt_memory_ref", &[I64, I32, I32], &[I64]),
-        ("rt_namespace_field", &[I64, I32, I32], &[I64]),
-        ("rt_array_new", &[I64, I32], &[I64]),
-        ("rt_array_push", &[I64, I64, I64, I32], &[]),
-        ("rt_tuple_new", &[I64, I32], &[I64]),
-        ("rt_tuple_push", &[I64, I64, I64, I32], &[]),
-        ("rt_tuple_get", &[I64, I64, I32, I32], &[I64]),
-        ("rt_table_new", &[I64], &[I64]),
-        ("rt_array_get", &[I64, I64, F64, I32], &[I64]),
-        ("rt_array_set", &[I64, I64, F64, I64, I32], &[I64]),
-        ("rt_map_get", &[I64, I64, I64, I32], &[I64]),
-        ("rt_map_set", &[I64, I64, I64, I64, I32], &[I64]),
-        ("rt_field_get", &[I64, I64, I32, I32], &[I64]),
-        ("rt_field_init", &[I64, I64, I32, I64, I32], &[]),
-        ("rt_field_set", &[I64, I64, I32, I64, I32], &[I64]),
-        ("rt_map_keys", &[I64, I64], &[I64]),
-        ("rt_len", &[I64, I64], &[F64]),
-        ("rt_concat", &[I64, I64, I64], &[I64]),
-        ("rt_str_cmp", &[I64, I64, I64], &[I32]),
-        ("rt_value_eq", &[I64, I64, I64], &[I8]),
-        ("rt_truthy", &[I64, I64], &[I8]),
-        ("rt_pow", &[F64, F64], &[F64]),
-        ("rt_raise_nan_compare", &[I64], &[]),
-        ("rt_call_host", &[I64, I32, I64, I32, I32], &[I64]),
-        ("rt_call_method", &[I64, I32, I64, I32, I32], &[I64]),
-        ("rt_call_builtin_value", &[I64, I32, I64, I32, I32], &[I64]),
-        ("rt_call_builtin_member", &[I64, I32, I64, I32, I32], &[I64]),
-        ("rt_cell_new", &[I64, I64, I32], &[I64]),
-        ("rt_cell_get", &[I64, I64, I32], &[I64]),
-        ("rt_cell_set", &[I64, I64, I64, I32], &[]),
-        ("rt_closure_new", &[I64, I32, I64, I32], &[I64]),
-        ("rt_closure_env_get", &[I64, I64, I32], &[I64]),
-        ("rt_closure_code_addr", &[I64, I64], &[I64]),
-    ];
     let mut ids = HashMap::new();
-    for (name, params, rets) in table {
-        let s = sig(cc, params, rets);
+    for shim in table {
+        let s = sig(cc, &shim.params, &shim.returns);
         let id = module
-            .declare_function(name, Linkage::Import, &s)
+            .declare_function(shim.name, Linkage::Import, &s)
             .map_err(|e| JitError::Cranelift(e.to_string()))?;
-        ids.insert(*name, id);
+        ids.insert(shim.name, id);
     }
     Ok(ids)
 }
@@ -763,10 +708,8 @@ fn define_body(
     func_id: FuncId,
     f: &crate::ir::Function,
 ) -> Result<(), JitError> {
-    let params: Vec<Repr> = f.params.iter().map(|p| Repr::of(&f.locals[p])).collect();
-    let ret = Repr::of(&f.ret);
     let mut ctx = module.make_context();
-    ctx.func.signature = typed_signature(cx.call_conv, &params, ret);
+    ctx.func.signature = typed_signature(cx.call_conv, &param_reprs(f), Repr::of(&f.ret));
     {
         let builder = FunctionBuilder::new(&mut ctx.func, fbctx);
         let t = Translator::new(builder, module as &mut dyn Module, cx, pools, f);
@@ -779,7 +722,13 @@ fn define_body(
     Ok(())
 }
 
-/// Build one trampoline into `tramp_id`.
+/// The representation of each of `f`'s parameters, in order (a lifted closure's env first).
+fn param_reprs(f: &crate::ir::Function) -> Vec<Repr> {
+    f.params.iter().map(|p| Repr::of(&f.locals[p])).collect()
+}
+
+/// Build one trampoline into `tramp_id`. With `env` (a lifted closure), `params` are the
+/// source-level parameters, excluding the hidden env.
 fn define_trampoline(
     module: &mut JITModule,
     fbctx: &mut FunctionBuilderContext,
@@ -787,38 +736,20 @@ fn define_trampoline(
     typed_id: FuncId,
     params: &[Repr],
     ret: Repr,
+    env: bool,
 ) -> Result<(), JitError> {
     let mut ctx = module.make_context();
-    ctx.func.signature = trampoline_signature(
-        // call conv comes from the declared signature; rebuild it the same way.
-        module.isa().default_call_conv(),
-    );
+    ctx.func.signature = trampoline_signature(module.isa().default_call_conv(), env);
     {
         let builder = FunctionBuilder::new(&mut ctx.func, fbctx);
-        build_trampoline(builder, module as &mut dyn Module, typed_id, params, ret);
-    }
-    module
-        .define_function(tramp_id, &mut ctx)
-        .map_err(|e| JitError::Cranelift(e.to_string()))?;
-    module.clear_context(&mut ctx);
-    Ok(())
-}
-
-/// Build one env-trampoline (for a lifted closure) into `tramp_id`. `params` are the
-/// source-level parameters, excluding the hidden env.
-fn define_env_trampoline(
-    module: &mut JITModule,
-    fbctx: &mut FunctionBuilderContext,
-    tramp_id: FuncId,
-    typed_id: FuncId,
-    params: &[Repr],
-    ret: Repr,
-) -> Result<(), JitError> {
-    let mut ctx = module.make_context();
-    ctx.func.signature = env_trampoline_signature(module.isa().default_call_conv());
-    {
-        let builder = FunctionBuilder::new(&mut ctx.func, fbctx);
-        build_env_trampoline(builder, module as &mut dyn Module, typed_id, params, ret);
+        build_trampoline(
+            builder,
+            module as &mut dyn Module,
+            typed_id,
+            params,
+            ret,
+            env,
+        );
     }
     module
         .define_function(tramp_id, &mut ctx)
