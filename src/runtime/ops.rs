@@ -19,13 +19,18 @@ use crate::ast::{BinOp, UnOp};
 use crate::runtime::builtins::num_to_string;
 use crate::value::{RunError, Value};
 
+// The interpreters dispatch every operator through here, one call per evaluated op, so the small
+// helpers are `#[inline]`: without it they stay out-of-line calls from the other modules.
+
 /// The number a type-checked operand holds.
+#[inline]
 pub fn number(v: &Value) -> Result<f64, RunError> {
     v.as_f64()
         .ok_or_else(|| RunError::Internal(format!("expected a number, found {}", v.type_name())))
 }
 
 /// The text a type-checked string operand holds.
+#[inline]
 pub fn string(v: &Value) -> Result<&str, RunError> {
     match v {
         Value::Str(s) => Ok(s),
@@ -40,6 +45,7 @@ pub fn string(v: &Value) -> Result<&str, RunError> {
 ///
 /// # Panics
 /// On any other operator.
+#[inline]
 pub fn arith(op: BinOp, a: f64, b: f64) -> f64 {
     match op {
         BinOp::Add => a + b,
@@ -58,6 +64,7 @@ pub const NAN_COMPARISON: &str = "comparison with NaN";
 
 /// Order two numbers or two strings for `< <= > >=`. Ordering a NaN is an error rather than
 /// IEEE's silent `false`, so a comparison never quietly takes the wrong branch.
+#[inline]
 pub fn compare(l: &Value, r: &Value) -> Result<Ordering, RunError> {
     match (l, r) {
         (Value::Number(a), Value::Number(b)) => a
@@ -74,6 +81,7 @@ pub fn compare(l: &Value, r: &Value) -> Result<Ordering, RunError> {
 
 /// Evaluate a binary operator whose operands are both already evaluated: every operator except
 /// `and`/`or`, which short-circuit and so are control flow in each backend.
+#[inline]
 pub fn binary(op: BinOp, l: &Value, r: &Value) -> Result<Value, RunError> {
     use BinOp::*;
     Ok(match op {
@@ -102,6 +110,7 @@ pub fn binary(op: BinOp, l: &Value, r: &Value) -> Result<Value, RunError> {
 }
 
 /// Evaluate a unary operator.
+#[inline]
 pub fn unary(op: UnOp, v: &Value) -> Result<Value, RunError> {
     Ok(match op {
         UnOp::Neg => Value::Number(-number(v)?),
@@ -124,6 +133,7 @@ pub fn len(v: &Value) -> Result<f64, RunError> {
 
 /// `arr[idx]`: the element at 1-based `idx`, or `nil` when `idx` is out of range or not a
 /// positive integer (`SPEC.md` §5.4 — an index read always yields `T?`).
+#[inline]
 pub fn array_get(arr: &RefCell<Vec<Value>>, idx: f64) -> Value {
     if idx < 1.0 || idx.fract() != 0.0 {
         return Value::Nil;
@@ -160,6 +170,7 @@ pub fn array_set(arr: &RefCell<Vec<Value>>, idx: f64, v: Value) -> Result<(), Ru
 
 /// `t.key = v` / `t[key] = v` on a record or map. Allocates the key only for a new entry, so
 /// overwriting an existing field (what an assignment in a loop does) allocates nothing.
+#[inline]
 pub fn table_set(table: &RefCell<BTreeMap<String, Value>>, key: &str, v: Value) {
     let mut table = table.borrow_mut();
     match table.get_mut(key) {
