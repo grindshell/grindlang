@@ -1,7 +1,7 @@
 //! Mid-level typed IR and lowering from the typed AST (`PLAN.md` Phase 5).
 //!
-//! The IR is a control-flow graph of basic blocks. It sits between the AST and the future
-//! cranelift backend (Phase 7) and is deliberately backend-agnostic:
+//! The IR is a control-flow graph of basic blocks. It sits between the AST and the cranelift
+//! backend (`codegen`, `jit` feature) and is deliberately backend-agnostic:
 //!
 //!   * **Locals are mutable variables**, not SSA values. Reads/writes go through
 //!     [`Op::LocalGet`] / [`Op::LocalSet`]. This matches `cranelift-frontend`'s `Variable`

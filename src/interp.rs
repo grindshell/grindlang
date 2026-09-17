@@ -2,14 +2,15 @@
 //! Phase 4, gated behind the `interp` feature).
 //!
 //! This is the **semantics oracle**. It implements the canonical meaning of every
-//! construct so the future cranelift JIT (Phase 7) can be validated by differential
-//! testing — interpret a program, JIT the same program, assert equal results. It also
-//! serves as a debug / fallback execution mode.
+//! construct so the cranelift JIT can be validated by differential testing — interpret a
+//! program, JIT the same program, assert equal results. It also serves as a debug / fallback
+//! execution mode.
 //!
-//! It is intentionally simple, not fast: runtime values are reference-counted rather than
-//! arena-allocated (the arena model described in `PLAN.md` is a JIT-runtime concern; the
-//! oracle just needs to be *correct*). Closures own a cloned [`crate::ast::FuncBody`] via
-//! `Rc`, so [`Value`] carries no lifetime and host code can hold values freely.
+//! It is intentionally simple, not fast: it walks the AST and keeps variables in hash-map
+//! frames. Operators and array indexing are evaluated by the shared [`crate::runtime::ops`],
+//! the same rules the IR VM and the JIT's runtime use. Closures own a cloned
+//! [`crate::ast::FuncBody`] via `Rc`, so [`Value`] carries no lifetime and host code can hold
+//! values freely.
 //!
 //! The runtime [`Value`] and [`RunError`] themselves live in [`crate::value`] (shared with
 //! the JIT and the embedding API); this module owns only the tree-walking [`Interpreter`]

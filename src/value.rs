@@ -20,10 +20,10 @@
 //!   backend that executes the IR (the JIT and the IR VM), so they compile whenever a backend
 //!   is enabled (`any(feature = "interp", feature = "jit")`).
 //! * **Interpreter callables** — [`Value::Function`] (a script closure) and [`Value::Native`]
-//!   (a host function captured *as a value*) — exist only with the `interp` feature. Only the
-//!   tree-walking interpreter represents functions as first-class values; the JIT keeps host
-//!   functions out-of-band in its runtime context and never materializes script closures, so
-//!   compiled code never produces these variants.
+//!   (a host function captured *as a value*) — exist only with the `interp` feature, and only
+//!   the tree-walking interpreter produces them. The IR VM and the JIT represent a closure as a
+//!   [`Value::Closure`] instead, and never make a host function a value: the checker allows a
+//!   named function only as the callee of a direct call (`SPEC.md` §5.5).
 
 #[cfg(any(feature = "interp", feature = "jit"))]
 use std::any::Any;

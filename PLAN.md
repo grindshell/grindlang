@@ -268,8 +268,9 @@ trust model), so it is left alone.
 > upvalues and calling first-class function values have since landed** (`src/capture.rs` is the
 > single source of truth for upvalue ordering, shared by both interpreters and the JIT;
 > `Module::call_value`/`call_value_typed` invoke a returned closure, which keeps its backing
-> code alive via the closure's `origin` stamp). Still deferred to future work: method-call
-> syntax and the full native arena (raw-pointer `#[repr(C)]` layouts) — the handle runtime is
+> code alive via the closure's `origin` stamp), as have **host-memory method calls**
+> (`mem:m(args)` lowered to `Op::CallMethod`, `SPEC.md` §7). Still deferred to future work: the
+> full native arena (raw-pointer `#[repr(C)]` layouts, below) — the handle runtime is
 > incrementally upgradable to it later. The ABI/value-model contract is documented in the
 > `codegen` and `runtime` module rustdoc (`SPEC.md` stays the author-facing language contract,
 > §1–§9).

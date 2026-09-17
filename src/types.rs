@@ -17,18 +17,24 @@
 //! * Conditions must be `bool`; equality needs matching operand types; arithmetic/relational
 //!   operators are numeric (relational also allows `string`); `..` is `string`.
 //!
-//! ## Deliberately deferred (documented gaps)
-//!
-//! * **Multi-value returns / tuples.** A function returns 0 or 1 values in v1; a `return`
-//!   with two or more values is rejected. Call/assignment lists require exact arity with
-//!   one value per expression.
+//! * **Multi-value returns** produce a [`Type::Tuple`], consumable only by a matching-arity
+//!   parallel binding or a pass-through `return` (§5.5); anywhere else is `E0415`.
+//! * **Method calls** (`mem:m(...)`) are typed against the host memory's declared method
+//!   signatures (§7); any other receiver is `E0417`.
 //! * **EmmyLua `---@` annotations** (§5.6) are supported for top-level functions: `---@param
 //!   <name> <type>` and `---@return <type>` pin a parameter/return type (parsed by
 //!   [`crate::annotations`], applied in Pass 2 before bodies are checked). This is what lets a
-//!   record/array-typed *parameter* be expressed. Still deferred: `---@type` on locals.
-//! * **Flow narrowing** is limited to `if <name> ~= nil`/`== nil` on a bare local; richer
-//!   narrowing (fields, early-return flow) is future work.
-//! * **Method calls** (`recv:m(...)`) and **`pairs` over records** are not yet typed.
+//!   record/array-typed *parameter* be expressed.
+//! * **Flow narrowing**: inside `if <place> ~= nil then`, a `T?` place reads as `T`, where the
+//!   place is a local, an upvalue, a memory root, or a field path over one (§5.3). A write to
+//!   the place or a prefix of it ends the narrowing. Each narrowed read is recorded in
+//!   [`TypeInfo::narrowed`] so lowering unwraps it.
+//!
+//! ## Deliberately deferred (documented gaps)
+//!
+//! * `---@type` annotations on locals.
+//! * Narrowing from `== nil`, an `else` branch, or an early return.
+//! * Iterating a record with `pairs` (its fields don't share a type).
 
 use std::collections::{BTreeMap, HashMap};
 

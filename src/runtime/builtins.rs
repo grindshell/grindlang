@@ -5,13 +5,14 @@
 //! the **single source of truth** for those builtins:
 //!
 //!   * The **catalog** ([`value_sig`], [`member_sig`], [`namespace_field_type`]) describes
-//!     each builtin's signature in [`Type`] terms. The type checker ([`crate::types`]) and
-//!     the IR lowering ([`crate::ir`]) both consult it, so a builtin's type lives in exactly
-//!     one place. It is always compiled (no `interp`/`jit` feature needed).
-//!   * The **implementations** (behind the `interp` feature) evaluate a builtin over runtime
-//!     [`Value`](crate::value::Value)s. Both the AST interpreter and the IR `Vm` call into
-//!     them, so the builtins also have a single executable definition. The (Phase 7) JIT
-//!     will lower calls to the same catalog entries (emitting native code or runtime calls).
+//!     each builtin's signature in [`Type`] terms. The type checker ([`crate::types`]) checks
+//!     calls against it and the IR lowering ([`crate::ir`]) reads result types from it, so a
+//!     builtin's type lives in exactly one place. It is always compiled (no feature needed).
+//!   * The **implementations** (compiled with either backend feature) evaluate a builtin over
+//!     runtime [`Value`](crate::value::Value)s. Both interpreters call them directly and the JIT
+//!     reaches them through its runtime shims, so each builtin has one executable definition.
+//!     The JIT's one exception is `math.floor`/`ceil`/`abs`/`sqrt` on a number, which it lowers
+//!     to the native float instruction that computes the identical IEEE result.
 
 use crate::types::Type;
 

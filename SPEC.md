@@ -184,7 +184,9 @@ explist    ::= exp {',' exp}
 - `local function` is allowed **inside bodies** (it is a local, which is legal here, not
   at the top level).
 - `genericfor`'s `iterexpr` is restricted to the builtins `ipairs(arr)` and `pairs(map)`
-  / `pairs(record)` _(v1)_ — there are no user-defined iterators (no metatables).
+  _(v1)_ — there are no user-defined iterators (no metatables). A record is not iterable: its
+  fields can have different types, so no one loop variable type fits. Iterating anything else
+  is an `E0412` error.
 - A `numericfor` evaluates its start, limit, and step once, before the first iteration, and
   counts with a hidden counter. The loop variable receives the counter's value at the start
   of each iteration, so assigning to it inside the body does not change how many times the
@@ -452,7 +454,7 @@ A small, pure, deterministic set — no global namespace pollution beyond these 
   keeping the three oracles bit-identical.
 - **string**: `string.len`, `string.sub`, `string.upper`, `string.lower`,
   `string.find` _(plain, no patterns in v1)_, `string.format` _(restricted verbs)_.
-- **iteration**: `ipairs(array<T>)`, `pairs(map<string,T> | record)` — usable only in
+- **iteration**: `ipairs(array<T>)`, `pairs(map<string,T>)` — usable only in
   `genericfor` (§3.3).
 - **conversion**: `tostring(x)` → `string` for `number`/`bool`/`string`; `tonumber(s)` →
   `number?`.

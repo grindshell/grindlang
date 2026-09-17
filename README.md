@@ -127,7 +127,7 @@ source (.lua-syntax text)
        ├─ Interpreter   tree-walking oracle      src/interp.rs   (feature: interp)
        ├─ Vm            IR interpreter oracle     src/ir.rs::vm   (feature: interp)
        └─ codegen       Cranelift IR → native     src/codegen/    (feature: jit)
-            └─ runtime  reprs, builtins           src/runtime/
+            └─ runtime  reprs, builtins, ops      src/runtime/
   host API: Engine / Module / Value marshaling   src/api.rs      (feature: jit)
 ```
 
@@ -225,11 +225,11 @@ pays repeatedly.
 ## Status
 
 Phases 0–9 are delivered: front end, resolver, type system, reference interpreter,
-mid-level IR, runtime/ABI, Cranelift JIT, the host embedding API, and Phase 9 hardening
+mid-level IR, shared runtime, Cranelift JIT, the host embedding API, and Phase 9 hardening
 (differential/fuzz/property tests, benchmarks, docs, the embedding example, and the CLI
 runner). Closures with upvalues and calling first-class function values are supported.
-Method-call syntax and the full native arena remain deferred. See [`PLAN.md`](PLAN.md) for
-per-phase exit criteria and deferred work.
+Host-memory method calls (`mem:m(args)`) are supported; the full native arena remains deferred.
+See [`PLAN.md`](PLAN.md) for per-phase exit criteria and deferred work.
 
 ## License
 

@@ -28,12 +28,12 @@ match Luau's API or semantics.
 ## 2. Status
 
 Phases 0–9 are delivered (front end, resolver, type system, reference interpreter, mid-level
-IR, runtime/ABI, cranelift JIT, host embedding API; plus Phase 9 hardening: differential +
+IR, shared runtime, cranelift JIT, host embedding API; plus Phase 9 hardening: differential +
 fuzz + property tests, criterion benchmarks with a rough Luau baseline, this `CLAUDE.md`, the
-`SPEC.md`, the `embed` example, and the `grindlang` CLI runner). Closures with upvalues and
-calling first-class function values have landed since the original Phase 7 cut (see
-`src/capture.rs`). See `PLAN.md` §4 for per-phase notes and what remains deferred (method-call
-syntax and the full native arena).
+`SPEC.md`, the `embed` example, and the `grindlang` CLI runner). Closures with upvalues,
+calling first-class function values (see `src/capture.rs`), and host-memory method calls
+(`mem:m(args)`, `SPEC.md` §7) have landed since the original Phase 7 cut. See `PLAN.md` §4 for
+per-phase notes and what remains deferred (the full native arena, portable closures).
 
 ## 3. Tech stack
 
@@ -104,7 +104,7 @@ source (.lua-syntax text)
        ├─ Interpreter   tree-walking oracle      src/interp.rs        (feature: interp)
        ├─ Vm            IR interpreter oracle     src/ir.rs::vm        (feature: interp)
        └─ codegen       cranelift IR → native     src/codegen/         (feature: jit)
-            └─ runtime  reprs, builtins           src/runtime/
+            └─ runtime  reprs, builtins, ops      src/runtime/
   host API: Engine / Module / Value marshaling   src/api.rs           (feature: jit)
   CLI runner: run a file (pyc-style IR cache)       src/bin/grindlang.rs (features: jit + serde)
 ```
@@ -148,7 +148,11 @@ the `codegen` and `runtime` module rustdoc for the ABI contract.
   property suites; never make a backend pass by special-casing it.
 - **Builtins are single-source-of-truth.** Signatures and reference implementations live in
   `runtime::builtins` (the catalog), consumed by the checker, IR lowering, and *all* backends.
-  Don't duplicate builtin signature tables.
+  Don't duplicate builtin signature tables. Operator semantics (arithmetic, ordering, `#`,
+  array indexing) likewise live once in `runtime::ops`; a backend calls them rather than
+  re-implementing them (the JIT's native arithmetic must match `ops::arith`).
+- **Declare shims once.** A new `rt_*` shim gets one entry in `codegen::rt`'s `shim_table!`,
+  written as its Rust signature; the cranelift declaration is derived from it.
 - **Isolate cranelift.** All cranelift API usage stays in `src/codegen/` behind `jit`, so the
   rest of the crate is insulated from cranelift churn. Pin cranelift versions.
 - **Respect the feature gating** (see §3). Shared-runtime items → `any(interp, jit)`;
