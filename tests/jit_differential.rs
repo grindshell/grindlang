@@ -1427,6 +1427,19 @@ fn chained_multi_return_unpacks() {
 }
 
 #[test]
+fn a_multi_return_call_as_a_statement() {
+    // A call statement discards what the call returns, a tuple included; the call still runs.
+    let src = "function main()\n\
+                 local n = 0\n\
+                 local pair = function() n = n + 1 return n, n end\n\
+                 pair()\n\
+                 local a, b = pair()\n\
+                 return n * 100 + a * 10 + b\n\
+               end";
+    assert_all_return(src, "main", vec![], "222");
+}
+
+#[test]
 fn tuple_with_optional_element() {
     // `xs[i]` yields `number?` (a boxed optional Ptr) — returned as a tuple element alongside a
     // bare number, it must stay a Ptr through MakeTuple and the host decode, `nil` included.

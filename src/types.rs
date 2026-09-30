@@ -23,6 +23,10 @@
 //!
 //! * **Multi-value returns** produce a [`Type::Tuple`], consumable only by a matching-arity
 //!   parallel binding or a pass-through `return` (§5.5); anywhere else is `E0415`.
+//! * **A call to a function that returns nothing** (`()`) may be a statement or returned with
+//!   `return f()`; used as a value it is `E0435` (§5.5). A function returns nothing when none of
+//!   its `return`s gives a value, which is settled before any body is checked, or when it
+//!   returns such a call.
 //! * **Method calls** (`mem:m(...)`) are typed against the host memory's declared method
 //!   signatures (§7); any other receiver is `E0417`.
 //! * **EmmyLua `---@` annotations** (§5.6) are supported for top-level functions: `---@param
@@ -515,6 +519,9 @@ struct Checker<'a> {
     /// The `T` of each `T?` operand of `and`/`or` typed before `T` was known, with the operand's
     /// span ([`Checker::check_logic_optionals`]).
     logic_optionals: Vec<(Type, Span)>,
+    /// The type of each call used as a value before its callee's return type was known, with
+    /// the call's span ([`Checker::check_valueless_calls`]).
+    valueless_calls: Vec<(Type, Span)>,
     diags: Diagnostics,
 }
 
@@ -537,6 +544,7 @@ impl<'a> Checker<'a> {
             nil_locals: Vec::new(),
             logic_types: HashMap::new(),
             logic_optionals: Vec::new(),
+            valueless_calls: Vec::new(),
             diags: Diagnostics::new(),
         }
     }
@@ -560,9 +568,10 @@ impl<'a> Checker<'a> {
                         self.apply_fn_annotations(f, &sig);
                     }
                     // A declared return type is the author's to give; `nil` against a
-                    // non-optional one is then reported at the `return`.
+                    // non-optional one is then reported at the `return`, and a missing value
+                    // at the exit that gives none (`E0480`).
                     if f.annotations.ret.is_empty() {
-                        self.infer_optional_return(&f.body, &sig);
+                        self.infer_return_up_front(&f.body, &sig);
                     }
                     self.func_sigs.insert(f.name.node.clone(), sig);
                 }
@@ -608,6 +617,7 @@ impl<'a> Checker<'a> {
         self.check_deferred_uses();
         self.check_logic_optionals();
         self.check_valueless_exits();
+        self.check_valueless_calls();
 
         // Pass 4: flag parameters whose type inference couldn't pin.
         let mut unknown_params = std::collections::HashSet::new();
@@ -1061,14 +1071,20 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Make `sig`'s return type optional up front when `body` returns a literal `nil` on some
-    /// paths and a value on others (`SPEC.md` §5.5), so that every `return` is then checked
-    /// against `T?` whichever comes first. Without it the first `return` would fix the type:
-    /// `return 1` makes it `number` and a later `return nil` a mismatch, while the same two
-    /// returns the other way round would infer `nil` and reject the `1`.
-    fn infer_optional_return(&mut self, body: &FuncBody, sig: &FnType) {
-        let (mut returns_nil, mut returns_value) = (false, false);
+    /// Settle what the shape of `body`'s returns decides about `sig`'s return type, before any
+    /// body is checked, so the outcome doesn't depend on the order of the code (`SPEC.md` §5.5):
+    ///
+    /// * No `return` gives a value: the function returns nothing, `()`. A call to it used as a
+    ///   value is then `E0435` wherever the call is, above the function included, instead of
+    ///   leaving the use to fix its return type.
+    /// * A literal `nil` on some paths and a value on others: it is optional, so every `return`
+    ///   is checked against `T?` whichever comes first. Otherwise the first `return` would fix
+    ///   the type: `return 1` makes it `number` and a later `return nil` a mismatch, while the
+    ///   same two returns the other way round would infer `nil` and reject the `1`.
+    fn infer_return_up_front(&mut self, body: &FuncBody, sig: &FnType) {
+        let (mut returns_nil, mut returns_value, mut returns_any) = (false, false, false);
         visit_returns(&body.block, &mut |ret| {
+            returns_any |= !ret.exprs.is_empty();
             if let [e] = ret.exprs.as_slice() {
                 if is_literal_nil(e) {
                     returns_nil = true;
@@ -1077,7 +1093,9 @@ impl<'a> Checker<'a> {
                 }
             }
         });
-        if returns_nil && returns_value {
+        if !returns_any {
+            let _ = self.u.unify(&sig.ret, &Type::Unit);
+        } else if returns_nil && returns_value {
             let inner = self.u.fresh();
             let _ = self.u.unify(&sig.ret, &Type::optional(inner));
         }
@@ -1091,7 +1109,7 @@ impl<'a> Checker<'a> {
             StatKind::Local { names, exprs } => self.check_local(names, exprs, stat.span),
             StatKind::LocalFunction { name, body } => {
                 let sig = self.make_sig(&body.params);
-                self.infer_optional_return(body, &sig);
+                self.infer_return_up_front(body, &sig);
                 if let Some(id) = self.res.def(name.span) {
                     self.sym_types[id as usize] = Type::Function(sig.clone());
                 }
@@ -1099,8 +1117,9 @@ impl<'a> Checker<'a> {
                 self.check_func_body(body, &sig);
             }
             StatKind::Assign { targets, exprs } => self.check_assign(targets, exprs, stat.span),
+            // A call statement discards whatever the call returns: nothing, a value, or a tuple.
             StatKind::Call(e) => {
-                self.check_expr(e);
+                self.check_expr_multi(e);
             }
             StatKind::Do(block) => self.check_block(block),
             StatKind::While { cond, body } => {
@@ -1151,8 +1170,10 @@ impl<'a> Checker<'a> {
                 }
                 return elems;
             }
-            // A single ordinary value.
-            if n != 1 {
+            // A single ordinary value, or none, from a call to a function that returns nothing.
+            let valueless = matches!(self.u.shallow(&t), Type::Unit);
+            let t = self.require_value(&exprs[0], t);
+            if n != 1 && !valueless {
                 self.error(
                     "E0414",
                     format!("assignment arity mismatch: {n} target(s) but 1 value"),
@@ -1309,7 +1330,7 @@ impl<'a> Checker<'a> {
     /// sole expression of a `return` and the sole right-hand side of a parallel binding — which
     /// call [`Checker::check_expr_multi`] directly. Every recursive/operand position routes
     /// through here, so a tuple can never silently unify into an operand, argument, container
-    /// element, or parameter var.
+    /// element, or parameter var. Nor can a call that returns nothing ([`Checker::require_value`]).
     fn check_expr(&mut self, expr: &Expr) -> Type {
         let t = self.check_expr_multi(expr);
         if matches!(self.u.shallow(&t), Type::Tuple(_)) {
@@ -1321,7 +1342,35 @@ impl<'a> Checker<'a> {
             );
             return Type::Error;
         }
-        t
+        self.require_value(expr, t)
+    }
+
+    /// Reject using a call to a function that returns nothing as a value (`E0435`, `SPEC.md`
+    /// §5.5): there is no value, and Grindlang doesn't make one up as Lua's `nil`. `t` is the
+    /// type of `expr`, which is used as a value. Where the callee's return type isn't known yet,
+    /// the check waits until every body has been ([`Checker::check_valueless_calls`]).
+    fn require_value(&mut self, expr: &Expr, t: Type) -> Type {
+        match self.u.shallow(&t) {
+            Type::Unit => {
+                self.error("E0435", VALUELESS_CALL, expr.span);
+                Type::Error
+            }
+            Type::Var(_) if is_call(expr) => {
+                self.valueless_calls.push((t.clone(), expr.span));
+                t
+            }
+            _ => t,
+        }
+    }
+
+    /// Report each call used as a value whose callee turned out to return nothing, once every
+    /// body has been checked (see [`Checker::require_value`]).
+    fn check_valueless_calls(&mut self) {
+        for (t, span) in std::mem::take(&mut self.valueless_calls) {
+            if matches!(self.u.shallow(&t), Type::Unit) {
+                self.error("E0435", VALUELESS_CALL, span);
+            }
+        }
     }
 
     /// The expression-typing engine. Returns a [`Type::Tuple`] for a multi-return call so the
@@ -1339,7 +1388,7 @@ impl<'a> Checker<'a> {
             ExprKind::Name(_) => self.check_name(expr),
             ExprKind::Function(body) => {
                 let sig = self.make_sig(&body.params);
-                self.infer_optional_return(body, &sig);
+                self.infer_return_up_front(body, &sig);
                 self.func_literals.insert(body.span, sig.clone());
                 self.check_func_body(body, &sig);
                 Type::Function(sig)
@@ -2509,6 +2558,19 @@ fn is_literal_nil(e: &Expr) -> bool {
     }
 }
 
+/// Whether `e` is a call, the only expression that can have no value.
+fn is_call(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Call { .. } | ExprKind::MethodCall { .. } => true,
+        ExprKind::Paren(inner) => is_call(inner),
+        _ => false,
+    }
+}
+
+/// The `E0435` message: a call to a function that returns nothing, used as a value.
+const VALUELESS_CALL: &str = "this call returns no value, so there is none to use here; make \
+                              the call a statement of its own";
+
 /// Call `f` on every `return` in `block` and the blocks nested in it, but not on those in the
 /// bodies of functions defined inside it: those return from a different function.
 fn visit_returns(block: &Block, f: &mut impl FnMut(&RetStat)) {
@@ -3027,6 +3089,87 @@ mod tests {
             ),
             "E0413"
         );
+    }
+
+    // ---- a call that returns nothing (E0435) ----
+
+    #[test]
+    fn a_valueless_call_used_as_a_value_is_error() {
+        for body in [
+            "local x = f()",
+            "local x = 0 x = f()",
+            "local a, b = f()",
+            "return g(f())",
+            "return f() == nil",
+            "return (f()) + 1",
+            "return f() or 1",
+            "return #{ f() }",
+            "return f(), 1",
+            "if f() then return end",
+            "local h = function() end local x = h()",
+        ] {
+            let src = format!(
+                "function f() end\nfunction g(x) return x + 1 end\nfunction main() {body} end"
+            );
+            assert_eq!(err_code(&src, &empty()), "E0435", "{body}");
+        }
+    }
+
+    #[test]
+    fn a_valueless_call_is_error_wherever_its_function_is() {
+        for src in [
+            // The callee comes after the call.
+            "function main() local x = f() end\nfunction f() end",
+            // ...and the result is used in a way that would otherwise give the callee a return
+            // type first: assigning `nil` makes it optional, which a function may return by
+            // ending without a value.
+            "function main() local x = f() x = nil end\nfunction f() end",
+            // Or a number, which makes this a missing `return` in `f` instead (`E0480`).
+            "function main() local x = f() return x + 1 end\nfunction f() end",
+            // In top-level code, which is checked before every function body.
+            "local x = f()\nfunction f() end",
+            // The callee returns nothing by returning a call that returns nothing, and so is
+            // only known to once its body has been checked.
+            "function main() local x = g() end\nfunction g() return f() end\nfunction f() end",
+            // A callback, typed by the closure the caller passes.
+            "function run(cb) local x = cb() end\nfunction main() run(function() end) end",
+        ] {
+            assert_eq!(err_code(src, &empty()), "E0435", "{src}");
+        }
+        // A host function and a memory method declared to return nothing.
+        let valueless = || FnType {
+            params: vec![],
+            ret: Box::new(Type::Unit),
+        };
+        let mut cfg = mem_method_cfg();
+        cfg.host_functions.insert("log".into(), valueless());
+        cfg.methods
+            .get_mut("mem")
+            .unwrap()
+            .insert("touch".into(), valueless());
+        for src in [
+            "function main() local x = log() end",
+            "function main() local x = mem:touch() end",
+        ] {
+            assert_eq!(err_code(src, &cfg), "E0435", "{src}");
+        }
+    }
+
+    #[test]
+    fn a_valueless_call_may_be_a_statement_or_returned() {
+        let info = ok(
+            "function f() end\n\
+             function pair() return 1, 2 end\n\
+             f()\n\
+             function main(c)\n\
+               f()\n\
+               pair()\n\
+               if c then return (f()) end\n\
+               return f()\n\
+             end",
+            &empty(),
+        );
+        assert_eq!(info.exports["main"].to_string(), "fn(bool) -> ()");
     }
 
     // ---- missing return value (E0480) ----

@@ -1,0 +1,9 @@
+---
+source: tests/snapshots.rs
+expression: "analyze_diag(\"function log() end\\nfunction f()\\n  local x = log()\\nend\")"
+---
+error[E0435]: this call returns no value, so there is none to use here; make the call a statement of its own
+  --> 3:13
+   |
+  3|   local x = log()
+   |             ^^^^^

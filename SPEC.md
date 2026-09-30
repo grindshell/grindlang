@@ -482,9 +482,15 @@ end
   may do either, and the call then returns `nil`. The check follows the structure of the code:
   an `if` returns on every path only when it has an `else` and every branch returns, a
   `while true` loop with no `break` never finishes, and any other loop may run zero times.
-- `return f()`, where `f` returns nothing (its return type is `()`), calls `f` and then returns
-  no value, as in Lua. The returning function returns nothing too; the host calling it gets
-  `nil`, as from a bare `return`.
+- A function **returns nothing** (its return type is `()`) when none of its `return`s gives a
+  value, or when it returns a call to such a function: `return f()` calls `f` and then returns
+  no value, as in Lua. The host calling it gets `nil`, as from a bare `return`. In a script, a
+  call to a function that returns nothing is **not a value**: besides `return f()`, it may only
+  be made as a statement. Using it as a value anywhere else — binding it (`local x = f()`),
+  passing it, or as an operand, a condition, or a table or tuple element — is a compile error
+  (`E0435`). Lua would make the missing value `nil`; Grindlang doesn't pad a missing value with
+  `nil` (below). Whether a function returns nothing is settled from its `return`s, not from how
+  its calls are used, so a use above the function is rejected just as one below it is.
 - A function whose return type is optional (`T?`) may `return` a `T` or `nil` on any path, as
   an assignment to a `T?` slot may. The type is optional either because `---@return T?` declares
   it (for a tuple return, per element) or because the function returns the literal `nil` on one
@@ -504,7 +510,9 @@ end
   values or pad missing ones with `nil`; a count mismatch is a compile error (`E0414` for a
   binding, `E0413` for an inconsistent `return`). A tuple used in **any** other position —
   as a single value, an operand, a call argument, an array/table element, or mixed into a
-  value list (`local a, b = f(), 5`) — is a compile error (`E0415`). *(v1 / "Tier A": there is
+  value list (`local a, b = f(), 5`) — is a compile error (`E0415`). A call made as a
+  statement, `divmod(a, b)`, discards whatever it returns, a tuple included; that is not a use
+  of the tuple. *(v1 / "Tier A": there is
   no value-count adjustment and no spreading of a call's results into an argument list; those
   Lua behaviors are intentionally omitted.)*
 - Anonymous `function … end` expressions (closures) are allowed in function bodies and in
@@ -729,6 +737,7 @@ Each produces a targeted, span-pointing error:
 - `require`, `load`, `dofile`, `loadstring`, `pcall`/`error`-based control flow _(v1)_
 - truthiness coercion (non-`bool` condition; an `and`/`or` whose left operand is never `nil` or
   `false`); mixed-type `==`; heterogeneous tables
+- a call to a function that returns nothing, used as a value (`E0435`) — §5.5
 - coroutines; integer/bitwise operations
 - source nested more than 200 levels deep — expressions, blocks, and function bodies inside one
   another (`E0209`). A long operator chain (`a + b + c + …`) or suffix chain (`t.a.b…`, `f()()`)
@@ -796,7 +805,11 @@ both read/write persistent memory.
 - **Multi-return is "Tier A"** (§5.5): a `return`-list builds a tuple, consumed only by a
   parallel binding/assignment or a pass-through `return`, with **exact arity** (no Lua-style
   truncate/pad, no spreading into argument lists, no value-count adjustment). A multi-value
-  call anywhere else is a compile error.
+  call anywhere else is a compile error, except as a statement, which discards its results.
+- **A call that returns nothing is not a value** (§5.5): it may be a statement or returned with
+  `return f()`, and anywhere else is a compile error rather than Lua's `nil` — Tier A's
+  no-padding rule applied to zero values. A function returns nothing when none of its `return`s
+  gives one, decided before any use of it is checked, so the order of the code can't change it.
 - **Method calls are memory-only, self-passing** (§7.2): `mem:m(args)` is valid only when the
   receiver is a host-memory binding named directly; the receiver is passed as an implicit
   `self` to the host method, which resolves to a direct Rust call. `:` on any other receiver

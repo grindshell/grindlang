@@ -112,6 +112,11 @@ fn snapshot_type_errors() {
             "function f(x)\n  if x < 0 then return end\n  if x > 0 then return 1 end\nend"
         )
     );
+    // A call to a function that returns nothing has no value to use (SPEC §5.5).
+    insta::assert_snapshot!(
+        "type_error_valueless_call_as_value",
+        analyze_diag("function log() end\nfunction f()\n  local x = log()\nend")
+    );
 }
 
 // ---- inferred export signatures ---------------------------------------------
