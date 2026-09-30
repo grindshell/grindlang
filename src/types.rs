@@ -32,8 +32,8 @@
 //!   because the function returns a literal `nil` beside a value — a `return` may give a `T` or
 //!   `nil`, checked like an assignment. Decided before the body is checked, so it doesn't depend
 //!   on the order of the `return`s (§5.5).
-//! * **A local initialized to `nil`** is `T?`, with `T` fixed by what is later assigned to it
-//!   (§5.2), or `nil` if nothing else ever is.
+//! * **A local initialized to `nil`**, or not initialized at all, is `T?`, with `T` fixed by
+//!   what is later assigned to it (§5.2), or `nil` if nothing else ever is.
 //! * **Uses before the code that types a value**: a field read or write, or a call, on a value
 //!   whose type is still unknown (a `local best = nil` read under a guard above the assignment
 //!   that types it) stands for a fresh variable and is checked once every body has been, so the
@@ -483,8 +483,8 @@ struct Checker<'a> {
     return_stack: Vec<ReturnFrame>,
     valueless_exits: Vec<ValuelessExits>,
     deferred: Vec<DeferredUse>,
-    /// The `T` of each `local x = nil`'s type `T?`, which is `nil` if nothing else is ever
-    /// assigned to `x` ([`Checker::settle_nil_locals`]).
+    /// The `T` of the type `T?` of each `local x = nil` or uninitialized `local x`, which is
+    /// `nil` if nothing else is ever assigned to `x` ([`Checker::settle_nil_locals`]).
     nil_locals: Vec<Type>,
     diags: Diagnostics,
 }
@@ -1119,16 +1119,13 @@ impl<'a> Checker<'a> {
     }
 
     fn check_local(&mut self, names: &[Ident], exprs: &[Expr], span: Span) {
-        if exprs.is_empty() {
-            // Uninitialized `local a, b` — each name gets a fresh var pinned by later use.
-            for name in names {
-                if let Some(id) = self.res.def(name.span) {
-                    self.sym_types[id as usize] = self.u.fresh();
-                }
-            }
-            return;
-        }
-        let value_types = self.check_multi_rhs(exprs, names.len(), span);
+        // An uninitialized `local a, b` holds `nil` until assigned, so it is typed as if
+        // initialized to `nil` (`SPEC.md` §5.2).
+        let value_types = if exprs.is_empty() {
+            vec![Type::Nil; names.len()]
+        } else {
+            self.check_multi_rhs(exprs, names.len(), span)
+        };
         for (name, vt) in names.iter().zip(value_types) {
             // A local that starts out `nil` is optional, holding whatever is later assigned to
             // it (`SPEC.md` §5.2); it would otherwise be typed `nil`, which nothing else fits.
@@ -3226,6 +3223,32 @@ mod tests {
         }
     }
 
+    /// A local with no initializer holds `nil` until assigned, so it is typed like one initialized
+    /// to `nil`. It used to take the type of what was assigned to it, so a path that read it
+    /// first returned `nil` from a function typed to return a number.
+    #[test]
+    fn an_uninitialized_local_is_typed_like_one_initialized_to_nil() {
+        let cases = [
+            (
+                "function f(c) local x if c > 0 then x = c end return x end",
+                "fn(number) -> number?",
+            ),
+            (
+                "function f(c) local x, y if c > 0 then x = c y = {a = c} end \
+                 if y ~= nil then return y.a end return 0 end",
+                "fn(number) -> number",
+            ),
+            ("function f() local x return x end", "fn() -> nil"),
+        ];
+        for (src, want) in cases {
+            let info = ok(src, &empty());
+            assert_eq!(info.exports["f"].to_string(), want, "{src}");
+        }
+        // Even when every path assigns it before the read.
+        let src = "function f(c) local x if c > 0 then x = 1 else x = 2 end return x + 1 end";
+        assert_eq!(err_code(src, &empty()), "E0401", "{src}");
+    }
+
     /// A value can be used above the assignment that gives it its type, as in a loop that
     /// remembers the previous iteration's value. The use is checked against that type.
     #[test]
@@ -3301,7 +3324,7 @@ mod tests {
             "function f() local x = nil if x ~= nil then return x.a end return 0 end",
             "function f() local x = nil if x ~= nil then x.a = 1 end return 0 end",
             "function f() local x = nil if x ~= nil then return x(1) end return 0 end",
-            "function f() local x return x.a + 1 end",
+            "function f() local x if x ~= nil then return x.a + 1 end return 0 end",
         ];
         for src in cases {
             assert_eq!(err_code(src, &empty()), "E0410", "{src}");

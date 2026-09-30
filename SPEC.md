@@ -337,7 +337,9 @@ unification:
 - A `local`'s type comes from its initializer. A `local` initialized to `nil` is optional,
   `T?`, where `T` is the type of what is later assigned to it (§5.3): `local best = nil` can
   go on to hold a record, a number, or a closure. One that is only ever assigned `nil` has type
-  `nil`.
+  `nil`. A `local` with no initializer (`local x`) holds `nil` until assigned, and is typed
+  exactly as if initialized to `nil`, so it too must be narrowed before its value is used, even
+  where every path assigns it first.
 - Inference does not depend on the order of the code: a value may be used above the assignment
   that gives it its type, as when a loop reads what the previous iteration stored (§5.3), and
   the use is checked against that type. A field read, field write, or call on a value that
@@ -710,7 +712,9 @@ both read/write persistent memory.
   is a compile error.
 - **A local initialized to `nil` is optional** (§5.2): `local x = nil` is `T?`, with `T`
   inferred from what is later assigned to it, rather than `nil`, which no other value fits.
-  It is narrowed with `~= nil` like any optional.
+  It is narrowed with `~= nil` like any optional. An uninitialized `local x` is the same, since
+  it holds `nil` until assigned; there is no definite-assignment analysis to exempt a local
+  that every path assigns before reading.
 - **`---@` annotation type-syntax subset** is fixed (§5.6): `@param`/`@return` on top-level
   functions, scalar/optional/array/map/record spellings, `@type` and function/userdata types
   deferred, unknown directives ignored.

@@ -1082,6 +1082,26 @@ fn a_nil_local_can_stay_nil() {
 }
 
 #[test]
+fn an_uninitialized_local_is_nil_until_assigned() {
+    // Regression: `local x` took the type of what was assigned to it, so `f` was typed to
+    // return a number, and with `c = 0` the interpreters returned `nil` while the JIT failed
+    // to unbox it. It is now `number?` everywhere.
+    let src = "function f(c) local x if c > 0 then x = c * 2 end return x end";
+    assert_all_return(src, "f", vec![Value::Number(0.0)], "nil");
+    assert_all_return(src, "f", vec![Value::Number(4.0)], "8");
+    // Regression: reading a field of it on such a path disagreed three ways (an internal error,
+    // `nil`, and a runtime error). It now has to be narrowed first.
+    let src = "function f(c)\n\
+                 local x\n\
+                 if c > 0 then x = { a = c } end\n\
+                 if x ~= nil then return x.a end\n\
+                 return -1\n\
+               end";
+    assert_all_return(src, "f", vec![Value::Number(0.0)], "-1");
+    assert_all_return(src, "f", vec![Value::Number(3.0)], "3");
+}
+
+#[test]
 fn a_value_used_above_the_assignment_that_types_it() {
     let field = "function f(n)\n\
                    local prev = nil\n\
