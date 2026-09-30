@@ -76,6 +76,16 @@ fn snapshot_type_errors() {
         "type_error_nil_arithmetic",
         analyze_diag("function f()\n  local x = nil\n  return x + 1\nend")
     );
+    // `and`/`or` yields one of its operands, so the ones it can yield need one type, and the
+    // left one must be able to be `nil` or `false` (SPEC §3.5).
+    insta::assert_snapshot!(
+        "type_error_or_operand_types",
+        analyze_diag("---@param x number?\nfunction f(x)\n  return x or \"none\"\nend")
+    );
+    insta::assert_snapshot!(
+        "type_error_or_left_never_nil",
+        analyze_diag("function f(n)\n  return n + 1 or 0\nend")
+    );
     // A constant is immutable all the way down (SPEC §3): writing through one names the
     // constant, not the field, and points at host memory as the place state belongs.
     insta::assert_snapshot!(

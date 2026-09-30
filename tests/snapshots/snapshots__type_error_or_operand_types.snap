@@ -1,0 +1,9 @@
+---
+source: tests/snapshots.rs
+expression: "analyze_diag(\"---@param x number?\\nfunction f(x)\\n  return x or \\\"none\\\"\\nend\")"
+---
+error[E0455]: `or` can yield a number or a string, which are not one type; its operands must have the same type, apart from being optional
+  --> 3:10
+   |
+  3|   return x or "none"
+   |          ^^^^^^^^^^^

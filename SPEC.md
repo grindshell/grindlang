@@ -262,8 +262,8 @@ Operator typing _(v1)_:
 - concat `..` : `string × string → string`
 - relational `< > <= >=` : `number × number → bool` **or** `string × string → bool`
 - equality `== ~=` : both operands the same type → `bool`
-- `and` / `or` : both operands the same type `T` → `T` (no truthiness coercion across
-  types; condition positions require `bool` — see below)
+- `and` / `or` : yields one of its operands, as in Lua — `a and b` is `a` if `a` is `nil` or
+  `false`, else `b`; `a or b` is `a` if `a` is neither, else `b` — typed as described below
 - `not` : `bool → bool`
 - `#` : `string → number` or `array<T> → number`
 - unary `-` : `number → number`
@@ -274,10 +274,29 @@ and function values compare by *which object they are*. So two separately built 
 same contents are **not** equal, and a table is equal to itself however it was reached —
 including through a constant, which §3 memoizes per call precisely so that holds.
 
-**Conditions must be `bool`.** Unlike Lua, `if`, `while`, and the operands of `and`/`or`
-in condition position require a `bool`; there is no implicit "everything except
-`nil`/`false` is truthy" coercion of arbitrary types. Narrowing an optional uses an
-explicit comparison: `if v ~= nil then …`.
+**`and` / `or` operands may differ in type.** The result's type is the one type that covers
+every operand the expression can yield, worked out across a whole chain such as `c and a or b`;
+if there is no such type, it is an `E0455` error:
+
+- `x or d` with `x : T?` is a `T` when `d : T` — a default for an optional — and a `T?` when
+  `d` is a `T?` or `nil`.
+- `x and e` with `x : T?` yields `nil` or `e`, so it is `E?` where `e : E`.
+- `c and a or b` with `c : bool` and `a, b : T` is a `T`: one of two values. As in Lua, a `nil`
+  or `false` `a` yields `b`. `c and a` alone yields `false` or `a`, so it is an error unless
+  `a` is a `bool`.
+- Two `bool`s give a `bool`.
+
+The left operand must be one that can be `nil` or `false`: a `bool`, an optional, or `nil`. One
+that never is (a number, a string, a table, …) is an `E0456` error, since `and` would always
+yield its right operand and `or` never would. An optional operand whose type only later code
+settles (a `local x = nil` assigned further down) is taken to be `nil` when falsy; if it turns
+out to be a `bool?`, which can also be `false`, that is an `E0455` error.
+
+**Conditions must be `bool`.** Unlike Lua, `if` and `while` require a `bool`; there is no
+implicit "everything except `nil`/`false` is truthy" coercion of arbitrary types. `and`/`or`
+are the one place that tests for `nil`/`false`, and a condition built with them must still
+come out a `bool`: `if x and n > 0` with `x : number?` is a `bool?` and is rejected. Narrowing
+an optional uses an explicit comparison: `if v ~= nil then …`.
 
 ## 4. Module & export model
 
@@ -388,6 +407,9 @@ function best_name(items)
   return "none"
 end
 ```
+
+`or` gives an optional a default without narrowing it: `p.name or "unknown"` is a `string`
+(§3.5).
 
 ### 5.4 Records, arrays, maps
 
@@ -641,7 +663,8 @@ Each produces a targeted, span-pointing error:
 - `goto` / labels; varargs `...`; `repeat … until` loops
 - `setmetatable`/`getmetatable`, metatable-driven behavior
 - `require`, `load`, `dofile`, `loadstring`, `pcall`/`error`-based control flow _(v1)_
-- truthiness coercion (non-`bool` condition); mixed-type `==`; heterogeneous tables
+- truthiness coercion (non-`bool` condition; an `and`/`or` whose left operand is never `nil` or
+  `false`); mixed-type `==`; heterogeneous tables
 - coroutines; integer/bitwise operations
 - source nested more than 200 levels deep — expressions, blocks, and function bodies inside one
   another (`E0209`). A long operator chain (`a + b + c + …`) or suffix chain (`t.a.b…`, `f()()`)
@@ -699,6 +722,10 @@ both read/write persistent memory.
 
 ### Resolved decisions (carried into v1)
 - **Conditions must be `bool`** — no truthiness coercion (§3.5, §5.3).
+- **`and`/`or` operands may differ in type** (§3.5): the result has the one type that covers
+  each operand it can yield, so `x or default` gives an optional a default and `c and a or b`
+  picks one of two values. Their left operand must be able to be `nil` or `false`, which keeps
+  them from testing the truthiness of a value that is always truthy.
 - **Array indexing always yields `T?`** — no static bounds analysis; narrow per-access or
   iterate with `ipairs` (§5.4).
 - **`repeat … until` is not supported**; **`//` floor-division is supported** (§3.3, §3.5, §8).

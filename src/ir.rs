@@ -443,6 +443,16 @@ struct FnLowerer<'a> {
     closure_counter: u32,
 }
 
+/// Where control goes once an operand of `and`/`or` is found truthy or falsy
+/// ([`FnLowerer::lower_logic_operand`]).
+#[derive(Clone, Copy)]
+enum LogicExit {
+    /// On to the block that evaluates the next operand; this one's value is dropped.
+    Goto(BlockId),
+    /// The expression yields this operand: store it into `result` and jump to `merge`.
+    Yield { result: LocalId, merge: BlockId },
+}
+
 impl<'a> FnLowerer<'a> {
     fn new(
         name: String,
@@ -1186,7 +1196,7 @@ impl<'a> FnLowerer<'a> {
                 };
                 Ok(self.emit_value(Op::Unary(*op, v), ty))
             }
-            ExprKind::Binary { op, lhs, rhs } => self.lower_binary(*op, lhs, rhs),
+            ExprKind::Binary { op, lhs, rhs } => self.lower_binary(expr, *op, lhs, rhs),
         }
     }
 
@@ -1433,10 +1443,16 @@ impl<'a> FnLowerer<'a> {
         Ok(table)
     }
 
-    fn lower_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<ValueId, LowerError> {
+    fn lower_binary(
+        &mut self,
+        expr: &Expr,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+    ) -> Result<ValueId, LowerError> {
         use BinOp::*;
         match op {
-            And | Or => self.lower_short_circuit(op, lhs, rhs),
+            And | Or => self.lower_logic(expr),
             _ => {
                 let l = self.lower_expr(lhs)?;
                 let r = self.lower_expr(rhs)?;
@@ -1451,41 +1467,96 @@ impl<'a> FnLowerer<'a> {
         }
     }
 
-    /// Short-circuiting `and`/`or` lowered to a branch and a result temporary.
-    fn lower_short_circuit(
-        &mut self,
-        op: BinOp,
-        lhs: &Expr,
-        rhs: &Expr,
-    ) -> Result<ValueId, LowerError> {
-        let l = self.lower_expr(lhs)?;
-        let result_ty = self.values[l as usize].clone();
-        let result_l = self.fresh_temp(result_ty.clone());
-        self.emit_stmt(Op::LocalSet(result_l, l));
-        let cond = self.emit_value(Op::Truthy(l), Type::Bool);
-
-        let rhs_b = self.new_block();
+    /// Short-circuiting `and`/`or`, lowered to branches on each operand's truthiness. Whichever
+    /// operand the expression yields is stored into one result temporary, on the path where it
+    /// is yielded: its type can differ from the result's (`x or 0` with `x` a `number?` is a
+    /// `number`), and it fits the result only there — `x` is a number only when it is truthy.
+    fn lower_logic(&mut self, expr: &Expr) -> Result<ValueId, LowerError> {
+        let ty = self
+            .types
+            .logic
+            .get(&expr.span)
+            .cloned()
+            .ok_or_else(|| LowerError::Internal("untyped `and`/`or`".into()))?;
+        let result = self.fresh_temp(ty.clone());
         let merge = self.new_block();
+        let yielded = LogicExit::Yield { result, merge };
+        self.lower_logic_operand(expr, yielded, yielded)?;
+        self.switch(merge);
+        Ok(self.emit_value(Op::LocalGet(result), ty))
+    }
 
-        // `and`: evaluate rhs when lhs is truthy. `or`: when lhs is falsy.
-        let (then_blk, else_blk) = match op {
-            BinOp::And => (rhs_b, merge),
-            BinOp::Or => (merge, rhs_b),
-            _ => unreachable!(),
+    /// Lower an operand of `and`/`or` (or a chain of them): evaluate it, then go to `on_truthy`
+    /// or `on_falsy` by its value.
+    fn lower_logic_operand(
+        &mut self,
+        expr: &Expr,
+        on_truthy: LogicExit,
+        on_falsy: LogicExit,
+    ) -> Result<(), LowerError> {
+        match &expr.kind {
+            ExprKind::Paren(inner) => return self.lower_logic_operand(inner, on_truthy, on_falsy),
+            // `a and b`: a falsy `a` ends it; otherwise `b` decides.
+            ExprKind::Binary {
+                op: BinOp::And,
+                lhs,
+                rhs,
+            } => {
+                let rhs_b = self.new_block();
+                self.lower_logic_operand(lhs, LogicExit::Goto(rhs_b), on_falsy)?;
+                self.switch(rhs_b);
+                return self.lower_logic_operand(rhs, on_truthy, on_falsy);
+            }
+            // `a or b`: a truthy `a` ends it; otherwise `b` decides.
+            ExprKind::Binary {
+                op: BinOp::Or,
+                lhs,
+                rhs,
+            } => {
+                let rhs_b = self.new_block();
+                self.lower_logic_operand(lhs, on_truthy, LogicExit::Goto(rhs_b))?;
+                self.switch(rhs_b);
+                return self.lower_logic_operand(rhs, on_truthy, on_falsy);
+            }
+            _ => {}
+        }
+        let v = self.lower_expr(expr)?;
+        if let (LogicExit::Yield { result, merge }, LogicExit::Yield { .. }) = (on_truthy, on_falsy)
+        {
+            // Yielded either way, so it has the result's type (or one it widens to).
+            self.emit_stmt(Op::LocalSet(result, v));
+            self.terminate(Terminator::Jump(merge));
+            return Ok(());
+        }
+        let cond = self.emit_value(Op::Truthy(v), Type::Bool);
+        let branch_from = self.current;
+        let target = |this: &mut Self, exit: LogicExit, truthy: bool| match exit {
+            LogicExit::Goto(b) => b,
+            LogicExit::Yield { result, merge } => {
+                let b = this.new_block();
+                this.switch(b);
+                // A truthy `T?` is a `T`, the result's type when nothing yields its `nil`.
+                let v = match &this.values[v as usize] {
+                    Type::Optional(inner) if truthy && this.locals[&result] == **inner => {
+                        let inner = (**inner).clone();
+                        this.emit_value(Op::Unwrap(v), inner)
+                    }
+                    _ => v,
+                };
+                this.emit_stmt(Op::LocalSet(result, v));
+                this.terminate(Terminator::Jump(merge));
+                b
+            }
         };
+        let then_blk = target(self, on_truthy, true);
+        let else_blk = target(self, on_falsy, false);
+        self.current = branch_from;
         self.terminate(Terminator::Branch {
             cond,
             then_blk,
             else_blk,
         });
-
-        self.switch(rhs_b);
-        let r = self.lower_expr(rhs)?;
-        self.emit_stmt(Op::LocalSet(result_l, r));
-        self.terminate(Terminator::Jump(merge));
-
-        self.switch(merge);
-        Ok(self.emit_value(Op::LocalGet(result_l), result_ty))
+        Ok(())
     }
 
     /// If `expr` is a bare name bound to a builtin namespace, return it.

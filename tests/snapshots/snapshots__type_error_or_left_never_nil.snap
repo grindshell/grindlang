@@ -1,0 +1,9 @@
+---
+source: tests/snapshots.rs
+expression: "analyze_diag(\"function f(n)\\n  return n + 1 or 0\\nend\")"
+---
+error[E0456]: the left operand of `or` has type number, which is never `nil` or `false`, so the right operand is never used; `or` needs a bool or an optional on its left
+  --> 2:10
+   |
+  2|   return n + 1 or 0
+   |          ^^^^^

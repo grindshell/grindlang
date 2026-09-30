@@ -1135,6 +1135,121 @@ fn a_value_used_above_the_assignment_that_types_it() {
     assert_all_return(param, "f", vec![Value::Number(4.0)], "5");
 }
 
+// ---- `and`/`or` over operands of different types (`SPEC.md` §3.5) -----------------------
+//
+// `and`/`or` yield one of their operands, and the operands need not share a type: `x or 0`
+// with `x` a `number?` is a `number`. Each operand is stored into the result only on the path
+// where it is the one yielded, and `x` is a number only where it is truthy; stored before the
+// test, a `nil` `x` would reach the JIT's `number` result and fail to unbox.
+
+#[test]
+fn or_gives_an_optional_a_default() {
+    let src = "---@param x number?\n\
+               function f(x) return x or 0 end";
+    assert_all_return(src, "f", vec![Value::Nil], "0");
+    assert_all_return(src, "f", vec![Value::Number(5.0)], "5");
+    // The result is a number, so arithmetic takes it without narrowing.
+    let src = "---@param x number?\n\
+               function f(x) return (x or 1) * 10 end";
+    assert_all_return(src, "f", vec![Value::Nil], "10");
+    assert_all_return(src, "f", vec![Value::Number(4.0)], "40");
+    // A `bool?` defaults the same way; a `false` one gives way to the default too.
+    let src = "---@param b bool?\n\
+               function f(b) return b or true end";
+    assert_all_return(src, "f", vec![Value::Nil], "true");
+    assert_all_return(src, "f", vec![Value::Bool(false)], "true");
+    // A reference value, read straight from the result.
+    let src = "---@param p { n: number }?\n\
+               function f(p) return (p or { n = -1 }).n end";
+    assert_all_return(src, "f", vec![Value::Nil], "-1");
+    let mut rec = BTreeMap::new();
+    rec.insert("n".to_string(), Value::Number(7.0));
+    assert_all_return(src, "f", vec![Value::table(rec)], "7");
+}
+
+#[test]
+fn or_over_optionals_stays_optional() {
+    let src = "---@param x number?\n\
+               ---@param y number?\n\
+               function f(x, y) return x or y end";
+    assert_all_return(src, "f", vec![Value::Nil, Value::Nil], "nil");
+    assert_all_return(src, "f", vec![Value::Nil, Value::Number(2.0)], "2");
+    assert_all_return(src, "f", vec![Value::Number(3.0), Value::Nil], "3");
+    let src = "---@param x number?\n\
+               ---@param y number?\n\
+               function f(x, y) return x or y or 0 end";
+    assert_all_return(src, "f", vec![Value::Nil, Value::Nil], "0");
+    assert_all_return(src, "f", vec![Value::Nil, Value::Number(2.0)], "2");
+}
+
+#[test]
+fn and_on_an_optional_yields_nil_or_its_right_operand() {
+    let src = "---@param x number?\n\
+               function f(x) return x and \"some\" end";
+    assert_all_return(src, "f", vec![Value::Nil], "nil");
+    assert_all_return(src, "f", vec![Value::Number(3.0)], "some");
+}
+
+#[test]
+fn and_or_picks_one_of_two_values() {
+    let src = "function f(n) return n > 0 and \"pos\" or \"not pos\" end";
+    assert_all_return(src, "f", vec![Value::Number(1.0)], "pos");
+    assert_all_return(src, "f", vec![Value::Number(-1.0)], "not pos");
+    // A `nil` middle operand falls through to the last, as in Lua.
+    let src = "---@param x number?\n\
+               function f(n, x) return n > 0 and x or -1 end";
+    assert_all_return(src, "f", vec![Value::Number(1.0), Value::Number(5.0)], "5");
+    assert_all_return(src, "f", vec![Value::Number(1.0), Value::Nil], "-1");
+    assert_all_return(src, "f", vec![Value::Number(0.0), Value::Number(5.0)], "-1");
+    let src = "---@param b bool?\n\
+               function f(b) return b and 1 or 2 end";
+    assert_all_return(src, "f", vec![Value::Bool(true)], "1");
+    assert_all_return(src, "f", vec![Value::Bool(false)], "2");
+    assert_all_return(src, "f", vec![Value::Nil], "2");
+}
+
+#[test]
+fn or_defaults_in_a_loop_and_on_a_nil_local() {
+    // Array reads are optional; each iteration's default string is a new handle.
+    let src = "---@param names string[]\n\
+               function f(names, n)\n\
+                 local s = \"\"\n\
+                 for i = 1, n do s = s .. (names[i] or \"?\") end\n\
+                 return s\n\
+               end";
+    let names = Value::array(vec![Value::string("a"), Value::string("b")]);
+    assert_all_return(src, "f", vec![names, Value::Number(4.0)], "ab??");
+    let src = "---@param xs number[]\n\
+               function first_over(xs, limit)\n\
+                 local found = nil\n\
+                 for _, x in ipairs(xs) do\n\
+                   if found == nil and x > limit then found = x end\n\
+                 end\n\
+                 return found or -1\n\
+               end";
+    let xs = Value::array(vec![Value::Number(1.0), Value::Number(7.0)]);
+    for (limit, want) in [(5.0, "7"), (10.0, "-1")] {
+        assert_all_return(
+            src,
+            "first_over",
+            vec![xs.clone(), Value::Number(limit)],
+            want,
+        );
+    }
+}
+
+#[test]
+fn and_or_as_a_condition() {
+    let src = "---@param b bool?\n\
+               function f(b, n)\n\
+                 if b or n > 3 then return 1 end\n\
+                 return 0\n\
+               end";
+    assert_all_return(src, "f", vec![Value::Nil, Value::Number(5.0)], "1");
+    assert_all_return(src, "f", vec![Value::Bool(false), Value::Number(1.0)], "0");
+    assert_all_return(src, "f", vec![Value::Bool(true), Value::Number(1.0)], "1");
+}
+
 // ---- `---@` annotations (`SPEC.md` §5.6) ------------------------------------------------
 //
 // Annotations only *constrain the checker* — they don't change runtime semantics — but they

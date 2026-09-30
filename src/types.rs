@@ -16,6 +16,10 @@
 //!   → [`Type::Record`], string-keyed → [`Type::Map`].
 //! * Conditions must be `bool`; equality needs matching operand types; arithmetic/relational
 //!   operators are numeric (relational also allows `string`); `..` is `string`.
+//! * **`and`/`or`** yield one of their operands, which may differ in type: the result has the
+//!   one type that covers each operand it can yield (`x or 0` with `x : number?` is a `number`),
+//!   recorded in [`TypeInfo::logic`] for lowering. The left operand must be able to be `nil` or
+//!   `false` (§3.5).
 //!
 //! * **Multi-value returns** produce a [`Type::Tuple`], consumable only by a matching-arity
 //!   parallel binding or a pass-through `return` (§5.5); anywhere else is `E0415`.
@@ -216,6 +220,10 @@ pub struct TypeInfo {
     /// IR lowering unwraps each of these reads to the narrowed type — without that, a narrowed
     /// `number?` would reach native code as a boxed handle where an `f64` is expected.
     pub narrowed: HashMap<Span, Type>,
+    /// The type of every `and`/`or` expression that isn't an operand of another (`SPEC.md`
+    /// §3.5), keyed by its span. Its operands can differ from it and from each other
+    /// (`x or 0` with `x` a `number?` is a `number`), so lowering can't take it from them.
+    pub logic: HashMap<Span, Type>,
 }
 
 /// Type-check `module` (already resolved into `resolution`) against `cfg`.
@@ -263,6 +271,11 @@ pub fn typecheck(
         .iter()
         .map(|(span, t)| (*span, c.u.deep(t)))
         .collect();
+    let logic = c
+        .logic_types
+        .iter()
+        .map(|(span, t)| (*span, c.u.deep(t)))
+        .collect();
 
     Ok(TypeInfo {
         exports,
@@ -271,6 +284,7 @@ pub fn typecheck(
         constants,
         function_literals,
         narrowed,
+        logic,
     })
 }
 
@@ -306,6 +320,8 @@ impl Unifier {
             Type::Optional(i) => match self.deep(&i) {
                 // Holds nothing but `nil` (a `local x = nil` that nothing else is assigned to).
                 Type::Nil => Type::Nil,
+                // There is one `nil`: `x or nil` with an `x` of a type found to be `T?` later.
+                inner @ Type::Optional(_) => inner,
                 inner => Type::optional(inner),
             },
             Type::Array(i) => Type::array(self.deep(&i)),
@@ -441,6 +457,13 @@ enum DeferredKind {
     },
 }
 
+/// What an operand of `and`/`or` can yield: the type of its truthy values, and of its `nil` or
+/// `false` ones. `None` where it has none: a number is never falsy, `nil` never truthy.
+struct Outcomes {
+    truthy: Option<Type>,
+    falsy: Option<Type>,
+}
+
 /// A **narrowable location**: a bare local/upvalue symbol, a host-memory root, or a field
 /// path rooted at one of those. Keying the narrowing overlay by `Place` (rather than a bare
 /// [`SymbolId`]) is what lets `if p.name ~= nil then … p.name` refine a *field*, not just a
@@ -486,6 +509,12 @@ struct Checker<'a> {
     /// The `T` of the type `T?` of each `local x = nil` or uninitialized `local x`, which is
     /// `nil` if nothing else is ever assigned to `x` ([`Checker::settle_nil_locals`]).
     nil_locals: Vec<Type>,
+    /// The type of each `and`/`or` expression that isn't an operand of another, by span
+    /// (deep-resolved into [`TypeInfo::logic`] at the end).
+    logic_types: HashMap<Span, Type>,
+    /// The `T` of each `T?` operand of `and`/`or` typed before `T` was known, with the operand's
+    /// span ([`Checker::check_logic_optionals`]).
+    logic_optionals: Vec<(Type, Span)>,
     diags: Diagnostics,
 }
 
@@ -506,6 +535,8 @@ impl<'a> Checker<'a> {
             valueless_exits: Vec::new(),
             deferred: Vec::new(),
             nil_locals: Vec::new(),
+            logic_types: HashMap::new(),
+            logic_optionals: Vec::new(),
             diags: Diagnostics::new(),
         }
     }
@@ -552,6 +583,7 @@ impl<'a> Checker<'a> {
             }
         }
         self.check_deferred_uses();
+        self.check_logic_optionals();
         self.check_valueless_exits();
 
         // Pass 4: flag parameters whose type inference couldn't pin.
@@ -1293,6 +1325,10 @@ impl<'a> Checker<'a> {
             } => self.check_method_call(receiver, method, args, expr.span),
             ExprKind::Table(fields) => self.check_table(fields, expr.span),
             ExprKind::Unary { op, operand } => self.check_unary(*op, operand, expr.span),
+            ExprKind::Binary {
+                op: BinOp::And | BinOp::Or,
+                ..
+            } => self.check_logic(expr),
             ExprKind::Binary { op, lhs, rhs } => self.check_binary(*op, lhs, rhs, expr.span),
         }
     }
@@ -1809,22 +1845,198 @@ impl<'a> Checker<'a> {
                 }
                 Type::Bool
             }
-            And | Or => {
-                let lt = self.check_expr(lhs);
-                let rt = self.check_expr(rhs);
-                if self.u.unify(&lt, &rt).is_err() {
+            And | Or => unreachable!("`and`/`or` are typed by `check_logic`"),
+        }
+    }
+
+    /// Type an `and`/`or` expression (`SPEC.md` §3.5). It yields one of its operands, so its
+    /// type is the one type that covers each value it can yield: the truthy values of the
+    /// operand that ends it, and the `nil` or `false` of any operand it stops at on the way.
+    /// That is worked out across a chain (`c and a or b`) before settling on one type, since
+    /// an inner operator can yield a value (the `false` of `c and a`) the outer one never lets
+    /// through. The type is recorded in [`TypeInfo::logic`] for lowering.
+    fn check_logic(&mut self, expr: &Expr) -> Type {
+        let out = self.logic_outcomes(expr);
+        let ty = match (out.truthy, out.falsy) {
+            (Some(t), Some(f)) => match self.join(&t, &f) {
+                Some(ty) => ty,
+                None => {
+                    let ExprKind::Binary { op, .. } = &expr.kind else {
+                        unreachable!("`check_logic` types a binary expression")
+                    };
+                    // What stops a chain early is `nil` or `false`, and `nil` fits any type.
+                    let falsy = match self.u.deep(&f) {
+                        Type::Bool | Type::Optional(_) => "`false`".to_string(),
+                        other => format!("a {other}"),
+                    };
                     self.error(
                         "E0455",
                         format!(
-                            "`{}` requires both operands to have the same type, found {} and {}",
+                            "this `{}` can yield {falsy} or a {}, which are not one type; to pick \
+                             one of two values, write `cond and a or b`",
                             op.symbol(),
-                            self.u.deep(&lt),
-                            self.u.deep(&rt)
+                            self.u.deep(&t)
                         ),
-                        span,
+                        expr.span,
                     );
+                    Type::Error
                 }
-                self.u.deep(&lt)
+            },
+            (Some(ty), None) | (None, Some(ty)) => ty,
+            (None, None) => Type::Error,
+        };
+        self.logic_types.insert(expr.span, ty.clone());
+        ty
+    }
+
+    /// What an operand of `and`/`or` can yield, looking through a chain of them.
+    fn logic_outcomes(&mut self, expr: &Expr) -> Outcomes {
+        let (op, lhs, rhs) = match &expr.kind {
+            ExprKind::Paren(inner) => return self.logic_outcomes(inner),
+            ExprKind::Binary {
+                op: op @ (BinOp::And | BinOp::Or),
+                lhs,
+                rhs,
+            } => (*op, lhs, rhs),
+            _ => {
+                let t = self.check_expr(expr);
+                return self.outcomes_of(&t, expr.span);
+            }
+        };
+        let l = self.logic_outcomes(lhs);
+        if l.falsy.is_none()
+            && let Some(t) = &l.truthy
+        {
+            let consequence = if op == BinOp::Or {
+                "the right operand is never used"
+            } else {
+                "`and` always yields its right operand"
+            };
+            self.error(
+                "E0456",
+                format!(
+                    "the left operand of `{0}` has type {1}, which is never `nil` or `false`, so \
+                     {consequence}; `{0}` needs a bool or an optional on its left",
+                    op.symbol(),
+                    self.u.deep(t)
+                ),
+                lhs.span,
+            );
+        }
+        let r = self.logic_outcomes(rhs);
+        // `a and b` stops at a falsy `a`, and otherwise yields `b`; `a or b` stops at a truthy
+        // `a`, and otherwise yields `b`.
+        if op == BinOp::And {
+            Outcomes {
+                truthy: r.truthy,
+                falsy: self.join_outcome(l.falsy, r.falsy, op, expr.span),
+            }
+        } else {
+            Outcomes {
+                truthy: self.join_outcome(l.truthy, r.truthy, op, expr.span),
+                falsy: r.falsy,
+            }
+        }
+    }
+
+    /// What a value of type `t`, the operand at `span`, yields as an operand of `and`/`or`.
+    fn outcomes_of(&mut self, t: &Type, span: Span) -> Outcomes {
+        match self.u.shallow(t) {
+            Type::Nil => Outcomes {
+                truthy: None,
+                falsy: Some(Type::Nil),
+            },
+            Type::Bool => Outcomes {
+                truthy: Some(Type::Bool),
+                falsy: Some(Type::Bool),
+            },
+            Type::Optional(inner) => {
+                let falsy = match self.u.shallow(&inner) {
+                    Type::Bool => Type::optional(Type::Bool),
+                    // Taken to be `nil` alone, which is checked once the type is known.
+                    var @ Type::Var(_) => {
+                        self.logic_optionals.push((var, span));
+                        Type::Nil
+                    }
+                    _ => Type::Nil,
+                };
+                Outcomes {
+                    truthy: Some(*inner),
+                    falsy: Some(falsy),
+                }
+            }
+            // Not known yet: of the one type either way, as long as it isn't.
+            t @ (Type::Var(_) | Type::Error) => Outcomes {
+                truthy: Some(t.clone()),
+                falsy: Some(t),
+            },
+            t => Outcomes {
+                truthy: Some(t),
+                falsy: None,
+            },
+        }
+    }
+
+    /// Join two operands' truthy (for `or`) or falsy (for `and`) values into one type, reporting
+    /// a clash at `span`, the operator's expression.
+    fn join_outcome(
+        &mut self,
+        a: Option<Type>,
+        b: Option<Type>,
+        op: BinOp,
+        span: Span,
+    ) -> Option<Type> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(self.join(&a, &b).unwrap_or_else(|| {
+                // Only truthy values can clash: falsy ones are `nil` or `false`.
+                let msg = format!(
+                    "`{}` can yield a {} or a {}, which are not one type; its operands must have \
+                     the same type, apart from being optional",
+                    op.symbol(),
+                    self.u.deep(&a),
+                    self.u.deep(&b)
+                );
+                self.error("E0455", msg, span);
+                Type::Error
+            })),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// The one type of a value that is either an `a` or a `b`: their common type, optional if
+    /// either is. `None` if they have none.
+    fn join(&mut self, a: &Type, b: &Type) -> Option<Type> {
+        let optional = |t: Type| match t {
+            Type::Optional(_) => t,
+            t => Type::optional(t),
+        };
+        match (self.u.shallow(a), self.u.shallow(b)) {
+            (Type::Error, _) | (_, Type::Error) => Some(Type::Error),
+            (Type::Nil, Type::Nil) => Some(Type::Nil),
+            (Type::Nil, t) | (t, Type::Nil) => Some(optional(t)),
+            (Type::Optional(x), Type::Optional(y)) => {
+                self.u.unify(&x, &y).is_ok().then_some(Type::Optional(x))
+            }
+            (Type::Optional(x), t) | (t, Type::Optional(x)) => {
+                self.u.unify(&x, &t).is_ok().then_some(Type::Optional(x))
+            }
+            (x, y) => self.u.unify(&x, &y).is_ok().then_some(x),
+        }
+    }
+
+    /// Report each optional operand of `and`/`or` whose `nil`-or-`false` values were taken to be
+    /// `nil` alone, before its type was known ([`Checker::outcomes_of`]), that turned out to be a
+    /// `bool?` — which can also be `false`.
+    fn check_logic_optionals(&mut self) {
+        for (inner, span) in std::mem::take(&mut self.logic_optionals) {
+            if self.u.deep(&inner) == Type::Bool {
+                self.error(
+                    "E0455",
+                    "`and`/`or` here took this value to be `nil` whenever it isn't truthy, but \
+                     code further on makes it a `bool?`, which can also be `false`; give it its \
+                     type before this point (for a local, initialize it to `false`, not `nil`)",
+                    span,
+                );
             }
         }
     }
@@ -3358,6 +3570,128 @@ mod tests {
                 diags.0[0].message
             );
         }
+    }
+
+    /// `and`/`or` yield one of their operands, typed as the one type that covers every operand
+    /// it can yield (`SPEC.md` §3.5).
+    #[test]
+    fn and_or_is_typed_by_the_operands_it_can_yield() {
+        let cases = [
+            // A default for an optional.
+            (
+                "---@param x number?\nfunction f(x) return x or 0 end",
+                "fn(number?) -> number",
+            ),
+            (
+                "---@param x bool?\nfunction f(x) return x or false end",
+                "fn(bool?) -> bool",
+            ),
+            (
+                "---@param x number?\n---@param y number?\nfunction f(x, y) return x or y end",
+                "fn(number?, number?) -> number?",
+            ),
+            (
+                "---@param x number?\nfunction f(x) return x or nil end",
+                "fn(number?) -> number?",
+            ),
+            (
+                "---@param p { name: string? }\nfunction f(p) return p.name or \"unknown\" end",
+                "fn(record { name: string? }) -> string",
+            ),
+            // `and` yields its left operand's `nil`, or its right operand.
+            (
+                "---@param x number?\nfunction f(x) return x and \"s\" end",
+                "fn(number?) -> string?",
+            ),
+            (
+                "---@param x bool?\nfunction f(x, y) return x and y > 0 end",
+                "fn(bool?, number) -> bool?",
+            ),
+            // One of two values: the `false` of `c and a` never gets past the `or`.
+            (
+                "function f(n) return n > 0 and \"pos\" or \"neg\" end",
+                "fn(number) -> string",
+            ),
+            (
+                "---@param x number?\nfunction f(n, x) return (n > 0 and x) or 0 end",
+                "fn(number, number?) -> number",
+            ),
+            // Two bools, as before.
+            (
+                "function f(a, b) return a > 0 and b > 0 or a < b end",
+                "fn(number, number) -> bool",
+            ),
+            // A parameter still takes the other operand's type.
+            ("function f(p) return p or 0 end", "fn(number) -> number"),
+            // `p or nil` is `T?` for a `p : T` found later; a `T?` one gives `T?` too, not `T??`.
+            (
+                "function f(p) return p or nil end\n\
+                 function g(c) local y = nil if c > 0 then y = c end return f(y) end",
+                "fn(number?) -> number?",
+            ),
+            // A local initialized to `nil` is typed by its default.
+            (
+                "function f() local x = nil return x or 0 end",
+                "fn() -> number",
+            ),
+        ];
+        for (src, want) in cases {
+            let info = ok(src, &empty());
+            assert_eq!(info.exports["f"].to_string(), want, "{src}");
+        }
+    }
+
+    #[test]
+    fn and_or_rejects_what_has_no_one_type() {
+        let cases = [
+            // The operands the expression can yield differ in type.
+            (
+                "---@param x number?\nfunction f(x) return x or \"none\" end",
+                "E0455",
+            ),
+            ("function f(n) return n > 0 or 1 end", "E0455"),
+            // `false` or a number.
+            ("function f(n) return n > 0 and n end", "E0455"),
+            ("function f(n) return (n > 0 and n or 1) and n end", "E0456"),
+            // A left operand that is never `nil` or `false`.
+            (
+                "---@param n number\nfunction f(n) return n or 1 end",
+                "E0456",
+            ),
+            ("function f(n) return n + 0 and n > 0 end", "E0456"),
+            (
+                "---@param x number?\nfunction f(x) return x or 0 or 1 end",
+                "E0456",
+            ),
+            // In a condition the result must be a bool, not a `bool?`.
+            (
+                "---@param x number?\nfunction f(x, n) if x and n > 0 then return 1 end return 0 end",
+                "E0400",
+            ),
+        ];
+        for (src, code) in cases {
+            assert_eq!(err_code(src, &empty()), code, "{src}");
+        }
+    }
+
+    /// An optional operand whose type isn't known yet is taken to be `nil` when it is falsy. If
+    /// it turns out to be a `bool?`, it could be `false`, and that is reported.
+    #[test]
+    fn and_or_on_a_value_later_found_to_be_a_bool_is_an_error() {
+        let src = "function f(c)\n\
+                     local x = nil\n\
+                     local r = x and 1\n\
+                     x = c > 0\n\
+                     if r ~= nil then return r end\n\
+                     return 0\n\
+                   end";
+        assert_eq!(err_code(src, &empty()), "E0455");
+        // The same code over a number is fine.
+        let src = src.replace("c > 0", "c + 0");
+        assert_eq!(
+            ok(&src, &empty()).exports["f"].to_string(),
+            "fn(number) -> number"
+        );
     }
 
     #[test]
