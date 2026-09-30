@@ -1,0 +1,33 @@
+---
+source: tests/ruby_translate.rs
+expression: rendered
+---
+error[E0521]: `f` doesn't take a block: only the loop methods (`each`, `times`, …) and the host's DSL keywords do
+  --> 4:6
+   |
+  4| f(1) { |y| y }
+   |      ^^^^^^^^^
+
+error[E0523]: named arguments (`a:`) are only for the host's DSL keywords
+  --> 2:5
+   |
+  2|   g(a: 1)
+   |     ^^
+
+error[E0524]: `@hp` reads host memory, but the host has designated no memory binding for `@` (`RubyConfig::ivar_memory`)
+  --> 2:3
+   |
+  2|   @hp
+   |   ^^^
+
+error[E0524]: a `def` can't read the top-level local `limit`: as in Ruby, a `def` sees only its own locals. Make it a constant (`LIMIT`) or pass it in
+  --> 3:3
+   |
+  3|   limit
+   |   ^^^^^
+
+error[E0525]: negative indices are not supported in Grindlang; for the last element, write `xs.last`
+  --> 2:6
+   |
+  2|   xs[-1]
+   |      ^^

@@ -23,15 +23,18 @@
 use crate::ast::{FnAnnotations, ParamAnn, Spanned, TypeAnn};
 use crate::diagnostics::Diagnostic;
 use crate::lexer::DocComment;
+use crate::surface::Surface;
 
-/// Parse the `@param` / `@return` directives out of a function's doc-comment run.
-pub fn parse_doc_block(docs: &[DocComment]) -> (FnAnnotations, Vec<Diagnostic>) {
+/// Parse the `@param` / `@return` directives out of a function's doc-comment run, written in
+/// `surface`'s comments (`---@param` in Lua, `# @param` in Ruby), which messages quote.
+pub fn parse_doc_block(docs: &[DocComment], surface: Surface) -> (FnAnnotations, Vec<Diagnostic>) {
     let mut ann = FnAnnotations::default();
     let mut diags = Vec::new();
+    let doc = surface.doc_comment();
 
-    for doc in docs {
+    for line in docs {
         // Only `@`-directives are consumed; everything else is free-form documentation.
-        let Some(rest) = doc.text.trim_start().strip_prefix('@') else {
+        let Some(rest) = line.text.trim_start().strip_prefix('@') else {
             continue;
         };
         let mut it = rest.splitn(2, char::is_whitespace);
@@ -46,20 +49,20 @@ pub fn parse_doc_block(docs: &[DocComment]) -> (FnAnnotations, Vec<Diagnostic>) 
                 if name.is_empty() || type_str.is_empty() {
                     diags.push(Diagnostic::error(
                         "E0110",
-                        "malformed `---@param` (expected `@param <name> <type>`)",
-                        doc.span,
+                        format!("malformed `{doc}@param` (expected `@param <name> <type>`)"),
+                        line.span,
                     ));
                     continue;
                 }
                 match parse_type_ann(type_str) {
                     Ok(ty) => ann.params.push(ParamAnn {
-                        name: Spanned::new(name.to_string(), doc.span),
-                        ty: Spanned::new(ty, doc.span),
+                        name: Spanned::new(name.to_string(), line.span),
+                        ty: Spanned::new(ty, line.span),
                     }),
                     Err(msg) => diags.push(Diagnostic::error(
                         "E0110",
-                        format!("malformed type in `---@param {name}`: {msg}"),
-                        doc.span,
+                        format!("malformed type in `{doc}@param {name}`: {msg}"),
+                        line.span,
                     )),
                 }
             }
@@ -67,18 +70,18 @@ pub fn parse_doc_block(docs: &[DocComment]) -> (FnAnnotations, Vec<Diagnostic>) 
                 if args.is_empty() {
                     diags.push(Diagnostic::error(
                         "E0110",
-                        "malformed `---@return` (expected `@return <type>`)",
-                        doc.span,
+                        format!("malformed `{doc}@return` (expected `@return <type>`)"),
+                        line.span,
                     ));
                     continue;
                 }
                 match parse_type_ann(args) {
                     // Each `@return` line contributes one return value; ≥ 2 build a tuple.
-                    Ok(ty) => ann.ret.push(Spanned::new(ty, doc.span)),
+                    Ok(ty) => ann.ret.push(Spanned::new(ty, line.span)),
                     Err(msg) => diags.push(Diagnostic::error(
                         "E0110",
-                        format!("malformed type in `---@return`: {msg}"),
-                        doc.span,
+                        format!("malformed type in `{doc}@return`: {msg}"),
+                        line.span,
                     )),
                 }
             }
@@ -407,7 +410,7 @@ mod tests {
                 text: " @return number".into(),
             },
         ];
-        let (ann, diags) = parse_doc_block(&docs);
+        let (ann, diags) = parse_doc_block(&docs, Surface::Lua);
         assert!(diags.is_empty());
         assert_eq!(ann.params.len(), 1);
         assert_eq!(ann.params[0].name.node, "base");
@@ -430,7 +433,7 @@ mod tests {
                 text: " @return string".into(),
             },
         ];
-        let (ann, diags) = parse_doc_block(&docs);
+        let (ann, diags) = parse_doc_block(&docs, Surface::Lua);
         assert!(diags.is_empty());
         assert_eq!(ann.ret.len(), 2);
         assert_eq!(ann.ret[0].node, TypeAnn::Named("number".into()));
@@ -444,7 +447,7 @@ mod tests {
             span: Span::new(0, 0),
             text: " @param x notatype!".into(),
         }];
-        let (_, diags) = parse_doc_block(&docs);
+        let (_, diags) = parse_doc_block(&docs, Surface::Lua);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "E0110");
     }

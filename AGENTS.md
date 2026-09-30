@@ -65,8 +65,10 @@ other feature required.
   can be cached to / loaded from disk. Pulls in `serde_json` as the on-disk format. The
   `grindlang` CLI **requires** this feature (`required-features = ["jit", "serde"]`) because its
   pyc-style IR cache is default-on; the library itself keeps `serde` optional.
-- `ruby` — the Ruby surface (`src/ruby/`, `SPEC-RUBY.md`, `PLAN.md` Phase 10): so far its lexer
-  and parser, `ruby::parse`, to a Ruby-shaped tree. Front end only; needs no backend feature.
+- `ruby` — the Ruby surface (`src/ruby/`, `SPEC-RUBY.md`, `PLAN.md` Phase 10): its lexer and
+  parser (`ruby::parse`, to a Ruby-shaped tree) and the translation into the shared
+  `ast::Module` (`ruby::parse_module`), which then runs through the Lua pipeline unchanged.
+  Front end only; needs no backend feature.
 
 **Gating rule:** items needed by *any* execution backend (the runtime `Value` reference
 variants `Cell`/`Closure`, `NativeFn`, `ClosureObj`, and the builtin reference impls in
@@ -132,10 +134,12 @@ Front-end entry points in `lib.rs` are always available: `parse` (→ AST), `che
 already parsed `ast::Module`, so another surface syntax can feed the shared pipeline.
 
 **Surfaces.** `ast::Module::surface` records which syntax a module was parsed from
-(`src/surface.rs`; only Lua so far, a Ruby surface is planned in `PLAN.md` Phase 10). It never
-changes what a program means. The resolver and checker quote code in diagnostics through it —
+(`src/surface.rs`: Lua, or Ruby, whose front end is `PLAN.md` Phase 10). It never changes what
+a program means. The resolver and checker quote code in diagnostics through it —
 `surface.binop(op)`, `surface.nil_test()`, … — so write a new message's code snippets that way
-rather than inlining Lua syntax.
+rather than inlining Lua syntax. The Ruby translator makes up nodes Lua source never has, so
+look up a binding only for a `Name`, never by the span of another kind of node (see
+`src/ruby/desugar.rs`).
 
 ### The three-oracle model
 

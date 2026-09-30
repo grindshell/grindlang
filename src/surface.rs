@@ -4,7 +4,8 @@
 //! the shared [`ast::Module`](crate::ast::Module), whichever syntax it was parsed from. The
 //! resolver and the checker still quote code in their diagnostics (an operator, the test that
 //! narrows an optional, a loop), so they ask the module's [`Surface`] how to write it instead of
-//! spelling it in Lua inline. Lua is the only surface so far; `PLAN.md` Phase 10 plans a second.
+//! spelling it in Lua inline. There are two surfaces: Lua's (`SPEC.md`) and Ruby's
+//! (`SPEC-RUBY.md`, whose front end is behind the `ruby` feature; its wording here is not).
 
 use crate::ast::{BinOp, UnOp};
 
@@ -15,6 +16,8 @@ pub enum Surface {
     /// Lua's syntax (`SPEC.md`).
     #[default]
     Lua,
+    /// A subset of Ruby's syntax (`SPEC-RUBY.md`), translated into the shared tree.
+    Ruby,
 }
 
 impl Surface {
@@ -22,6 +25,15 @@ impl Surface {
     pub fn binop(self, op: BinOp) -> &'static str {
         match self {
             Surface::Lua => op.symbol(),
+            Surface::Ruby => match op {
+                BinOp::FloorDiv => ".div",
+                BinOp::Pow => "**",
+                BinOp::Concat => "#{…}",
+                BinOp::Ne => "!=",
+                BinOp::And => "&&",
+                BinOp::Or => "||",
+                _ => op.symbol(),
+            },
         }
     }
 
@@ -29,6 +41,11 @@ impl Surface {
     pub fn unop(self, op: UnOp) -> &'static str {
         match self {
             Surface::Lua => op.symbol(),
+            Surface::Ruby => match op {
+                UnOp::Neg => "-",
+                UnOp::Not => "!",
+                UnOp::Len => ".length",
+            },
         }
     }
 
@@ -36,20 +53,23 @@ impl Surface {
     pub fn nil_test(self) -> &'static str {
         match self {
             Surface::Lua => "~= nil",
+            Surface::Ruby => ".nil?",
         }
     }
 
-    /// The iterator a loop over an array uses.
+    /// The loop over an array, as a message names it, quoted.
     pub fn array_loop(self) -> &'static str {
         match self {
-            Surface::Lua => "ipairs",
+            Surface::Lua => "`ipairs`",
+            Surface::Ruby => "`each` with one block parameter",
         }
     }
 
-    /// The iterator a loop over a map uses.
+    /// The loop over a map, as a message names it, quoted.
     pub fn map_loop(self) -> &'static str {
         match self {
-            Surface::Lua => "pairs",
+            Surface::Lua => "`pairs`",
+            Surface::Ruby => "`each` with two block parameters",
         }
     }
 
@@ -57,6 +77,7 @@ impl Surface {
     pub fn parallel_binding(self) -> &'static str {
         match self {
             Surface::Lua => "a parallel `local`/assignment",
+            Surface::Ruby => "a multiple assignment (`a, b = …`)",
         }
     }
 
@@ -65,6 +86,7 @@ impl Surface {
     pub fn choice(self) -> &'static str {
         match self {
             Surface::Lua => "cond and a or b",
+            Surface::Ruby => "cond ? a : b",
         }
     }
 
@@ -72,6 +94,7 @@ impl Surface {
     pub fn closure_calling(self, name: &str) -> String {
         match self {
             Surface::Lua => format!("function(x) return {name}(x) end"),
+            Surface::Ruby => format!("->(x) {{ {name}(x) }}"),
         }
     }
 
@@ -79,6 +102,35 @@ impl Surface {
     pub fn top_level_return(self) -> &'static str {
         match self {
             Surface::Lua => "the only top-level `return` is a module's trailing export table",
+            Surface::Ruby => "a script exports its public `def`s and its constants",
+        }
+    }
+
+    /// What starts a doc-comment line holding an annotation, as a message quotes it.
+    pub fn doc_comment(self) -> &'static str {
+        match self {
+            Surface::Lua => "---",
+            Surface::Ruby => "# ",
+        }
+    }
+
+    /// Advice for an optional used as a condition, where the surface has some: in Ruby, `if x`
+    /// tests whether `x` is `nil`, which Grindlang spells out.
+    pub fn optional_condition_hint(self) -> Option<&'static str> {
+        match self {
+            Surface::Lua => None,
+            Surface::Ruby => {
+                Some("to test whether it is nil, write `unless x.nil?` or `if x.nil?`")
+            }
+        }
+    }
+
+    /// Advice for `+` with a string operand, where the surface has some: Ruby authors join
+    /// strings with `+`, which Grindlang's `+` doesn't do.
+    pub fn string_plus_hint(self) -> Option<&'static str> {
+        match self {
+            Surface::Lua => None,
+            Surface::Ruby => Some("to join strings, use interpolation: `\"#{a}#{b}\"`"),
         }
     }
 }

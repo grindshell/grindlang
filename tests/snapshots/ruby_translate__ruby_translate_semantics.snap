@@ -1,0 +1,135 @@
+---
+source: tests/ruby_translate.rs
+expression: rendered
+---
+error[E0600]: `+` doesn't join strings in Grindlang; use interpolation: `"#{a}#{b}"`
+  --> 2:3
+   |
+  2|   "hi " + name
+   |   ^^^^^^^^^^^^
+
+error[E0601]: the method `sort` is not supported in Grindlang (SPEC-RUBY.md §4.11 lists the methods it has)
+  --> 2:6
+   |
+  2|   xs.sort()
+   |      ^^^^
+
+error[E0601]: the method `even?` is not supported in Grindlang (SPEC-RUBY.md §4.11 lists the methods it has)
+  --> 2:5
+   |
+  2|   x.even?
+   |     ^^^^^
+
+error[E0601]: `Math.tan` is not supported in Grindlang
+  --> 2:8
+   |
+  2|   Math.tan(x)
+   |        ^^^
+
+error[E0602]: `abs` takes 0 arguments, found 1
+  --> 2:5
+   |
+  2|   x.abs(2)
+   |     ^^^
+
+error[E0602]: `each` is a loop, which needs a block: `each { |x| … }`
+  --> 2:6
+   |
+  2|   xs.each
+   |      ^^^^
+
+error[E0602]: `each` is a loop, so it's a statement; it can't be used as a value. To build a value in it, assign to a local declared before the loop
+  --> 2:10
+   |
+  2|   y = xs.each { |x| x }
+   |          ^^^^
+
+error[E0602]: `each` takes one block parameter to loop over an array's elements, or two to loop over a map's keys and values
+  --> 2:11
+   |
+  2|   xs.each { |a, b, c| a }
+   |           ^^^^^^^^^^^^^^^
+
+error[E0602]: `<<` adds to an array, so it's a statement, not a value
+  --> 2:7
+   |
+  2|   y = xs << x
+   |       ^^^^^^^
+
+error[E0602]: `push` adds to an array, so it's a statement, not a value
+  --> 2:10
+   |
+  2|   n = xs.push(1)
+   |          ^^^^
+
+error[E0602]: `last` reads its receiver twice, and this one has a call in it; assign it to a local first
+  --> 2:3
+   |
+  2|   g.last
+   |   ^
+
+error[E0602]: `+=` would evaluate this target twice, and it has a call in it; assign what it's in to a local first
+  --> 2:3
+   |
+  2|   g[0] += 1
+   |   ^^^^
+
+error[E0603]: a range is only a loop's receiver, `(a..b).each { |i| … }`, or a `when` value
+  --> 2:7
+   |
+  2|   r = 1..3
+   |       ^^^^
+
+error[E0604]: `X` is a constant, which is assigned only directly at the top level, once; use a lowercase name for a variable
+  --> 2:3
+   |
+  2|   X = 1
+   |   ^
+
+error[E0604]: `X` is a constant, which is assigned only directly at the top level, once; use a lowercase name for a variable
+  --> 2:3
+   |
+  2|   X = 1
+   |   ^
+
+error[E0604]: `A` is a constant, which is assigned only directly at the top level, once; use a lowercase name for a variable
+  --> 1:1
+   |
+  1| A, B = 1, 2
+   | ^
+
+error[E0604]: `B` is a constant, which is assigned only directly at the top level, once; use a lowercase name for a variable
+  --> 1:4
+   |
+  1| A, B = 1, 2
+   |    ^
+
+error[E0604]: `X` is a constant, which takes one value
+  --> 1:1
+   |
+  1| X = 1, 2
+   | ^^^^^^^^
+
+error[E0605]: this value is never used: only a call can be a statement, except at the end of a `def` or lambda, which returns it
+  --> 2:3
+   |
+  2|   x + 1
+   |   ^^^^^
+
+error[E0606]: this code never runs: it comes after a `return`
+  --> 3:3
+   |
+  3|   x + 1
+   |   ^^^^^
+
+error[E0607]: `g` is a local here, not a method; call the lambda it holds with `g.(…)` or `g.call(…)`
+  --> 3:3
+   |
+  3|   g(1)
+   |   ^
+
+error[E0608]: an empty hash is not supported yet: Grindlang has no way to write an empty map, so a hash starts with at least one entry
+  --> 2:7
+   |
+  2|   h = {}
+   |       ^^

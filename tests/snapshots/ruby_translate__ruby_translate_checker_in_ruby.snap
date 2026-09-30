@@ -1,0 +1,57 @@
+---
+source: tests/ruby_translate.rs
+expression: rendered
+---
+error[E0412]: `each` with one block parameter expects an array, found map<string, number>
+  --> 4:3
+   |
+  4|   m.each { |v| t += v }
+   |   ^
+
+error[E0401]: expected a number: expected number, found string; to join strings, use interpolation: `"#{a}#{b}"`
+  --> 4:3
+   |
+  4|   a + b
+   |   ^
+
+error[E0401]: expected a number: expected number, found string; to join strings, use interpolation: `"#{a}#{b}"`
+  --> 4:7
+   |
+  4|   a + b
+   |       ^
+
+error[E0401]: expected a number: expected number, found a value that may be nil; check it with `.nil?` first
+  --> 2:3
+   |
+  2|   s.to_f + 1
+   |   ^^^^^^
+
+error[E0400]: condition must be a bool: expected bool, found number?; to test whether it is nil, write `unless x.nil?` or `if x.nil?`
+  --> 3:6
+   |
+  3|   if n
+   |      ^
+
+error[E0415]: a multi-value call must be returned directly or bound to a multiple assignment (`a, b = …`); it can't be used as a single value here
+  --> 5:3
+   |
+  5|   two + 1
+   |   ^^^
+
+error[E0309]: top-level code cannot `return`; a script exports its public `def`s and its constants
+  --> 1:1
+   |
+  1| return 1
+   | ^^^^^^^^
+
+error[E0110]: malformed type in `# @param x`: expected `]` for an array type `T[]`
+  --> 1:1
+   |
+  1| # @param x nope[
+   | ^^^^^^^^^^^^^^^^
+
+error[E0480]: missing `return`: this function returns number, but can reach its end without returning a value
+  --> 3:1
+   |
+  3| end
+   | ^^^

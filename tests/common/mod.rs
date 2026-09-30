@@ -49,6 +49,51 @@ impl Executors {
         }
     }
 
+    /// Bind host memory `name` on every executor, each to a table of its own from `make`, so
+    /// each executor's writes can be compared ([`Self::assert_memory`]).
+    pub fn set_memory(&mut self, name: &str, make: impl Fn() -> Value) {
+        self.interp.set_memory(name, make());
+        self.vm.set_memory(name, make());
+        self.jit.set_memory(name, make());
+        self.eager.set_memory(name, make());
+    }
+
+    /// Register the memory method `symbol` (`"mem:method"`) on every executor.
+    pub fn set_method<F>(&mut self, symbol: &str, f: F)
+    where
+        F: Fn(&[Value]) -> Result<Value, RunError> + Clone + 'static,
+    {
+        self.interp.set_method(symbol, f.clone());
+        self.vm.set_method(symbol, f.clone());
+        self.jit.set_method(symbol, f.clone());
+        self.eager.set_method(symbol, f);
+    }
+
+    /// Register the host function `name` on every executor.
+    pub fn set_host_function<F>(&mut self, name: &str, f: F)
+    where
+        F: Fn(&[Value]) -> Result<Value, RunError> + Clone + 'static,
+    {
+        self.interp.set_host_function(name, f.clone());
+        self.vm.set_host_function(name, f.clone());
+        self.jit.set_host_function(name, f.clone());
+        self.eager.set_host_function(name, f);
+    }
+
+    /// Assert every executor's memory `name` reads `want` (by `Display`).
+    #[track_caller]
+    pub fn assert_memory(&self, name: &str, want: &str) {
+        for (oracle, got) in [
+            ("AST", self.interp.memory(name)),
+            ("IR", self.vm.memory(name)),
+            ("JIT", self.jit.memory(name)),
+            ("eager JIT", self.eager.memory(name)),
+        ] {
+            let got = got.unwrap_or_else(|| panic!("{oracle} has no memory `{name}`"));
+            assert_eq!(got.to_string(), want, "{oracle} memory `{name}`");
+        }
+    }
+
     /// Call `func` on every executor, labelled.
     pub fn call(
         &mut self,

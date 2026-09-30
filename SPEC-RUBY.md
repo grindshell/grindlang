@@ -5,10 +5,13 @@
 > Ruby forms are accepted and which SPEC.md construct each one becomes. Where this document is
 > silent, SPEC.md governs.
 >
-> Status: **draft, partly implemented.** The lexer and parser (§2, §3, and the syntax
-> rejections of §6) are built, behind the `ruby` feature (`grindlang::ruby::parse`); the
-> translation of §4–§5 is not yet. The decisions below were confirmed with the stakeholder on
-> 2026-09-30; details marked _(open)_ are still to settle. Items that depend on a core change
+> Status: **draft, partly implemented.** Behind the `ruby` feature: the lexer and parser (§2,
+> §3, and the syntax rejections of §6; `grindlang::ruby::parse`), and the translation of §4
+> into the shared tree (`grindlang::ruby::parse_module`), except the forms that wait on core
+> changes or later steps: `?:`, `if`/`case` as values, `next`, and returning `nil` from the end
+> of a function (R3), the collection methods of §4.12 (R4), and the DSL keywords of §5 (R5).
+> Each of those is `E0699` until then. The decisions below were confirmed with the stakeholder
+> on 2026-09-30; details marked _(open)_ are still to settle. Items that depend on a core change
 > name it (C2–C9, PLAN.md Phase 10).
 
 ## 1. What a Ruby-surface script is
@@ -71,6 +74,9 @@ end
 - **Memory fields:** `@name` (§4.10).
 - **Symbols:** `:name`, which is the string `"name"` (§4.6).
 - Rejected: `$globals`, `@@class_vars`, `:"quoted symbols"`.
+- Reserved at the top level: `math`, `string`, `tostring`, and `tonumber`, the builtins the
+  translation calls (`x.abs` is `math.abs(x)`), so a `def` or top-level local can't take one of
+  those names (SPEC.md's `E0304`).
 
 ### 2.4 Keywords
 ```
@@ -253,7 +259,7 @@ even though SPEC.md's Lua spelling ranks `and` above `or`, and `not a and b` is
 | Ruby | Becomes |
 |---|---|
 | `MAX_HP = 100` | the constant `MAX_HP`, exported (SPEC.md §3.1) |
-| `table = {}` (lowercase) | a top-level `local`: a private module variable |
+| `names = []` (lowercase) | a top-level `local`: a private module variable |
 | `def name … end` | an exported top-level function |
 | `private def name … end`, or a `def` after a bare `private` | a top-level function **not** exported |
 
@@ -267,6 +273,13 @@ read top-level locals, since they are closures. `CONST.freeze` is accepted and d
 top-level values are frozen after initialization regardless (SPEC.md §3.1). Everything else
 about top-level code is SPEC.md's: it may loop, branch, and call host functions; it may not
 `return` (E0309) or use host memory (E0310).
+
+A constant is assigned only directly at the top level, once, with one value: `X = 1` in a
+`def`, a block, or a branch, `A, B = 1, 2`, and `X = 1, 2` are `E0604`.
+
+The host translates a script with `ruby::parse_module(src, &RubyConfig, &TypeConfig)`, which
+returns the shared `ast::Module` that `analyze_module` and `compile_module` take with the same
+`TypeConfig`: the translator reads the memory bindings and memory methods from it (§4.10).
 
 ### 4.2 Methods and implicit return
 A `def`'s parameters are plain names: no defaults, splats, keyword parameters, or `&block`.
@@ -286,23 +299,31 @@ A DSL block's return follows its declared signature instead (§5): a block decla
 nothing never gets an implicit `return`.
 
 ### 4.3 Local variables
-A Ruby local is declared by its first assignment. The translator finds each variable's owning
-scope — a `def`, a block or lambda, or the top level — and:
-- emits `local x = …` at the first assignment when that assignment comes before every use of
-  `x` in the same block;
+A Ruby local is declared by its first assignment, as Ruby's parser sees it: a name is a local
+from the first assignment to it on, and before that, the same name is a call with no
+arguments. The translator finds each variable's owning scope — a `def`, a block or lambda, or
+the top level — and:
+- emits `local x = …` at the first assignment when every other use of `x` is inside the block
+  that assignment lands in (a branch, a loop body, or the block a modifier's statement forms);
 - otherwise emits a bare `local x` at the start of the owning scope. It holds `nil` until
   assigned and is typed as optional (SPEC.md §5.2), matching Ruby, where a variable assigned in
-  only one branch is `nil` on the others.
+  only one branch is `nil` on the others. So is a variable whose first assignment reads it
+  (`x ||= 1`, `x += 1`, a lambda that calls itself), and every new variable of a multiple
+  assignment that also assigns something else (`a, b = 1, 2` where `a` exists).
 
 A block sees its enclosing scope's locals; a variable first assigned inside a block is local to
 that block. Block parameters shadow outer names.
+
+One difference from Ruby: a variable first assigned directly in a `while` or `until` body is
+declared there, so it is a new variable on each pass, where Ruby has one for the whole method.
+Only a lambda made in the loop and called on a later pass can tell.
 
 ### 4.4 Control flow
 | Ruby | Becomes |
 |---|---|
 | `if`/`elsif`/`else`, `unless`/`else` | `if`/`elseif`/`else`, with `unless c` as `if not c` |
 | `stmt if c`, `stmt unless c` | a one-branch `if` |
-| `case x when a, b … when c … else … end` | an `if` chain testing `x == a or x == b`, … (`x` evaluated once) |
+| `case x when a, b … when c … else … end` | an `if` chain testing `x == a or x == b`, …; a local or constant `x` is read again for each `when`, and any other is evaluated once, into a temporary |
 | `when lo..hi`, `when lo...hi` | `x >= lo and x <= hi`, `x >= lo and x < hi` |
 | `while c`, `until c`, `stmt while c` | `while c`, `while not c` |
 | `loop do … end` | `while true do … end` |
@@ -327,8 +348,11 @@ whole right side of an assignment or a `return`; elsewhere each branch must be o
 | `a.step(b, s) { \|i\| … }` | `for i = a, b, s do … end` |
 
 `each` with **one** block parameter iterates an array and with **two** a map, since the
-translator can't see types; the wrong one is SPEC.md's E0412, with a Ruby-worded hint. The
-iteration rules of SPEC.md §3.3 apply: what is visited is fixed when the loop starts.
+translator can't see types; the wrong one is SPEC.md's E0412, worded for Ruby ("`each` with
+one block parameter expects an array"). The iteration rules of SPEC.md §3.3 apply: what is
+visited is fixed when the loop starts. `times`, `upto`, `step`, and a range's `each` take at
+most one block parameter, `each_pair` exactly two; a block may leave out the ones it doesn't
+use. Each form is a loop, so it is a statement: as a value it is `E0602`.
 
 ### 4.6 Literals
 | Ruby | Becomes |
@@ -340,9 +364,10 @@ iteration rules of SPEC.md §3.3 apply: what is visited is fixed when the loop s
 | `[a, b, c]` | an array |
 | `{ hp: 10, name: "x" }` | a record |
 | `{ "fire" => 2, "ice" => 3 }` | a map |
-| `{}` | an empty table, shaped by its uses (SPEC.md §5.2) |
+| `{}` | rejected (`E0608`, _open_): SPEC.md has no empty map, since `{}` is an empty array |
 
-Interpolated values go through `tostring`, so each must be a `number`, `bool`, or `string`.
+Interpolated values go through `tostring`, so each must be a `number`, `bool`, or `string`,
+and interpolating a parameter doesn't settle its type: annotate it (`# @param name string`).
 Record fields are read with `r.name` or `r[:name]` (the literal key `"name"`, SPEC.md §5.4).
 
 ### 4.7 Operators
@@ -358,8 +383,12 @@ Record fields are read with `r.name` or `r[:name]` (the literal key `"name"`, SP
 
 `and`/`or` yield one of their operands as in SPEC.md §3.5, so `name || "unknown"` gives an
 optional a default. `+` on strings is rejected: when an operand is a string literal the
-translator reports it directly; otherwise the checker's type mismatch carries a hint to use
-interpolation.
+translator reports it directly (`E0600`); otherwise the checker's type mismatch carries a hint
+to use interpolation.
+
+A compound assignment reads its target and writes it, so a target holding a call
+(`g[0] += 1`, where `g` is a method) is `E0602`, which asks for a local: the call would run
+twice.
 
 ### 4.8 Nil tests and conditions
 `x.nil?` becomes `x == nil`; `!x.nil?`, `x != nil`, and `unless x.nil?` become `x ~= nil`. The
@@ -368,7 +397,10 @@ checker narrows `x` in the then-branch of `x ~= nil` and, with C8, in the else-b
 written.
 
 Conditions must be `bool` (SPEC.md §3.5). `if user` with `user` optional is an error whose
-hint suggests `unless user.nil?`.
+hint suggests `unless user.nil?`. `unless c` is `if not c`, except that the negation of `==`
+or `!=` is the other comparison, so `unless x.nil?` narrows as `x ~= nil` does. Narrowing
+follows SPEC.md §5.3, so a guard clause, `return 0 if x.nil?`, narrows nothing after it
+_(open)_.
 
 ### 4.9 Arrays
 Ruby indices **start at 0**. `a[i]` is an index node marked zero-based (C9): when `a` is an
@@ -385,14 +417,18 @@ on an array and `m[k]` on a map look alike. Reads yield `T?` as in SPEC.md §5.4
 
 A literal negative index (`a[-1]`) is an error; a computed negative index reads `nil`. An
 out-of-range write is SPEC.md §7.3's runtime error and reports the element's 1-based position
-_(open: report the Ruby index instead)_.
+_(open: report the Ruby index instead)_. `a.last` and `a << x` read `a` twice, so an `a`
+holding a call is `E0602`.
 
 ### 4.10 Host memory
 `@name` is the field `name` of one memory binding the host designates for `@`
-(`RubyConfig::ivar_memory`, for example `mem`); without one, `@name` is an error. Other
-memory bindings are used by name, `mem.gold`. A call on a memory binding, `mem.add_item(id)`,
-is a memory method call (SPEC.md §7.2; Lua's `mem:add_item(id)`). `@hp` in top-level code is
-E0310, as in SPEC.md §3.1.
+(`RubyConfig::ivar_memory`, for example `mem`); without one, or when the host provides no
+memory of that name, `@name` is `E0524`. Other memory bindings are used by name, `mem.gold`.
+A call on a memory binding, `mem.add_item(id)`, is a memory method call (SPEC.md §7.2; Lua's
+`mem:add_item(id)`), and so is `mem.reset` with no parentheses when the host declares a method
+`reset`; otherwise `mem.name` is a field. A call of a method the host doesn't declare is
+`E0601`. A local of the same name hides the memory binding. `@hp` in top-level code is E0310,
+as in SPEC.md §3.1.
 
 ### 4.11 Methods on values
 `recv.name` with no arguments is a **field read** unless `name` is in this table. A method in
@@ -402,6 +438,7 @@ the table always wins, so a record field named `size` is read as `r[:size]`.
 |---|---|
 | `x.length`, `x.size` | `#x` (string or array) |
 | `x.nil?` | `x == nil` (§4.8) |
+| `x.empty?`, `x.zero?` | `#x == 0`, `x == 0` |
 | `x.to_s` | `tostring(x)` |
 | `s.to_f` | `tonumber(s)` (`number?`) |
 | `x.abs`, `x.floor`, `x.ceil` | `math.abs(x)`, `math.floor(x)`, `math.ceil(x)` |
@@ -410,11 +447,15 @@ the table always wins, so a record field named `size` is read as `r[:size]`.
 | `x.div(y)` | `x // y` |
 | `a.first`, `a.last`, `a.push(x)`, `a << x` | §4.9 |
 | `f.call(x)`, `f.(x)` | calling the closure `f` |
-| `format(fmt, …)` | `string.format(fmt, …)` |
-| `Math.sqrt(x)`, `Math::PI` _(open: `::`)_ | `math.sqrt(x)`, `math.pi` |
+| `x.freeze` | `x` (§4.1) |
+| `format(fmt, …)` | `string.format(fmt, …)`, unless the script or host defines `format` |
+| `Math.sqrt(x)`, and any other function of `math` | `math.sqrt(x)` |
+| `Math.pi`, `Math.huge`; `Math::PI` _(open: `::`)_ | `math.pi`, `math.huge` |
 
-Any other method on a non-memory value is "not supported in Grindlang", naming the method.
-The table only renames; SPEC.md §6's catalog is the single source of builtins.
+A method in the table checks its argument count (`E0602`) and takes no block (`E0521`). Any
+other method called with parentheses or arguments, or whose name ends in `?` or `!`, is
+`E0601`, "not supported in Grindlang", naming the method. The table only renames; SPEC.md
+§6's catalog is the single source of builtins.
 
 ### 4.12 Collection methods with blocks
 | Ruby | Result |
@@ -558,13 +599,16 @@ once for its branches.
   `instance_eval`.
 - **Blocks and procs** (`E0521`): `yield`, `&block` parameters, passing a block with `&`,
   `block_given?`, `proc`, `Proc.new`, block-local variables `|x; y|`. _Translation:_ a block
-  passed to a user `def`, `f[x]` as a call.
+  passed to anything but a loop method or DSL keyword, including a user `def`, or to a method of
+  §4.11. (`f[x]` meant as a call is the checker's `E0424`: a function can't be indexed.)
 - **Exceptions** (`E0522`): `begin`/`rescue`/`ensure`/`retry`, `raise`, the `rescue` modifier,
   and with `begin`, `begin … end while`.
 - **Parameters** (`E0523`): default values, `*args`, `**opts`, keyword parameters,
-  destructuring `(a, b)`, splat arguments.
+  destructuring `(a, b)`, splat arguments. _Translation:_ named arguments (`f(a: 1)`) outside a
+  DSL keyword.
 - **Variables** (`E0524`): `$globals`, `@@class_vars`. _Translation:_ `@ivar` with no memory
-  designated for `@`, and a `def` reading a top-level lowercase local.
+  designated for `@`, or designated but not provided, and a `def` reading a top-level lowercase
+  local.
 - **Literals** (`E0525`): heredocs, `%w`/`%i`/`%q`/`%Q`, `?a`, regex literals, backticks,
   `0b`/`0o`/`017`, rationals, imaginaries, quoted symbols and `"key":` keys, `"#@x"`, literal
   negative indices.
@@ -582,9 +626,25 @@ once for its branches.
 - **Everything else** is a plain syntax error: `E0500`–`E0503` from the lexer (a stray
   character, an unterminated string, a bad escape, a malformed number), `E0510` for an
   unexpected token, and `E0511` where an expression was expected.
-- **Semantics** (E06xx, translation): `+` with a string-literal operand; a collection method
-  (§4.12) outside an assignment or `return`; an `if` or `case` value with multi-statement
-  branches outside an assignment or `return`.
+- **Semantics** (E06xx, translation):
+  - `E0600`: `+` with a string-literal operand (§4.7).
+  - `E0601`: a method that isn't in §4.11's table, a memory method the host doesn't declare,
+    or a `Math` function the catalog doesn't have.
+  - `E0602`: a method used the wrong way: the wrong number of arguments, a loop method without
+    a block or used as a value, `push` or `<<` used as a value, and `.last`, `<<`, or a
+    compound assignment reading a receiver that holds a call twice.
+  - `E0603`: a range anywhere but a loop's receiver or a `when` value.
+  - `E0604`: a constant assigned anywhere but directly at the top level, or with more than one
+    value.
+  - `E0605`: a value used as a statement, except the last one of a `def` or lambda.
+  - `E0606`: a statement after `return` or `break` in the same body.
+  - `E0607`: a local called like a method, `f(x)`, rather than as a lambda, `f.(x)`.
+  - `E0608`: an empty hash (Open items).
+  - Planned for later steps: a collection method (§4.12) outside an assignment or `return`
+    (R4), and an `if` or `case` value with multi-statement branches outside an assignment or
+    `return` (R3).
+  - `E0699`, until the step that translates it: `?:`, `if`/`case` as values, `next` (R3), and
+    the collection methods (R4).
 
 ## 7. Worked example
 
@@ -654,3 +714,10 @@ return { XP_BASE = XP_BASE, xp_for = xp_for, best_name = best_name }
 - **`::` for `Math::PI`.** Accept `Math::PI` and `Math.sqrt` as spellings of `math.*`, or only
   the latter.
 - **The keyword declaration API** (§5.3), settled in PLAN.md Phase 10, step R5.
+- **Empty hashes.** SPEC.md types `{}` as an empty array and has no way to write an empty map,
+  so a hash needs at least one entry for now (`E0608`). Options: type `{}` by its uses in the
+  checker (the interpreter, which has no types, then needs to know which one it built), or an
+  empty-map node only the Ruby translator makes. Either is a core change.
+- **Guard clauses.** `return 0 if x.nil?` narrows nothing after it (SPEC.md §5.3), which rules
+  out a common Ruby idiom; narrowing after an early return is a core change that would serve
+  Lua scripts equally.

@@ -311,7 +311,7 @@ impl Parser {
         if block.is_empty() {
             return FnAnnotations::default();
         }
-        let (ann, diags) = crate::annotations::parse_doc_block(&block);
+        let (ann, diags) = crate::annotations::parse_doc_block(&block, Surface::Lua);
         for d in diags {
             self.diags.push(d);
         }

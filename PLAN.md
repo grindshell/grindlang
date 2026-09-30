@@ -423,7 +423,7 @@ history before the commit that deleted it.
 
 A second syntax for the same language: a strict subset of Ruby's syntax aimed at game logic and
 dialog DSLs. [`SPEC-RUBY.md`](SPEC-RUBY.md) (draft) is its authoring contract; this section is
-why it is built the way it is. R0 and R1 are done; the rest is not implemented yet.
+why it is built the way it is. R0–R2 are done; the rest is not implemented yet.
 
 **Approach: translate into the shared AST.** The backends only see `ir::Program`, and
 everything above the IR sees `ast::Module`. A Ruby frontend that translates into `ast::Module`
@@ -551,12 +551,36 @@ counts exclude tests; the total is about 6k.
   tour), a table of every rejection with its code, and one snapshot per §6 group pinning each
   rendered diagnostic. (~3.6k lines without tests, over the ~2.3k estimated: most of the
   difference is diagnostic text and one-token-per-line enums.)
-- **R2 — translating the core subset.** C8 and C9 first. Then everything that maps onto
-  today's AST: scope analysis, the top level, literals, operators, interpolation, nil tests,
-  `if`/`unless`/modifiers, `while`/`until`/`loop`, the iteration forms, memory, the method
-  table, lambdas, multiple and compound assignment, annotations, and implicit return of
-  expression tails. Exit: the Ruby corpus runs the same on all three oracles, and every twin
-  pair lowers to the same IR. (~1.9k lines)
+- **R2 — translating the core subset.** ✅ Done. C8 and C9 first (above), then
+  `ruby::translate` and `ruby::parse_module(src, &RubyConfig, &TypeConfig)`: `scope.rs` decides
+  which names are locals and where each is declared, `desugar.rs` rewrites each form, and
+  `methods.rs` holds the method table. `RubyConfig` so far only names the memory `@` reads
+  (`ivar_memory`); the translator reads memory bindings and methods from the `TypeConfig`, so
+  `mem.reset` is a method call when the host declares `reset`. `Surface::Ruby` words the
+  checker's messages, with hints for `+` on strings and for an optional used as a condition,
+  and `annotations::parse_doc_block` takes the surface. What settling it took, recorded in
+  SPEC-RUBY.md §4 and §6:
+  - The resolver and checker key what they learn by the span of each name, so every name the
+    translator makes up has a span of its own unless it is the same variable at the same point
+    (desugar.rs module docs). A `case` subject read again per `when` takes that `when`'s span,
+    so a `when nil` narrowing the later arms doesn't unwrap the first read. `check_call`
+    looked up a callee's binding without checking the callee was a name, harmless for Lua;
+    it now checks, as every other lookup did.
+  - `case` reads a local or constant subject again and evaluates any other once, into a
+    temporary inside a `do` block (so two at the top level don't collide as module variables).
+  - A local first assigned in a `while` body is declared there, so it is new on each pass;
+    Ruby's one variable for the method is observable only through a lambda made in the loop.
+  - SPEC.md has no empty map (`{}` is an empty array), so `{}` is `E0608` and an open item, as
+    is narrowing after a guard clause (`return 0 if x.nil?`).
+  - The forms R3 and R4 translate are `E0699` until then, and a block or named argument
+    outside a loop method is `E0521`/`E0523` until R5's keywords.
+  Tests: scope unit tests; `tests/ruby_corpus.rs` (nine programs over every form, all four
+  executors, with memory, methods, and top-level code); `tests/ruby_twins.rs` over
+  `tests/ruby_twins/*.rb`/`.lua`, which lower to identical IR; `tests/ruby_translate.rs`, a code
+  table and four snapshots (translation rejections, semantics, forms not yet translated, and
+  checker errors worded for Ruby); and `tests/core_changes.rs` for C8 and C9. The shared
+  `Executors` harness gained memory, methods, and host functions. (~1.9k lines without tests,
+  as estimated.)
 - **R3 — language additions.** C2, C3, and C4, each with its `SPEC.md` section, and the Ruby
   forms that need them: `?:`, `if`/`case` as values, `next`, `nil` on falling off the end.
   (~700 lines)

@@ -1337,7 +1337,7 @@ impl<'a> Checker<'a> {
                         self.error(
                             "E0412",
                             format!(
-                                "`{}` expects an array, found {}",
+                                "{} expects an array, found {}",
                                 self.surface.array_loop(),
                                 self.u.deep(&other)
                             ),
@@ -1363,7 +1363,7 @@ impl<'a> Checker<'a> {
                         self.error(
                             "E0412",
                             format!(
-                                "`{}` expects a map, found {} (iterating records is not yet \
+                                "{} expects a map, found {} (iterating records is not yet \
                                  supported)",
                                 self.surface.map_loop(),
                                 self.u.deep(&other)
@@ -1664,8 +1664,11 @@ impl<'a> Checker<'a> {
     }
 
     fn check_call(&mut self, callee: &Expr, args: &[Expr], span: Span) -> Type {
-        // Plain builtins (`tostring`, `tonumber`).
-        if let Some(Binding::Builtin(ns)) = self.res.binding(callee.span) {
+        // Plain builtins (`tostring`, `tonumber`). A binding belongs to a name: a callee of
+        // another kind may share a name's span, as a call the Ruby translator makes up does.
+        if let ExprKind::Name(_) = &callee.kind
+            && let Some(Binding::Builtin(ns)) = self.res.binding(callee.span)
+        {
             return self.check_builtin_value_call(ns, args, span);
         }
         // Namespace member calls (`math.floor(...)`, `string.sub(...)`).
@@ -1923,8 +1926,28 @@ impl<'a> Checker<'a> {
         use BinOp::*;
         match op {
             Add | Sub | Mul | Div | FloorDiv | Mod | Pow => {
-                self.require_number(lhs);
-                self.require_number(rhs);
+                for operand in [lhs, rhs] {
+                    let t = self.check_expr(operand);
+                    let hint = match self.u.shallow(&t) {
+                        Type::String if op == Add => self.surface.string_plus_hint(),
+                        _ => None,
+                    };
+                    match hint {
+                        Some(hint) => {
+                            if self.u.unify(&t, &Type::Number).is_err() {
+                                let msg = self.mismatch("expected a number", &t, &Type::Number);
+                                self.error("E0401", format!("{msg}; {hint}"), operand.span);
+                            }
+                        }
+                        None => self.require(
+                            operand.span,
+                            &t,
+                            &Type::Number,
+                            "E0401",
+                            "expected a number",
+                        ),
+                    }
+                }
                 Type::Number
             }
             Concat => {
@@ -2509,6 +2532,16 @@ impl<'a> Checker<'a> {
 
     fn check_condition(&mut self, cond: &Expr) {
         let t = self.check_expr(cond);
+        // An optional isn't a condition; where the surface has a spelling for testing whether
+        // it's nil, say it.
+        if let (Type::Optional(inner), Some(hint)) =
+            (self.u.shallow(&t), self.surface.optional_condition_hint())
+            && self.u.shallow(&inner) != Type::Bool
+        {
+            let msg = self.mismatch("condition must be a bool", &t, &Type::Bool);
+            self.error("E0400", format!("{msg}; {hint}"), cond.span);
+            return;
+        }
         self.require(
             cond.span,
             &t,
