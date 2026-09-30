@@ -97,8 +97,9 @@ pub fn parse_type_ann(s: &str) -> Result<TypeAnn, String> {
     let mut p = TypeParser {
         toks: &toks,
         pos: 0,
+        depth: 0,
     };
-    let ty = p.parse_type()?;
+    let (ty, _) = p.parse_type()?;
     if p.pos != p.toks.len() {
         return Err(format!("unexpected trailing `{}`", desc(&p.toks[p.pos])));
     }
@@ -190,10 +191,19 @@ fn tokenize(s: &str) -> Result<Vec<Tk>, String> {
     Ok(out)
 }
 
+/// Parses one type expression, refusing to nest deeper than
+/// [`MAX_NESTING`](crate::parser::MAX_NESTING) levels: the checker and the types it builds are
+/// walked recursively, so an unbounded `number[][]…` or `{a:{a:…}}` would overflow the stack.
+/// Braces nest by recursion, which [`depth`](Self::depth) counts; postfix `[]`/`?` stack up in a
+/// loop, which each parse function's returned height counts.
 struct TypeParser<'a> {
     toks: &'a [Tk],
     pos: usize,
+    /// How many braces enclose the type being parsed.
+    depth: u32,
 }
+
+const TOO_DEEP: &str = "type annotation is nested too deeply";
 
 impl TypeParser<'_> {
     fn peek(&self) -> Option<&Tk> {
@@ -207,8 +217,9 @@ impl TypeParser<'_> {
         t
     }
 
-    fn parse_type(&mut self) -> Result<TypeAnn, String> {
-        let mut ty = self.parse_primary()?;
+    /// A type and its height (how many levels deep it nests).
+    fn parse_type(&mut self) -> Result<(TypeAnn, u32), String> {
+        let (mut ty, mut height) = self.parse_primary()?;
         loop {
             match self.peek() {
                 Some(Tk::Question) => {
@@ -224,21 +235,34 @@ impl TypeParser<'_> {
                 }
                 _ => break,
             }
+            height += 1;
+            if self.depth + height > crate::parser::MAX_NESTING {
+                return Err(TOO_DEEP.into());
+            }
         }
-        Ok(ty)
+        Ok((ty, height))
     }
 
-    fn parse_primary(&mut self) -> Result<TypeAnn, String> {
+    fn parse_primary(&mut self) -> Result<(TypeAnn, u32), String> {
         match self.bump() {
-            Some(Tk::Ident(n)) => Ok(TypeAnn::Named(n.clone())),
-            Some(Tk::LBrace) => self.parse_brace(),
+            Some(Tk::Ident(n)) => Ok((TypeAnn::Named(n.clone()), 1)),
+            Some(Tk::LBrace) => {
+                self.depth += 1;
+                if self.depth > crate::parser::MAX_NESTING {
+                    return Err(TOO_DEEP.into());
+                }
+                let (ty, height) = self.parse_brace()?;
+                self.depth -= 1;
+                Ok((ty, height + 1))
+            }
             Some(other) => Err(format!("expected a type, found `{}`", desc(other))),
             None => Err("expected a type".into()),
         }
     }
 
-    /// After `{` — either a map `[string]: T` or a record `k: T, …`.
-    fn parse_brace(&mut self) -> Result<TypeAnn, String> {
+    /// After `{` — either a map `[string]: T` or a record `k: T, …` — with the height of its
+    /// deepest field type.
+    fn parse_brace(&mut self) -> Result<(TypeAnn, u32), String> {
         if matches!(self.peek(), Some(Tk::LBracket)) {
             self.pos += 1; // [
             match self.bump() {
@@ -253,15 +277,16 @@ impl TypeParser<'_> {
                 Some(Tk::Colon) => {}
                 _ => return Err("expected `:` in map type".into()),
             }
-            let val = self.parse_type()?;
+            let (val, height) = self.parse_type()?;
             match self.bump() {
                 Some(Tk::RBrace) => {}
                 _ => return Err("expected `}` to close map type".into()),
             }
-            return Ok(TypeAnn::Map(Box::new(val)));
+            return Ok((TypeAnn::Map(Box::new(val)), height));
         }
 
         let mut fields = Vec::new();
+        let mut height = 0;
         loop {
             let key = match self.bump() {
                 Some(Tk::Ident(k)) => k.clone(),
@@ -272,7 +297,8 @@ impl TypeParser<'_> {
                 Some(Tk::Colon) => {}
                 _ => return Err(format!("expected `:` after record field `{key}`")),
             }
-            let val = self.parse_type()?;
+            let (val, field_height) = self.parse_type()?;
+            height = height.max(field_height);
             fields.push((key, val));
             match self.bump() {
                 Some(Tk::Comma) => continue,
@@ -283,7 +309,7 @@ impl TypeParser<'_> {
         if fields.is_empty() {
             return Err("empty record type `{}` is not allowed".into());
         }
-        Ok(TypeAnn::Record(fields))
+        Ok((TypeAnn::Record(fields), height))
     }
 }
 
@@ -349,6 +375,18 @@ mod tests {
         assert!(parse_type_ann("{ [number]: string }").is_err());
         assert!(parse_type_ann("number number").is_err());
         assert!(parse_type_ann("").is_err());
+    }
+
+    #[test]
+    fn deeply_nested_types_are_rejected() {
+        let postfix = format!("number{}", "[]".repeat(10_000));
+        assert_eq!(parse_type_ann(&postfix), Err(TOO_DEEP.to_string()));
+        let records = format!("{}number{}", "{ a: ".repeat(10_000), " }".repeat(10_000));
+        assert_eq!(parse_type_ann(&records), Err(TOO_DEEP.to_string()));
+        // Postfix outside a record counts the record's own depth too.
+        let mixed = format!("{{ a: number{} }}{}", "[]".repeat(150), "[]".repeat(100));
+        assert_eq!(parse_type_ann(&mixed), Err(TOO_DEEP.to_string()));
+        t(&format!("number{}", "[]".repeat(150)));
     }
 
     #[test]

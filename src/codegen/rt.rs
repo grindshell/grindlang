@@ -57,7 +57,9 @@ use cranelift_codegen::ir::types;
 use crate::ast::BinOp;
 use crate::runtime::repr::Repr;
 use crate::runtime::{builtins, ops};
-use crate::value::{ClosureObj, NativeFn, RunError, Value};
+use crate::value::{
+    ClosureObj, DEFAULT_MAX_CALL_DEPTH, NativeFn, RunError, Value, call_depth_exceeded,
+};
 
 /// A reference-value handle: an index into [`RtCtx::values`]. Handle `0` is always `nil`.
 pub type Handle = u64;
@@ -183,6 +185,10 @@ pub struct RtCtx {
     /// in a form the JIT can read without a call. Kept in sync by [`fail`](Self::fail),
     /// [`reset`](Self::reset), and [`take_error`](Self::take_error); never written directly.
     errored: u8,
+    /// The most script calls that may be active at once (`SPEC.md` §7.3). A trampoline loads
+    /// it from [`MAX_CALL_DEPTH_OFFSET`] as the call budget it hands the function it enters,
+    /// which counts down from there in a register (see `translate`'s module docs).
+    max_call_depth: u32,
     /// The value table; index `0` is permanently `nil`.
     values: Vec<Value>,
     /// The handle already given to each object interned by [`intern_shared`](Self::intern_shared)
@@ -318,6 +324,9 @@ pub fn closure_module_id(c: &ClosureObj) -> Option<u64> {
 /// being declared first; asserted in the module's tests.
 pub const ERRORED_OFFSET: i32 = 0;
 
+/// Byte offset of [`RtCtx::max_call_depth`], which the trampolines load directly.
+pub const MAX_CALL_DEPTH_OFFSET: i32 = std::mem::offset_of!(RtCtx, max_call_depth) as i32;
+
 impl RtCtx {
     /// Build a context for one invocation. `host`/`memory` are resolved into id order by the
     /// caller (the compiled module) from the user-registered bindings.
@@ -331,6 +340,7 @@ impl RtCtx {
     ) -> Self {
         RtCtx {
             errored: 0,
+            max_call_depth: DEFAULT_MAX_CALL_DEPTH,
             values: vec![Value::Nil],
             shared: HashMap::default(),
             const_cache: vec![None; pools.consts.len()],
@@ -466,6 +476,11 @@ impl RtCtx {
         self.frozen.clear();
         self.error = None;
         self.errored = 0;
+    }
+
+    /// Set how many script calls may be active at once, for calls entered from now on.
+    pub fn set_max_call_depth(&mut self, depth: u32) {
+        self.max_call_depth = depth;
     }
 
     /// Take the latched error, clearing the errored state. The only way out of the context, so
@@ -859,6 +874,14 @@ pub unsafe extern "C" fn rt_raise_nan_compare(ctx: *mut RtCtx) {
 
 // ---- calls ------------------------------------------------------------------
 
+/// Raise the call-depth error (`SPEC.md` §7.3). Like [`rt_raise_nan_compare`], only the failing
+/// edge calls here: the depth check itself is inline in every compiled function's prologue.
+pub unsafe extern "C" fn rt_raise_call_depth(ctx: *mut RtCtx) {
+    let ctx = ctx!(ctx);
+    let limit = ctx.max_call_depth;
+    ctx.fail(call_depth_exceeded(limit));
+}
+
 /// Decode `argc` call arguments. Each takes two words at `argv`: the operand bits, then its tag
 /// (see [`repr_tag`]), so a scalar argument never passes through the value table.
 ///
@@ -1140,6 +1163,7 @@ shim_table! {
     rt_truthy(*mut RtCtx, Handle) -> i8;
     rt_pow(f64, f64) -> f64;
     rt_raise_nan_compare(*mut RtCtx);
+    rt_raise_call_depth(*mut RtCtx);
     rt_call_host(*mut RtCtx, u32, *const u64, u32, u32) -> u64;
     rt_call_method(*mut RtCtx, u32, *const u64, u32, u32) -> u64;
     rt_call_builtin_value(*mut RtCtx, u32, *const u64, u32, u32) -> u64;

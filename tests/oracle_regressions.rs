@@ -1015,3 +1015,181 @@ end
         "got {e:?}"
     );
 }
+
+// ---- Runaway recursion must be an error, not a crashed host ---------------
+//
+// Every backend runs a script call on the native stack of the calling thread, so unbounded
+// recursion overflowed it and aborted the whole process. A call-depth limit (`SPEC.md` §7.3)
+// turns that into a runtime error, raised at the same call in all three backends. These tests
+// lower the limit: the interpreter oracles take several KiB of stack per call in a debug build,
+// too much to reach the default on a test thread.
+
+/// All three executors, each limited to `depth` script calls at once.
+fn triple_with_depth(src: &str, depth: u32) -> (Interpreter<'static>, Vm<'static>, JitModule) {
+    let (mut interp, mut vm, mut jit) = triple(src, &TypeConfig::default());
+    interp.set_max_call_depth(depth);
+    vm.set_max_call_depth(depth);
+    jit.set_max_call_depth(depth);
+    (interp, vm, jit)
+}
+
+/// Call `name(n)` on all three executors, assert they agree, and return the JIT's outcome.
+fn call_all(
+    (interp, vm, jit): &mut (Interpreter<'static>, Vm<'static>, JitModule),
+    name: &str,
+    n: f64,
+) -> Result<Value, RunError> {
+    let args = || vec![Value::Number(n)];
+    let (a, b, c) = (
+        interp.call(name, args()),
+        vm.call(name, args()),
+        jit.call(name, args()),
+    );
+    assert_agree(&format!("{name}({n})"), &a, &b, &c);
+    if let (Err(a), Err(b), Err(c)) = (&a, &b, &c) {
+        let (a, b, c) = (a.to_string(), b.to_string(), c.to_string());
+        assert!(
+            a == b && b == c,
+            "{name}({n}): errors differ: {a} / {b} / {c}"
+        );
+    }
+    c
+}
+
+#[track_caller]
+fn assert_too_deep(r: Result<Value, RunError>, limit: u32) {
+    let e = r.expect_err("the call should exceed the call-depth limit");
+    assert_eq!(
+        e.to_string(),
+        grindlang::value::call_depth_exceeded(limit).to_string()
+    );
+}
+
+/// The limit counts the calls active at once, the host's own call included, identically in
+/// every backend: a chain exactly `limit` deep runs and one more fails.
+#[test]
+fn the_call_depth_limit_is_exact_in_every_backend() {
+    // `down(n)` is n + 1 nested calls.
+    let src = "function down(n) if n == 0 then return 0 end return 1 + down(n - 1) end";
+    let mut all = triple_with_depth(src, 50);
+    assert_eq!(call_all(&mut all, "down", 49.0).unwrap().to_string(), "49");
+    assert_too_deep(call_all(&mut all, "down", 50.0), 50);
+    // The failed call leaves nothing behind: the next one starts with the full limit again.
+    assert_eq!(call_all(&mut all, "down", 49.0).unwrap().to_string(), "49");
+}
+
+/// Recursion through a local function (a closure, called indirectly) counts the same way.
+#[test]
+fn recursion_through_a_closure_is_limited_too() {
+    let src = "\
+function outer(n)
+  local function go(k)
+    if k == 0 then return 0 end
+    return 1 + go(k - 1)
+  end
+  return go(n)
+end
+";
+    let mut all = triple_with_depth(src, 50);
+    // `outer` plus n + 1 calls of `go`.
+    assert_eq!(call_all(&mut all, "outer", 48.0).unwrap().to_string(), "48");
+    assert_too_deep(call_all(&mut all, "outer", 49.0), 50);
+}
+
+/// Only calls active *at once* count: a call that has returned gives its place back, whichever
+/// way it returned. Were any return path to skip that, a loop of calls would run out.
+#[test]
+fn calls_that_have_returned_do_not_count() {
+    let src = "\
+function one() return 1 end
+function nothing(x) if x > 0 then return end end
+function maybe(x) if x > 0 then return tonumber(\"1\") end end
+function many(n)
+  local s = 0
+  for i = 1, n do
+    nothing(i)
+    local m = maybe(i)
+    if m ~= nil then s = s + m + one() end
+  end
+  return s
+end
+";
+    let mut all = triple_with_depth(src, 3);
+    assert_eq!(
+        call_all(&mut all, "many", 1000.0).unwrap().to_string(),
+        "2000"
+    );
+}
+
+/// The limit is the *most* calls active at once, so a limit of zero refuses even the host's own
+/// call. Constants are read, not called, so reading one still works.
+#[test]
+fn a_zero_limit_refuses_every_call_but_not_a_constant() {
+    let src = "C = {x = 1}\nfunction f(n) return n + 1 end\n";
+    let mut all = triple_with_depth(src, 0);
+    assert_too_deep(call_all(&mut all, "f", 1.0), 0);
+    let (interp, vm, jit) = &mut all;
+    let (a, b, c) = (
+        interp.call("C", vec![]),
+        vm.call("C", vec![]),
+        jit.call("C", vec![]),
+    );
+    assert_agree("read C", &a, &b, &c);
+    assert!(c.is_ok(), "{c:?}");
+}
+
+// ---- Deep source must not overflow any later phase ------------------------
+
+/// Source nested just inside the parser's limit (`E0209`) must survive every recursive phase —
+/// resolver, checker, lowering, each backend, and dropping the tree — on the stack that limit is
+/// sized for: 1 MiB in a release build (the Windows main thread's default), 2 MiB in a debug one,
+/// whose unoptimized frames are several times larger. Each kind of nesting recurses through
+/// different code, so each gets its own program.
+#[test]
+fn source_nested_to_the_limit_runs_on_the_stack_it_is_sized_for() {
+    let n = 185; // levels; function literals and calls take two per nesting
+    let programs = [
+        format!(
+            "function f(x) {}return x + 1 {}return 0 end",
+            "if x > 0 then ".repeat(n),
+            "end ".repeat(n)
+        ),
+        format!(
+            "function f(x) return {}x + 1{} end",
+            "(".repeat(n),
+            ")".repeat(n)
+        ),
+        format!("function f(x) return x{} end", " + 1".repeat(n)),
+        format!(
+            "function f(x) local t = {}x{} return x + 1 end",
+            "{".repeat(n),
+            "}".repeat(n)
+        ),
+        format!(
+            "function f(x) {}return x + 1 {}return x + 1 end",
+            "local g = function() ".repeat(n / 2),
+            "end ".repeat(n / 2)
+        ),
+        format!(
+            "function id(y) return y + 0 end\nfunction f(x) return {}x{} end",
+            "id(".repeat(n / 2),
+            ")".repeat(n / 2)
+        ),
+    ];
+    let stack = if cfg!(debug_assertions) {
+        2 << 20
+    } else {
+        1 << 20
+    };
+    std::thread::Builder::new()
+        .stack_size(stack)
+        .spawn(move || {
+            for src in programs {
+                let mut all = triple(&src, &TypeConfig::default());
+                call_all(&mut all, "f", 1.0).unwrap_or_else(|e| panic!("{e}\n{src}"));
+            }
+        })
+        .unwrap()
+        .join()
+        .expect("no stack overflow");
+}

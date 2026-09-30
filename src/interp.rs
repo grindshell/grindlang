@@ -44,7 +44,7 @@ use crate::diagnostics::Diagnostics;
 use crate::resolve::{Binding, Resolution, ResolveConfig, SymbolId};
 use crate::runtime::builtins::{field_value, member_call, value_call};
 use crate::runtime::ops;
-use crate::value::{NativeFn, RunError, Value};
+use crate::value::{DEFAULT_MAX_CALL_DEPTH, NativeFn, RunError, Value, call_depth_exceeded};
 
 /// A script function: its parameter symbols, body, and (for closures) the captured
 /// upvalue slots. Top-level functions capture nothing.
@@ -123,6 +123,10 @@ pub struct Interpreter<'a> {
     methods: HashMap<String, NativeFn>,
     /// The current activation frame chain (innermost last).
     env: Vec<Frame>,
+    /// Script calls currently active, checked against [`max_call_depth`](Self::max_call_depth).
+    depth: u32,
+    /// The most script calls that may be active at once (`SPEC.md` §7.3).
+    max_call_depth: u32,
 }
 
 impl<'a> Interpreter<'a> {
@@ -140,6 +144,8 @@ impl<'a> Interpreter<'a> {
             memory: HashMap::new(),
             methods: HashMap::new(),
             env: Vec::new(),
+            depth: 0,
+            max_call_depth: DEFAULT_MAX_CALL_DEPTH,
         };
         me.init(module)?;
         Ok(me)
@@ -247,6 +253,12 @@ impl<'a> Interpreter<'a> {
         self.memory.get(name).cloned()
     }
 
+    /// Set how many script calls may be active at once before a call fails (`SPEC.md` §7.3).
+    /// Defaults to [`DEFAULT_MAX_CALL_DEPTH`].
+    pub fn set_max_call_depth(&mut self, depth: u32) {
+        self.max_call_depth = depth;
+    }
+
     /// Call an exported function by name with `args`.
     ///
     /// A module exports constants as well as functions (`SPEC.md` §4), so a name that resolves
@@ -336,6 +348,9 @@ impl<'a> Interpreter<'a> {
         match callee {
             Value::Native(f) => f(&args),
             Value::Function(func) => {
+                if self.depth >= self.max_call_depth {
+                    return Err(call_depth_exceeded(self.max_call_depth));
+                }
                 let func = Rc::clone(func);
                 let mut activation: Frame = HashMap::new();
                 for (i, &pid) in func.params.iter().enumerate() {
@@ -348,7 +363,9 @@ impl<'a> Interpreter<'a> {
                 let new_env = vec![func.captured.clone(), activation];
 
                 let saved = std::mem::replace(&mut self.env, new_env);
+                self.depth += 1;
                 let result = self.exec_block(&func.body.block);
+                self.depth -= 1;
                 self.env = saved;
 
                 match result? {

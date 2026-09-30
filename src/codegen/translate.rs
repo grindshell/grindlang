@@ -27,6 +27,19 @@
 //! - `rt_closure_code_addr` → address `0` (jumping there would fault);
 //! - a script / const / indirect call → nothing, so the caller loads the context's `errored`
 //!   byte directly (see [`ERRORED_OFFSET`](super::rt::ERRORED_OFFSET)).
+//!
+//! ## Call depth
+//!
+//! Every compiled function takes a hidden second parameter after the ctx: how many more script
+//! calls may start, the call it begins included (`SPEC.md` §7.3). A script function raises the
+//! call-depth error on entry when that is zero and passes one less to everything it calls; a
+//! trampoline starts it at the context's limit. Without the limit, runaway recursion would
+//! overflow the native stack and abort the host process.
+//!
+//! The budget travels in a register rather than in the context because it is on every call
+//! path: a counter in memory costs a load and a store on entry and again on every return, and
+//! each call waits on the store its caller just made. As a parameter it costs a compare and a
+//! subtract, and a return has nothing to undo. See [`Translator::enter_frame`].
 
 use std::collections::HashMap;
 
@@ -71,11 +84,13 @@ fn repr_of_const(cx: &Context<'_>, name: &str) -> Repr {
     cx.const_rets[name]
 }
 
-/// Build the typed signature of a compiled function: `(ctx, params...) -> ret`. A lifted
-/// closure's hidden env parameter is simply its first `Ptr` param.
+/// Build the typed signature of a compiled function: `(ctx, depth, params...) -> ret`, where
+/// `depth` is the call budget (see the module docs). A lifted closure's hidden env parameter is
+/// simply its first `Ptr` param.
 pub fn typed_signature(call_conv: CallConv, params: &[Repr], ret: Repr) -> Signature {
     let mut sig = Signature::new(call_conv);
     sig.params.push(AbiParam::new(types::I64)); // ctx
+    sig.params.push(AbiParam::new(types::I32)); // depth
     for &p in params {
         if let Some(t) = clif_ty(p) {
             sig.params.push(AbiParam::new(t));
@@ -122,7 +137,14 @@ pub struct Translator<'a, 'b> {
     pools: &'a mut Pools,
     func: &'a Function,
 
+    /// Whether this body is a script call, counted against the call-depth limit (`SPEC.md`
+    /// §7.3). A constant initializer is not: reading a constant isn't a call in the
+    /// interpreters, so counting it here would make the JIT fail one call sooner than they do.
+    counts_calls: bool,
+
     ctx_val: ClifValue,
+    /// The call budget this function passes to everything it calls (see the module docs).
+    depth_val: ClifValue,
     blocks: Vec<ClifBlock>,
     error_block: ClifBlock,
     vars: HashMap<LocalId, Variable>,
@@ -138,6 +160,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         cx: &'a Context<'a>,
         pools: &'a mut Pools,
         func: &'a Function,
+        counts_calls: bool,
     ) -> Self {
         Translator {
             builder,
@@ -145,7 +168,9 @@ impl<'a, 'b> Translator<'a, 'b> {
             cx,
             pools,
             func,
+            counts_calls,
             ctx_val: ClifValue::from_u32(0),
+            depth_val: ClifValue::from_u32(0),
             blocks: Vec::new(),
             error_block: ClifBlock::from_u32(0),
             vars: HashMap::new(),
@@ -178,16 +203,18 @@ impl<'a, 'b> Translator<'a, 'b> {
             }
         }
 
-        // Hidden ctx parameter is first; script params follow in order. Bind them into the
-        // entry block. The entry block must receive its first instruction *before* any other
-        // block so it becomes cranelift's layout entry — hence we translate it (and the rest)
-        // before filling the error-exit block.
-        let entry = self.blocks[self.func.entry as usize];
-        self.builder.append_block_params_for_function_params(entry);
-        self.builder.switch_to_block(entry);
-        let params = self.builder.block_params(entry).to_vec();
+        // A prologue block receives the parameters — the hidden ctx and call budget first, then
+        // the script's params in order — checks the budget, and continues into the IR's entry
+        // block. It must receive its first instruction *before* any other block so it becomes
+        // cranelift's layout entry — hence it is filled before the IR blocks and the error exit.
+        let prologue = self.builder.create_block();
+        self.builder
+            .append_block_params_for_function_params(prologue);
+        self.builder.switch_to_block(prologue);
+        let params = self.builder.block_params(prologue).to_vec();
         self.ctx_val = params[0];
-        let mut pi = 1usize;
+        let depth = params[1];
+        let mut pi = 2usize;
         let param_ids: Vec<LocalId> = self.func.params.clone();
         for id in param_ids {
             if let Some(&var) = self.vars.get(&id) {
@@ -196,8 +223,14 @@ impl<'a, 'b> Translator<'a, 'b> {
                 pi += 1;
             }
         }
+        self.depth_val = if self.counts_calls {
+            self.enter_frame(depth)
+        } else {
+            depth
+        };
+        let entry = self.blocks[self.func.entry as usize];
+        self.builder.ins().jump(entry, &[]);
 
-        // Translate every IR block in order (entry first, so it leads the layout).
         for i in 0..self.func.blocks.len() {
             self.translate_block(i);
         }
@@ -369,6 +402,15 @@ impl<'a, 'b> Translator<'a, 'b> {
             super::rt::ERRORED_OFFSET,
         );
         self.guard(failed);
+    }
+
+    /// Start this call against the `depth` budget it was given (`SPEC.md` §7.3): raise the
+    /// call-depth error if the budget is spent, and otherwise return the budget left for the
+    /// calls this function makes. Only the failing edge calls into the runtime.
+    fn enter_frame(&mut self, depth: ClifValue) -> ClifValue {
+        let spent = self.builder.ins().icmp_imm(IntCC::Equal, depth, 0);
+        self.guard_raising(spent, "rt_raise_call_depth");
+        self.builder.ins().iadd_imm(depth, -1)
     }
 
     fn script_ref(&mut self, id: FuncId) -> cranelift_codegen::ir::FuncRef {
@@ -710,7 +752,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         };
         let sig = typed_signature(self.cx.call_conv, &param_reprs, ret_repr);
         let sigref = self.builder.import_signature(sig);
-        let mut call_args = vec![self.ctx_val, clo];
+        let mut call_args = vec![self.ctx_val, self.depth_val, clo];
         for &a in args {
             call_args.push(self.val(a));
         }
@@ -868,7 +910,7 @@ impl<'a, 'b> Translator<'a, 'b> {
     fn translate_call_script(&mut self, name: &str, args: &[ValueId]) -> Option<ClifValue> {
         let id = self.cx.typed_ids[name];
         let fref = self.script_ref(id);
-        let mut call_args = vec![self.ctx_val];
+        let mut call_args = vec![self.ctx_val, self.depth_val];
         for &a in args {
             call_args.push(self.val(a));
         }
@@ -930,7 +972,10 @@ impl<'a, 'b> Translator<'a, 'b> {
     fn call_const_body(&mut self, name: &str) -> Option<ClifValue> {
         let id = self.cx.const_ids[name];
         let fref = self.script_ref(id);
-        let call = self.builder.ins().call(fref, &[self.ctx_val]);
+        let call = self
+            .builder
+            .ins()
+            .call(fref, &[self.ctx_val, self.depth_val]);
         let result = self.builder.inst_results(call).first().copied();
         self.guard_errored();
         result
@@ -1090,11 +1135,20 @@ pub fn build_trampoline(
     builder.append_block_params_for_function_params(entry);
     builder.switch_to_block(entry);
     let bp = builder.block_params(entry).to_vec();
-    // `(ctx, [env,] argv, argc)`: everything before argv is forwarded as-is.
+    // `(ctx, [env,] argv, argc)`: everything before argv is forwarded as-is, with the call
+    // budget — the context's whole limit, since this is where a host call enters — after ctx.
     let leading = if env { 2 } else { 1 };
     let argv = bp[leading];
+    let ctx = bp[0];
+    let depth = builder.ins().load(
+        types::I32,
+        MemFlags::trusted(),
+        ctx,
+        super::rt::MAX_CALL_DEPTH_OFFSET,
+    );
 
-    let mut call_args = bp[..leading].to_vec();
+    let mut call_args = vec![ctx, depth];
+    call_args.extend_from_slice(&bp[1..leading]);
     for (i, &r) in params.iter().enumerate() {
         let slot = builder
             .ins()

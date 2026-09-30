@@ -555,8 +555,8 @@ end
 ### 7.3 Runtime errors
 
 Static typing rules out most failures, but a few survive to run time: an out-of-range array
-write, ordering a `NaN`, an unbound memory read, or an error returned by a host function or
-method.
+write, ordering a `NaN`, an unbound memory read, calls nested too deeply, or an error returned by
+a host function or method.
 
 - **A runtime error aborts the call.** Evaluation stops at the failing operation. No later
   statement in that function runs, no enclosing loop takes another iteration, and the error
@@ -569,6 +569,13 @@ method.
   already wrote in its mutated state — there is no rollback. Only effects *before* the failing
   operation are visible; effects that would have followed it never happen. Hosts that need
   all-or-nothing updates must stage them (e.g. write through a method that commits at the end).
+- **Call depth is limited.** At most 200 script calls may be active at once — the host's own
+  call, nested calls, and recursion all count — and the call that would exceed that fails with a
+  runtime error. A host may set a different limit per module. Script calls run on the calling
+  thread's native stack, so without a limit runaway recursion would overflow it and abort the
+  host process instead of returning `Err`. The limit counts calls rather than bytes so that every
+  backend fails at the same call. Calling a host function or method and reading a constant are
+  not script calls and do not count.
 
 These are the semantics every backend implements; they are what the three-oracle invariant
 (`Interpreter == Vm == JitModule`) is checked against, side effects included.
@@ -585,6 +592,10 @@ Each produces a targeted, span-pointing error:
 - `require`, `load`, `dofile`, `loadstring`, `pcall`/`error`-based control flow _(v1)_
 - truthiness coercion (non-`bool` condition); mixed-type `==`; heterogeneous tables
 - coroutines; integer/bitwise operations
+- source nested more than 200 levels deep — expressions, blocks, and function bodies inside one
+  another (`E0209`). A long operator chain (`a + b + c + …`) or suffix chain (`t.a.b…`, `f()()`)
+  counts one level per link. Every later phase walks the tree recursively, so a deeper tree would
+  overflow the native stack. A `---@` type annotation may nest 200 levels too (`E0110` past it).
 
 ## 9. Worked examples
 

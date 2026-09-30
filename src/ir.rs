@@ -1576,7 +1576,7 @@ mod vm {
     use super::*;
     use crate::runtime::builtins::{field_value, member_call, value_call};
     use crate::runtime::ops;
-    use crate::value::{NativeFn, RunError, Value};
+    use crate::value::{DEFAULT_MAX_CALL_DEPTH, NativeFn, RunError, Value, call_depth_exceeded};
 
     /// Executes a lowered [`Program`].
     pub struct Vm<'a> {
@@ -1594,6 +1594,10 @@ mod vm {
         /// Allocations reachable from the constants read so far this call, which may not be
         /// written to (`SPEC.md` §3). Cleared alongside `const_cache`.
         frozen: std::collections::HashSet<usize>,
+        /// Script calls currently active, checked against `max_call_depth`.
+        depth: u32,
+        /// The most script calls that may be active at once (`SPEC.md` §7.3).
+        max_call_depth: u32,
     }
 
     struct Activation {
@@ -1628,7 +1632,15 @@ mod vm {
                 memory: HashMap::new(),
                 const_cache: HashMap::new(),
                 frozen: std::collections::HashSet::new(),
+                depth: 0,
+                max_call_depth: DEFAULT_MAX_CALL_DEPTH,
             }
+        }
+
+        /// Set how many script calls may be active at once before a call fails (`SPEC.md`
+        /// §7.3). Defaults to [`DEFAULT_MAX_CALL_DEPTH`].
+        pub fn set_max_call_depth(&mut self, depth: u32) {
+            self.max_call_depth = depth;
         }
 
         pub fn set_host_function<F>(&mut self, name: impl Into<String>, f: F)
@@ -1669,7 +1681,7 @@ mod vm {
                     let func = self.lookup_function(f)?;
                     // A constant is read, not called, so its arity is zero.
                     check_arity(name, func.params.len(), args.len())?;
-                    self.run_function(func, args)
+                    self.call_function(func, args)
                 }
                 ExportTarget::Const(c) => {
                     check_arity(name, 0, args.len())?;
@@ -1699,7 +1711,7 @@ mod vm {
             let mut argv = Vec::with_capacity(args.len() + 1);
             argv.push(callee);
             argv.extend(args);
-            self.run_function(func, argv)
+            self.call_function(func, argv)
         }
 
         fn lookup_function(&self, name: &str) -> Result<&'a Function, RunError> {
@@ -1734,6 +1746,20 @@ mod vm {
                 ));
             }
             Ok(())
+        }
+
+        /// Run a script function or closure as a call, counted against the call-depth limit.
+        /// Constant initializers go straight to [`run_function`](Self::run_function): reading a
+        /// constant is not a call in the other two backends either, so counting it here would
+        /// make the VM fail one call earlier than they do.
+        fn call_function(&mut self, func: &Function, args: Vec<Value>) -> Result<Value, RunError> {
+            if self.depth >= self.max_call_depth {
+                return Err(call_depth_exceeded(self.max_call_depth));
+            }
+            self.depth += 1;
+            let result = self.run_function(func, args);
+            self.depth -= 1;
+            result
         }
 
         fn run_function(&mut self, func: &Function, args: Vec<Value>) -> Result<Value, RunError> {
@@ -1902,7 +1928,7 @@ mod vm {
                 Op::CallScript(name, args) => {
                     let argv = self.eval_args(act, args)?;
                     let func = self.lookup_function(name)?;
-                    self.run_function(func, argv)?
+                    self.call_function(func, argv)?
                 }
                 Op::CallHost(name, args) => {
                     let argv = self.eval_args(act, args)?;
@@ -1986,7 +2012,7 @@ mod vm {
                     for a in args {
                         argv.push(self.val(act, *a)?);
                     }
-                    self.run_function(func, argv)?
+                    self.call_function(func, argv)?
                 }
             })
         }

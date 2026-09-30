@@ -578,6 +578,16 @@ impl Module {
         self.jit.memory(name)
     }
 
+    /// Set how many script calls may be active at once before a call fails with a runtime
+    /// error (`SPEC.md` §7.3), instead of overflowing the native stack.
+    ///
+    /// The default, [`DEFAULT_MAX_CALL_DEPTH`](crate::value::DEFAULT_MAX_CALL_DEPTH), is sized
+    /// for a 1 MiB stack. Raise it only for calls made from a thread with a bigger stack.
+    pub fn set_max_call_depth(&mut self, depth: u32) -> &mut Self {
+        self.jit.set_max_call_depth(depth);
+        self
+    }
+
     /// Call an exported function with typed Rust arguments and marshal its typed result.
     ///
     /// Arguments are a tuple (`(a, b)`, `(x,)`, or `()` for none) or a raw `Vec<Value>`.

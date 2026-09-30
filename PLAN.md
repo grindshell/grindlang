@@ -70,7 +70,10 @@ final design intent, not options — revisit only with a concrete consumer need.
 5. **No fuel budget, no sandbox.** Per the trust model, scripts are trusted dev code.
    An *opt-in* debug step counter may exist purely to help developers catch accidental
    infinite loops during authoring, but it is off by default and is not a security or
-   resource boundary.
+   resource boundary. The call-depth limit (`SPEC.md` §7.3) and source nesting limit (§8)
+   are not budgets either: script calls and every compiler phase run on the host's native
+   stack, and overflowing it aborts the process rather than failing the call. They bound
+   stack use, not work — an infinite loop still runs forever.
 6. **Closures are allowed within an invocation** (they live in the arena) and cannot be
    persisted across calls. Module-level exported functions are compiled once and are not
    closures over per-call state.

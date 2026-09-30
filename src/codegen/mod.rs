@@ -55,19 +55,20 @@ type EnvTrampFn = unsafe extern "C" fn(*mut RtCtx, Handle, *const Handle, u32) -
 
 /// Arity-specialized fn-pointer types for the **direct-call fast path**. An exported function
 /// whose signature is all-`number` is invoked straight at its native typed address as
-/// `(ctx, f64 × N) -> f64`, skipping the trampoline hop and the argument buffer entirely.
-/// Signatures involving `bool`/reference/`unit` keep using the uniform trampoline. Cranelift
-/// lowers the typed function with the platform C ABI (`isa.default_call_conv()`), so these
-/// `extern "C"` pointers match it exactly — the same contract the trampolines already rely on.
-type Direct0 = unsafe extern "C" fn(*mut RtCtx) -> f64;
-type Direct1 = unsafe extern "C" fn(*mut RtCtx, f64) -> f64;
-type Direct2 = unsafe extern "C" fn(*mut RtCtx, f64, f64) -> f64;
-type Direct3 = unsafe extern "C" fn(*mut RtCtx, f64, f64, f64) -> f64;
-type Direct4 = unsafe extern "C" fn(*mut RtCtx, f64, f64, f64, f64) -> f64;
-type Direct5 = unsafe extern "C" fn(*mut RtCtx, f64, f64, f64, f64, f64) -> f64;
-type Direct6 = unsafe extern "C" fn(*mut RtCtx, f64, f64, f64, f64, f64, f64) -> f64;
-type Direct7 = unsafe extern "C" fn(*mut RtCtx, f64, f64, f64, f64, f64, f64, f64) -> f64;
-type Direct8 = unsafe extern "C" fn(*mut RtCtx, f64, f64, f64, f64, f64, f64, f64, f64) -> f64;
+/// `(ctx, depth, f64 × N) -> f64`, skipping the trampoline hop and the argument buffer entirely
+/// (`depth` is the call budget, see [`translate`]). Signatures involving `bool`/reference/`unit`
+/// keep using the uniform trampoline. Cranelift lowers the typed function with the platform C
+/// ABI (`isa.default_call_conv()`), so these `extern "C"` pointers match it exactly — the same
+/// contract the trampolines already rely on.
+type Direct0 = unsafe extern "C" fn(*mut RtCtx, u32) -> f64;
+type Direct1 = unsafe extern "C" fn(*mut RtCtx, u32, f64) -> f64;
+type Direct2 = unsafe extern "C" fn(*mut RtCtx, u32, f64, f64) -> f64;
+type Direct3 = unsafe extern "C" fn(*mut RtCtx, u32, f64, f64, f64) -> f64;
+type Direct4 = unsafe extern "C" fn(*mut RtCtx, u32, f64, f64, f64, f64) -> f64;
+type Direct5 = unsafe extern "C" fn(*mut RtCtx, u32, f64, f64, f64, f64, f64) -> f64;
+type Direct6 = unsafe extern "C" fn(*mut RtCtx, u32, f64, f64, f64, f64, f64, f64) -> f64;
+type Direct7 = unsafe extern "C" fn(*mut RtCtx, u32, f64, f64, f64, f64, f64, f64, f64) -> f64;
+type Direct8 = unsafe extern "C" fn(*mut RtCtx, u32, f64, f64, f64, f64, f64, f64, f64, f64) -> f64;
 
 /// Maximum arity handled by the direct-call fast path (one arm per arity below). Higher-arity
 /// all-`number` functions fall back to the trampoline.
@@ -116,6 +117,8 @@ pub struct JitModule {
     /// Set when `host`/`memory` change, so the pooled context's resolved bindings are rebuilt
     /// on the next call rather than every call.
     bindings_dirty: bool,
+    /// The most script calls that may be active at once (`SPEC.md` §7.3).
+    max_call_depth: u32,
 }
 
 impl JitModule {
@@ -209,10 +212,26 @@ impl JitModule {
 
         let mut fbctx = FunctionBuilderContext::new();
         for (name, f) in &program.functions {
-            define_body(&mut module, &cx, &mut pools, &mut fbctx, typed_ids[name], f)?;
+            define_body(
+                &mut module,
+                &cx,
+                &mut pools,
+                &mut fbctx,
+                typed_ids[name],
+                f,
+                true,
+            )?;
         }
         for (name, c) in &program.constants {
-            define_body(&mut module, &cx, &mut pools, &mut fbctx, const_ids[name], c)?;
+            define_body(
+                &mut module,
+                &cx,
+                &mut pools,
+                &mut fbctx,
+                const_ids[name],
+                c,
+                false,
+            )?;
         }
 
         // Trampolines (declared functions whose only job is arg/result marshaling).
@@ -305,7 +324,15 @@ impl JitModule {
             memory: HashMap::new(),
             cached_ctx: None,
             bindings_dirty: false,
+            max_call_depth: crate::value::DEFAULT_MAX_CALL_DEPTH,
         })
+    }
+
+    /// Set how many script calls may be active at once before a call fails (`SPEC.md` §7.3).
+    /// Defaults to [`DEFAULT_MAX_CALL_DEPTH`](crate::value::DEFAULT_MAX_CALL_DEPTH), which is
+    /// sized for a 1 MiB stack; raise it only when calls run on a thread with a bigger stack.
+    pub fn set_max_call_depth(&mut self, depth: u32) {
+        self.max_call_depth = depth;
     }
 
     /// Register a host function callable from scripts under `name`.
@@ -427,7 +454,8 @@ impl JitModule {
     }
 
     /// Direct-call fast path for an all-`number` export: invoke the native typed function at
-    /// `addr` as `(ctx, f64 × arity) -> f64`, skipping the trampoline and the argument buffer.
+    /// `addr` as `(ctx, depth, f64 × arity) -> f64`, skipping the trampoline and the argument
+    /// buffer. `depth` is the whole call budget, as a trampoline would pass.
     /// `arity` is `<= MAX_DIRECT_ARGS` and matches `args.len()` (both guaranteed by the caller).
     /// Rejects a non-number argument exactly as the trampoline path's [`RtCtx::encode_arg`]
     /// does, so taking the fast path can't change whether a call is accepted.
@@ -449,27 +477,30 @@ impl JitModule {
         }
         let p = addr as *const u8;
         let c = ctx as *mut RtCtx;
+        let d = self.max_call_depth;
         // SAFETY: `addr` is the finalized native address of the typed function `fn_<name>`,
-        // whose signature the caller verified is `(ctx, f64 × arity) -> f64`. It was compiled
-        // with the platform C ABI, so the matching arity-specialized `extern "C"` pointer is
-        // the same ABI contract the trampolines rely on. `ctx` is a live, exclusive `*mut
-        // RtCtx` that outlives the call.
+        // whose signature the caller verified is `(ctx, depth, f64 × arity) -> f64`. It was
+        // compiled with the platform C ABI, so the matching arity-specialized `extern "C"`
+        // pointer is the same ABI contract the trampolines rely on. `ctx` is a live, exclusive
+        // `*mut RtCtx` that outlives the call.
         let r = unsafe {
             match arity {
-                0 => std::mem::transmute::<*const u8, Direct0>(p)(c),
-                1 => std::mem::transmute::<*const u8, Direct1>(p)(c, a[0]),
-                2 => std::mem::transmute::<*const u8, Direct2>(p)(c, a[0], a[1]),
-                3 => std::mem::transmute::<*const u8, Direct3>(p)(c, a[0], a[1], a[2]),
-                4 => std::mem::transmute::<*const u8, Direct4>(p)(c, a[0], a[1], a[2], a[3]),
-                5 => std::mem::transmute::<*const u8, Direct5>(p)(c, a[0], a[1], a[2], a[3], a[4]),
+                0 => std::mem::transmute::<*const u8, Direct0>(p)(c, d),
+                1 => std::mem::transmute::<*const u8, Direct1>(p)(c, d, a[0]),
+                2 => std::mem::transmute::<*const u8, Direct2>(p)(c, d, a[0], a[1]),
+                3 => std::mem::transmute::<*const u8, Direct3>(p)(c, d, a[0], a[1], a[2]),
+                4 => std::mem::transmute::<*const u8, Direct4>(p)(c, d, a[0], a[1], a[2], a[3]),
+                5 => {
+                    std::mem::transmute::<*const u8, Direct5>(p)(c, d, a[0], a[1], a[2], a[3], a[4])
+                }
                 6 => std::mem::transmute::<*const u8, Direct6>(p)(
-                    c, a[0], a[1], a[2], a[3], a[4], a[5],
+                    c, d, a[0], a[1], a[2], a[3], a[4], a[5],
                 ),
                 7 => std::mem::transmute::<*const u8, Direct7>(p)(
-                    c, a[0], a[1], a[2], a[3], a[4], a[5], a[6],
+                    c, d, a[0], a[1], a[2], a[3], a[4], a[5], a[6],
                 ),
                 8 => std::mem::transmute::<*const u8, Direct8>(p)(
-                    c, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+                    c, d, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
                 ),
                 _ => unreachable!("arity > MAX_DIRECT_ARGS is guarded by the caller"),
             }
@@ -599,7 +630,7 @@ impl JitModule {
     /// caller must return it via [`Self::store_ctx`] after the call so the next call can reuse
     /// it. Taking it out means a reentrant call gets its own fresh context.
     fn take_ctx(&mut self) -> RtCtx {
-        let ctx = match self.cached_ctx.take() {
+        let mut ctx = match self.cached_ctx.take() {
             Some(mut ctx) => {
                 if self.bindings_dirty {
                     let host = self.resolve_host();
@@ -613,6 +644,7 @@ impl JitModule {
             None => self.make_ctx(),
         };
         self.bindings_dirty = false;
+        ctx.set_max_call_depth(self.max_call_depth);
         ctx
     }
 
@@ -707,12 +739,20 @@ fn define_body(
     fbctx: &mut FunctionBuilderContext,
     func_id: FuncId,
     f: &crate::ir::Function,
+    counts_calls: bool,
 ) -> Result<(), JitError> {
     let mut ctx = module.make_context();
     ctx.func.signature = typed_signature(cx.call_conv, &param_reprs(f), Repr::of(&f.ret));
     {
         let builder = FunctionBuilder::new(&mut ctx.func, fbctx);
-        let t = Translator::new(builder, module as &mut dyn Module, cx, pools, f);
+        let t = Translator::new(
+            builder,
+            module as &mut dyn Module,
+            cx,
+            pools,
+            f,
+            counts_calls,
+        );
         t.run();
     }
     module

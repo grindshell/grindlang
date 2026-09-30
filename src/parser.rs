@@ -11,10 +11,30 @@
 //!
 //! The parser bails on the first error (no recovery) — adequate for the current phase;
 //! multi-error recovery can be layered on later.
+//!
+//! ## Nesting limit
+//!
+//! Every later phase — resolver, checker, lowering, the interpreters, even dropping the AST —
+//! walks the tree recursively, so a deep enough tree overflows the native stack and aborts the
+//! process. The parser therefore refuses to build a tree more than `MAX_NESTING` levels deep
+//! (`E0209`). It measures the tree's height rather than its own recursion: a left-associative
+//! chain like `1 + 1 + … + 1` or a suffix chain like `a.b.c…` is parsed by a loop but still
+//! builds a tree as deep as it is long.
 
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, Diagnostics, Span};
 use crate::lexer::{DocComment, Token, TokenKind};
+
+/// How many levels of nested expressions and blocks a script may have (`E0209`), and how deeply a
+/// `---@` type annotation may nest. Lua and Luau limit their parsers to the same 200.
+///
+/// Source nested this deep compiles and runs on a 1 MiB stack (the Windows main thread's
+/// default) in a release build. A debug build's unoptimized frames are several times larger, so
+/// there it needs 2 MiB (Rust's default for spawned threads); on 1 MiB, nested tables, blocks,
+/// and function literals can run out from about 100 levels. That is also why the recursive path
+/// through the parser is kept to small dispatching frames, with nodes built in separate
+/// functions.
+pub(crate) const MAX_NESTING: u32 = 200;
 
 /// Parse a token stream plus the `---` doc comments (as produced by [`crate::lexer::lex`])
 /// into a [`Module`]. Doc comments are associated with the `function` they precede and their
@@ -24,6 +44,8 @@ pub fn parse(tokens: Vec<Token>, docs: Vec<DocComment>) -> Result<Module, Diagno
         tokens,
         docs,
         pos: 0,
+        depth: 0,
+        reached: 0,
         diags: Diagnostics::new(),
     };
     match p.parse_module() {
@@ -40,6 +62,11 @@ struct Parser {
     tokens: Vec<Token>,
     docs: Vec<DocComment>,
     pos: usize,
+    /// The nesting level of the expression or block being parsed.
+    depth: u32,
+    /// The deepest level the tree built so far reaches, within the current
+    /// [`measured`](Self::measured) scope.
+    reached: u32,
     diags: Diagnostics,
 }
 
@@ -103,6 +130,52 @@ impl Parser {
     fn err<T>(&mut self, code: &'static str, msg: impl Into<String>, span: Span) -> PResult<T> {
         self.diags.push(Diagnostic::error(code, msg, span));
         Err(Aborted)
+    }
+
+    // ---- nesting limit (see the module docs) -------------------------------------
+
+    /// Open one level of nesting for the expression or block about to be parsed.
+    fn enter(&mut self) -> PResult<()> {
+        self.depth += 1;
+        self.note_level(self.depth)
+    }
+
+    fn leave(&mut self) {
+        self.depth -= 1;
+    }
+
+    /// Record that the tree under construction reaches `level`, failing past [`MAX_NESTING`].
+    fn note_level(&mut self, level: u32) -> PResult<()> {
+        if level > MAX_NESTING {
+            return self.err(
+                "E0209",
+                format!(
+                    "this is nested too deeply (more than {MAX_NESTING} levels of expressions \
+                     and blocks); split it up, e.g. by moving parts into local variables"
+                ),
+                self.peek_span(),
+            );
+        }
+        self.reached = self.reached.max(level);
+        Ok(())
+    }
+
+    /// Start measuring how many levels below the current depth the tree parsed next reaches,
+    /// finished by [`end_measure`](Self::end_measure) with the value this returns. A loop that
+    /// stacks nodes on top of what it has parsed (a left-associative operator chain, a suffix
+    /// chain) uses this to account for the levels its own nodes add.
+    ///
+    /// A pair of calls rather than one taking a closure, because every frame on the parser's
+    /// recursive path counts: in a debug build a closure frame costs as much stack as the work
+    /// it wraps.
+    fn start_measure(&mut self) -> u32 {
+        std::mem::replace(&mut self.reached, self.depth)
+    }
+
+    fn end_measure(&mut self, outer: u32) -> u32 {
+        let height = self.reached - self.depth;
+        self.reached = self.reached.max(outer);
+        height
     }
 
     fn expect_name(&mut self) -> PResult<Ident> {
@@ -284,6 +357,7 @@ impl Parser {
     /// Parse statements until a block terminator (`end`/`else`/`elseif`/EOF), including
     /// an optional trailing `return`.
     fn parse_block(&mut self) -> PResult<Block> {
+        self.enter()?;
         let start = self.peek_span();
         let mut stats = Vec::new();
         let mut ret = None;
@@ -313,6 +387,7 @@ impl Parser {
         }
 
         let end = self.peek_span();
+        self.leave();
         Ok(Block {
             stats,
             ret,
@@ -342,36 +417,17 @@ impl Parser {
         )
     }
 
+    /// Only dispatches: every nested block recurses through here, so each statement is built in
+    /// its own function rather than in this frame (see [`MAX_NESTING`]).
     fn parse_stat(&mut self) -> PResult<Stat> {
         let span0 = self.peek_span();
         match self.peek() {
-            TokenKind::Semi => {
-                self.bump();
-                Ok(Stat {
-                    kind: StatKind::Empty,
-                    span: span0,
-                })
-            }
+            TokenKind::Semi | TokenKind::Break => self.parse_keyword_stat(),
             TokenKind::Local => self.parse_local(),
-            TokenKind::Do => {
-                self.bump();
-                let block = self.parse_block()?;
-                let end = self.expect(TokenKind::End)?;
-                Ok(Stat {
-                    kind: StatKind::Do(block),
-                    span: span0.to(end.span),
-                })
-            }
+            TokenKind::Do => self.parse_do(),
             TokenKind::While => self.parse_while(),
             TokenKind::If => self.parse_if(),
             TokenKind::For => self.parse_for(),
-            TokenKind::Break => {
-                let t = self.bump();
-                Ok(Stat {
-                    kind: StatKind::Break,
-                    span: t.span,
-                })
-            }
             TokenKind::Repeat => self.err(
                 "E0201",
                 "`repeat ... until` loops are not supported in Grindlang; use `while`",
@@ -384,6 +440,26 @@ impl Parser {
             ),
             _ => self.parse_expr_stat(),
         }
+    }
+
+    /// `;` (an empty statement) or `break`.
+    fn parse_keyword_stat(&mut self) -> PResult<Stat> {
+        let t = self.bump();
+        let kind = match t.kind {
+            TokenKind::Break => StatKind::Break,
+            _ => StatKind::Empty,
+        };
+        Ok(Stat { kind, span: t.span })
+    }
+
+    fn parse_do(&mut self) -> PResult<Stat> {
+        let kw = self.expect(TokenKind::Do)?;
+        let block = self.parse_block()?;
+        let end = self.expect(TokenKind::End)?;
+        Ok(Stat {
+            kind: StatKind::Do(block),
+            span: kw.span.to(end.span),
+        })
     }
 
     fn parse_local(&mut self) -> PResult<Stat> {
@@ -611,32 +687,34 @@ impl Parser {
 
     /// Pratt expression parser. `min_bp` is the minimum left binding power that an infix
     /// operator must have to be consumed at this level (see SPEC §3.5).
+    ///
+    /// Nested parentheses, unary operators and right-associative operators all recurse through
+    /// here, so it only opens the nesting level and parses the first operand; the infix loop
+    /// runs in [`parse_infix`](Self::parse_infix), whose larger frame is then not on the stack
+    /// once per level while the operand is parsed.
     fn parse_expr_bp(&mut self, min_bp: u8) -> PResult<Expr> {
-        // Prefix / unary.
-        let mut lhs = if let Some(op) = unary_op(self.peek()) {
-            let op_tok = self.bump();
-            let r_bp = UNARY_BP;
-            let operand = self.parse_expr_bp(r_bp)?;
-            let span = op_tok.span.to(operand.span);
-            Expr {
-                kind: ExprKind::Unary {
-                    op,
-                    operand: Box::new(operand),
-                },
-                span,
-            }
-        } else {
-            self.parse_primary()?
-        };
+        self.enter()?;
+        let outer = self.start_measure();
+        let lhs = self.parse_operand()?;
+        let height = self.end_measure(outer);
+        let e = self.parse_infix(lhs, height, min_bp)?;
+        self.leave();
+        Ok(e)
+    }
 
-        // Infix.
+    /// Fold infix operators onto `lhs`, which reaches `height` levels below the current depth.
+    /// Each operator folded puts everything parsed so far one level deeper.
+    fn parse_infix(&mut self, mut lhs: Expr, mut height: u32, min_bp: u8) -> PResult<Expr> {
         while let Some(op) = binary_op(self.peek()) {
             let (l_bp, r_bp) = infix_bp(op);
             if l_bp < min_bp {
                 break;
             }
             self.bump(); // operator
+            let outer = self.start_measure();
             let rhs = self.parse_expr_bp(r_bp)?;
+            height = height.max(self.end_measure(outer)) + 1;
+            self.note_level(self.depth + height)?;
             let span = lhs.span.to(rhs.span);
             lhs = Expr {
                 kind: ExprKind::Binary {
@@ -647,13 +725,41 @@ impl Parser {
                 span,
             };
         }
-
         Ok(lhs)
+    }
+
+    /// A unary operation or a primary expression: the operand an infix chain starts from.
+    fn parse_operand(&mut self) -> PResult<Expr> {
+        let Some(op) = unary_op(self.peek()) else {
+            return self.parse_primary();
+        };
+        let op_tok = self.bump();
+        let operand = self.parse_expr_bp(UNARY_BP)?;
+        let span = op_tok.span.to(operand.span);
+        Ok(Expr {
+            kind: ExprKind::Unary {
+                op,
+                operand: Box::new(operand),
+            },
+            span,
+        })
     }
 
     /// Primary expressions: literals, anonymous functions, table constructors, and
     /// suffixed prefix-expressions (names / parens followed by `.`/`[]`/calls).
+    ///
+    /// Only dispatches, so that a parenthesized expression recursing through here doesn't carry
+    /// the frame of [`parse_literal`](Self::parse_literal) once per level.
     fn parse_primary(&mut self) -> PResult<Expr> {
+        match self.peek() {
+            TokenKind::Name(_) | TokenKind::LParen => self.parse_suffixed_expr(),
+            _ => self.parse_literal(),
+        }
+    }
+
+    /// A primary expression that isn't a prefix-expression: a literal, an anonymous function,
+    /// or a table constructor.
+    fn parse_literal(&mut self) -> PResult<Expr> {
         let span = self.peek_span();
         match self.peek().clone() {
             TokenKind::Nil => {
@@ -712,7 +818,6 @@ impl Parser {
                     span: tspan,
                 })
             }
-            TokenKind::Name(_) | TokenKind::LParen => self.parse_suffixed_expr(),
             other => self.err(
                 "E0206",
                 format!("expected an expression, found {}", other.describe()),
@@ -723,13 +828,26 @@ impl Parser {
 
     /// A prefix-expression (name or parenthesized expr) followed by any chain of
     /// suffixes: `.name`, `[expr]`, `(args)`, `{table}`, `"str"`, and `:method(args)`.
+    ///
+    /// Like an infix chain, each suffix puts everything parsed so far one level deeper. The
+    /// suffix loop runs in [`parse_suffixes`](Self::parse_suffixes), after the atom, for the
+    /// same reason [`parse_expr_bp`](Self::parse_expr_bp) splits off its infix loop.
     fn parse_suffixed_expr(&mut self) -> PResult<Expr> {
-        let mut e = self.parse_atom()?;
+        let outer = self.start_measure();
+        let atom = self.parse_atom()?;
+        let height = self.end_measure(outer);
+        self.parse_suffixes(atom, height)
+    }
+
+    /// Apply any suffixes following `e`, which reaches `height` levels below the current depth.
+    fn parse_suffixes(&mut self, mut e: Expr, mut height: u32) -> PResult<Expr> {
         loop {
             match self.peek() {
                 TokenKind::Dot => {
                     self.bump();
                     let name = self.expect_name()?;
+                    height += 1;
+                    self.note_level(self.depth + height)?;
                     let span = e.span.to(name.span);
                     e = Expr {
                         kind: ExprKind::Field {
@@ -741,8 +859,11 @@ impl Parser {
                 }
                 TokenKind::LBracket => {
                     self.bump();
+                    let outer = self.start_measure();
                     let index = self.parse_expr()?;
+                    height = height.max(self.end_measure(outer)) + 1;
                     let close = self.expect(TokenKind::RBracket)?;
+                    self.note_level(self.depth + height)?;
                     let span = e.span.to(close.span);
                     e = Expr {
                         kind: ExprKind::Index {
@@ -755,7 +876,10 @@ impl Parser {
                 TokenKind::Colon => {
                     self.bump();
                     let method = self.expect_name()?;
+                    let outer = self.start_measure();
                     let (args, aspan) = self.parse_call_args()?;
+                    height = height.max(self.end_measure(outer)) + 1;
+                    self.note_level(self.depth + height)?;
                     let span = e.span.to(aspan);
                     e = Expr {
                         kind: ExprKind::MethodCall {
@@ -767,7 +891,10 @@ impl Parser {
                     };
                 }
                 TokenKind::LParen | TokenKind::LBrace | TokenKind::Str(_) => {
+                    let outer = self.start_measure();
                     let (args, aspan) = self.parse_call_args()?;
+                    height = height.max(self.end_measure(outer)) + 1;
+                    self.note_level(self.depth + height)?;
                     let span = e.span.to(aspan);
                     e = Expr {
                         kind: ExprKind::Call {
@@ -1134,5 +1261,76 @@ mod tests {
     fn rejects_non_statement_expression() {
         // A parenthesized expression is neither a call nor an assignment.
         assert_eq!(err_code("function f(x) (x) end"), "E0205");
+    }
+
+    // ---- nesting limit (E0209) ----
+
+    fn nested(open: &str, inner: &str, close: &str, n: usize) -> String {
+        format!("{}{inner}{}", open.repeat(n), close.repeat(n))
+    }
+
+    #[test]
+    fn rejects_deeply_nested_parentheses() {
+        assert_eq!(
+            err_code(&format!("X = {}", nested("(", "1", ")", 300))),
+            "E0209"
+        );
+    }
+
+    #[test]
+    fn rejects_deeply_nested_blocks() {
+        let body = nested("do ", "", "end ", 300);
+        assert_eq!(err_code(&format!("function f() {body}end")), "E0209");
+    }
+
+    #[test]
+    fn rejects_deeply_nested_tables_and_calls() {
+        assert_eq!(
+            err_code(&format!("X = {}", nested("{", "1", "}", 300))),
+            "E0209"
+        );
+        let call = nested("f(", "1", ")", 300);
+        assert_eq!(
+            err_code(&format!("function f(x) return {call} end")),
+            "E0209"
+        );
+    }
+
+    #[test]
+    fn rejects_a_long_operator_chain() {
+        // Parsed by a loop, not by recursion, but the tree is still 10,000 levels deep.
+        let chain = " + 1".repeat(10_000);
+        assert_eq!(err_code(&format!("X = 1{chain}")), "E0209");
+    }
+
+    #[test]
+    fn rejects_a_long_suffix_chain() {
+        let chain = ".a".repeat(10_000);
+        assert_eq!(
+            err_code(&format!("function f(t) return t{chain} end")),
+            "E0209"
+        );
+    }
+
+    #[test]
+    fn a_chain_counts_the_depth_of_its_operands() {
+        // Every `+ 1` folded after the parentheses pushes them one level deeper, so 150 levels
+        // of parentheses plus 100 operators is 250 levels, although neither alone is too deep.
+        let parens = nested("(", "1", ")", 150);
+        assert_eq!(
+            err_code(&format!("X = 1 + {parens}{}", " + 1".repeat(100))),
+            "E0209"
+        );
+        parse_ok(&format!("X = 1 + {parens}{}", " + 1".repeat(20)));
+    }
+
+    #[test]
+    fn accepts_nesting_within_the_limit() {
+        parse_ok(&format!("X = {}", nested("(", "1", ")", 190)));
+        parse_ok(&format!("X = 1{}", " + 1".repeat(190)));
+        parse_ok(&format!(
+            "function f() {}end",
+            nested("do ", "", "end ", 190)
+        ));
     }
 }

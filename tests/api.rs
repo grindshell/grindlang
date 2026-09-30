@@ -116,6 +116,35 @@ fn nan_comparison_is_a_call_error() {
     assert!(matches!(err, CallError::Run(_)), "got {err:?}");
 }
 
+/// Runaway recursion used to overflow the native stack and abort the host process. It now
+/// fails the call at the call-depth limit (`SPEC.md` §7.3), which runs under the default
+/// `jit`-only feature set on the test thread's ordinary stack.
+#[test]
+fn runaway_recursion_is_a_call_error() {
+    let mut m = Engine::new()
+        .compile("function down(n) if n == 0 then return 0 end return 1 + down(n - 1) end")
+        .expect("compile");
+    let err = m
+        .call_typed::<_, f64>("down", (1e7,))
+        .expect_err("ten million nested calls must hit the limit");
+    assert!(
+        err.to_string().contains("call depth limit exceeded"),
+        "got {err}"
+    );
+
+    // The default leaves ordinary recursion alone, and a host that knows its stack is bigger
+    // can raise the limit.
+    let depth = grindlang::value::DEFAULT_MAX_CALL_DEPTH;
+    let n = f64::from(depth - 1);
+    assert_eq!(m.call_typed::<_, f64>("down", (n,)).expect("fits"), n);
+    assert!(m.call_typed::<_, f64>("down", (n + 1.0,)).is_err());
+    m.set_max_call_depth(depth * 10);
+    assert_eq!(
+        m.call_typed::<_, f64>("down", (n + 1.0,)).expect("fits"),
+        n + 1.0
+    );
+}
+
 /// A bool-returning decision function.
 #[test]
 fn bool_result() {

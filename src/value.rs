@@ -143,6 +143,30 @@ pub struct ClosureObj {
 pub const IMMUTABLE_CONSTANT: &str = "cannot modify a constant: constants are immutable, \
      including through an alias. Use host memory (`SPEC.md` §7) for state that changes.";
 
+/// How many script calls may be active at once before a call fails (`SPEC.md` §7.3), unless the
+/// host sets its own limit.
+///
+/// Every backend runs a script call on the native stack of the thread that invoked it, so
+/// unbounded recursion would overflow that stack and abort the host process rather than return
+/// an error. The limit is counted in calls rather than bytes so all three backends fail at the
+/// same call — the oracles have to agree on where an error happens, not just that it does.
+///
+/// It is sized for the JIT on a 1 MiB stack (the Windows main thread's default). A compiled
+/// function's frame runs from under 100 bytes to a few KiB — every call site in it reserves its
+/// own argument slots, so one making 40 host calls takes about 2.7 KiB — and 200 of the larger
+/// kind still leave room for the host's own frames. The interpreter oracles take several KiB per
+/// call in a debug build, so running them to this depth needs a bigger stack than that.
+#[cfg(any(feature = "interp", feature = "jit"))]
+pub const DEFAULT_MAX_CALL_DEPTH: u32 = 200;
+
+/// The error every backend raises when a call would nest deeper than `limit` calls.
+#[cfg(any(feature = "interp", feature = "jit"))]
+pub fn call_depth_exceeded(limit: u32) -> RunError {
+    RunError::Runtime(format!(
+        "call depth limit exceeded: more than {limit} nested script calls (runaway recursion?)"
+    ))
+}
+
 impl Value {
     /// Collect the address of every table/array allocation reachable from this value.
     ///
