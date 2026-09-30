@@ -373,6 +373,12 @@ end
 
 ### 5.5 Functions, tuples, closures
 
+- A function that returns a value must return one **on every path**. Reaching its closing `end`,
+  or a bare `return`, in a function whose return type is not optional is a compile error
+  (`E0480`): there would be no value to hand the caller. A function returning an optional (`T?`)
+  may do either, and the call then returns `nil`. The check follows the structure of the code:
+  an `if` returns on every path only when it has an `else` and every branch returns, a
+  `while true` loop with no `break` never finishes, and any other loop may run zero times.
 - Functions may return multiple values as a **tuple**. A `return e1, …, en` with `n ≥ 2`
   builds a tuple of `n` single-valued elements (a nested multi-value call in the list is **not**
   flattened — `E0415`). The tuple type is written `(T1, …, Tn)` and is inferred from the

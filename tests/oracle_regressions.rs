@@ -1138,6 +1138,42 @@ fn a_zero_limit_refuses_every_call_but_not_a_constant() {
     assert!(c.is_ok(), "{c:?}");
 }
 
+// ---- A function returning a value must return one on every path -------------
+//
+// Falling off the end of a function typed `number` (or a bare `return` in one) returned `nil`
+// from the interpreters but `0` from the JIT. The checker now rejects it (`E0480`); an
+// optional-returning function may still end without a value, and must mean `nil` everywhere.
+
+#[test]
+fn falling_off_a_number_function_is_rejected() {
+    let err = grindlang::analyze(
+        "function f(x) if x > 0 then return 1 end end",
+        &TypeConfig::default(),
+    )
+    .expect_err("falling off a `number` function must not type-check");
+    assert!(format!("{err:?}").contains("E0480"), "got {err:?}");
+}
+
+#[test]
+fn falling_off_an_optional_function_is_nil_everywhere() {
+    let src = "\
+function first_big(n)
+  for i = 1, n do
+    if i > 10 then return tonumber(\"7\") end
+  end
+end
+";
+    let mut all = triple(src, &TypeConfig::default());
+    assert_eq!(
+        call_all(&mut all, "first_big", 20.0).unwrap().to_string(),
+        "7"
+    );
+    assert_eq!(
+        call_all(&mut all, "first_big", 5.0).unwrap().to_string(),
+        "nil"
+    );
+}
+
 // ---- Deep source must not overflow any later phase ------------------------
 
 /// Source nested just inside the parser's limit (`E0209`) must survive every recursive phase —

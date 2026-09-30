@@ -25,6 +25,9 @@
 //!   <name> <type>` and `---@return <type>` pin a parameter/return type (parsed by
 //!   [`crate::annotations`], applied in Pass 2 before bodies are checked). This is what lets a
 //!   record/array-typed *parameter* be expressed.
+//! * **Every path returns a value** in a function whose return type isn't optional: a bare
+//!   `return`, or control reaching the closing `end`, is `E0480` (§5.5). Checked after every
+//!   body, once return types are settled.
 //! * **Flow narrowing**: inside `if <place> ~= nil then`, a `T?` place reads as `T`, where the
 //!   place is a local, an upvalue, a memory root, or a field path over one (§5.3). A write to
 //!   the place or a prefix of it ends the narrowing. Each narrowed read is recorded in
@@ -382,6 +385,17 @@ impl Unifier {
 struct ReturnFrame {
     ret: Type,
     saw_value: bool,
+    /// Each bare `return` in the function, which returns no value.
+    bare_returns: Vec<Span>,
+}
+
+/// The ways a value-returning function can return no value, checked once every body has been
+/// checked and its return type is fully known (see [`Checker::check_valueless_exits`]).
+struct ValuelessExits {
+    ret: Type,
+    bare_returns: Vec<Span>,
+    /// The function's closing `end`, if control can reach it.
+    falls_off: Option<Span>,
 }
 
 /// A **narrowable location**: a bare local/upvalue symbol, a host-memory root, or a field
@@ -424,6 +438,7 @@ struct Checker<'a> {
     /// Nested function-literal signatures, by [`FuncBody`] span (deep-resolved at the end).
     func_literals: HashMap<Span, FnType>,
     return_stack: Vec<ReturnFrame>,
+    valueless_exits: Vec<ValuelessExits>,
     diags: Diagnostics,
 }
 
@@ -441,6 +456,7 @@ impl<'a> Checker<'a> {
             const_types: BTreeMap::new(),
             func_literals: HashMap::new(),
             return_stack: Vec::new(),
+            valueless_exits: Vec::new(),
             diags: Diagnostics::new(),
         }
     }
@@ -481,6 +497,7 @@ impl<'a> Checker<'a> {
                 self.check_func_body(&f.body, &sig);
             }
         }
+        self.check_valueless_exits();
 
         // Pass 4: flag parameters whose type inference couldn't pin.
         for sym in self.res.symbols.iter() {
@@ -671,12 +688,65 @@ impl<'a> Checker<'a> {
         self.return_stack.push(ReturnFrame {
             ret: (*sig.ret).clone(),
             saw_value: false,
+            bare_returns: Vec::new(),
         });
         self.check_block(&body.block);
         let frame = self.return_stack.pop().expect("return frame");
-        // A function with no value-returning `return` is value-less.
-        if !frame.saw_value {
-            let _ = self.u.unify(&frame.ret, &Type::Unit);
+        // A function with no value-returning `return` is value-less — unless an annotation
+        // already gave it a return type, which its exits are then checked against below.
+        if !frame.saw_value && self.u.unify(&frame.ret, &Type::Unit).is_ok() {
+            return;
+        }
+        let falls_off = (!always_returns(&body.block)).then(|| end_keyword(body));
+        if falls_off.is_some() || !frame.bare_returns.is_empty() {
+            self.valueless_exits.push(ValuelessExits {
+                ret: frame.ret,
+                bare_returns: frame.bare_returns,
+                falls_off,
+            });
+        }
+    }
+
+    /// Reject every way a function whose return type can't hold `nil` returns without a value
+    /// (`E0480`, `SPEC.md` §5.5): a bare `return`, or reaching the closing `end`.
+    ///
+    /// Such an exit has no value to give the caller. The interpreters would hand back `nil` and
+    /// the JIT the zero of the return type (`0`, `false`), so this is where the three backends
+    /// would otherwise disagree. A function returning an optional may exit without a value,
+    /// which returns `nil` in all three.
+    ///
+    /// Run after every body is checked, because a return type can be fixed by code checked
+    /// later — a call from another function, or the use of a closure after it is built.
+    fn check_valueless_exits(&mut self) {
+        for exits in std::mem::take(&mut self.valueless_exits) {
+            let ret = self.u.deep(&exits.ret);
+            // `Var`/`Error`: the return type couldn't be determined, which is reported elsewhere.
+            if matches!(
+                ret,
+                Type::Optional(_) | Type::Nil | Type::Unit | Type::Var(_) | Type::Error
+            ) {
+                continue;
+            }
+            for span in exits.bare_returns {
+                self.error(
+                    "E0480",
+                    format!(
+                        "missing return value: this function returns {ret}, but this `return` \
+                         gives none"
+                    ),
+                    span,
+                );
+            }
+            if let Some(span) = exits.falls_off {
+                self.error(
+                    "E0480",
+                    format!(
+                        "missing `return`: this function returns {ret}, but can reach its end \
+                         without returning a value"
+                    ),
+                    span,
+                );
+            }
         }
     }
 
@@ -694,6 +764,9 @@ impl<'a> Checker<'a> {
         // 0 exprs → value-less; 1 → a single value (which may itself be a tuple-returning call,
         // i.e. a pass-through); ≥ 2 → a tuple built from single-valued elements (no flattening).
         let (value_ty, span) = if ret.exprs.is_empty() {
+            if let Some(frame) = self.return_stack.last_mut() {
+                frame.bare_returns.push(ret.span);
+            }
             return;
         } else if ret.exprs.len() == 1 {
             let e = &ret.exprs[0];
@@ -1827,6 +1900,61 @@ impl<'a> Checker<'a> {
     }
 }
 
+// ---- reachability -------------------------------------------------------------
+
+/// Whether control can never reach the end of `block`: every path through it ends in a
+/// `return` or loops forever.
+///
+/// Only called on a function body and the blocks nested in it outside any loop, so a `break`
+/// never has to be considered here — one can only occur inside a loop, and a loop is only ever
+/// treated as not finishing when it has no `break` ([`stat_always_returns`]).
+fn always_returns(block: &Block) -> bool {
+    block.ret.is_some() || block.stats.iter().any(stat_always_returns)
+}
+
+fn stat_always_returns(stat: &Stat) -> bool {
+    match &stat.kind {
+        StatKind::Do(block) => always_returns(block),
+        StatKind::If {
+            arms,
+            else_block: Some(else_block),
+        } => arms.iter().all(|(_, b)| always_returns(b)) && always_returns(else_block),
+        // `while true` without a `break` can only be left by returning.
+        StatKind::While { cond, body } => is_literal_true(cond) && !breaks_out(body),
+        _ => false,
+    }
+}
+
+/// Whether `block` (a loop body) contains a `break` that leaves that loop — not one belonging to
+/// a loop nested inside it.
+fn breaks_out(block: &Block) -> bool {
+    block.stats.iter().any(|stat| match &stat.kind {
+        StatKind::Break => true,
+        StatKind::Do(b) => breaks_out(b),
+        StatKind::If { arms, else_block } => {
+            arms.iter().any(|(_, b)| breaks_out(b)) || else_block.as_ref().is_some_and(breaks_out)
+        }
+        _ => false,
+    })
+}
+
+fn is_literal_true(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Bool(b) => *b,
+        ExprKind::Paren(inner) => is_literal_true(inner),
+        _ => false,
+    }
+}
+
+/// The span of the `end` keyword closing `body`, which is where a function that can finish
+/// without returning is reported. A function body's span always ends with that keyword.
+fn end_keyword(body: &FuncBody) -> Span {
+    Span {
+        start: body.span.end - "end".len() as u32,
+        end: body.span.end,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2311,6 +2439,128 @@ mod tests {
             ),
             "E0413"
         );
+    }
+
+    // ---- missing return value (E0480) ----
+
+    #[test]
+    fn falling_off_a_value_returning_function_is_error() {
+        assert_eq!(
+            err_code("function f(x) if x > 0 then return 1 end end", &empty()),
+            "E0480"
+        );
+    }
+
+    #[test]
+    fn bare_return_in_a_value_returning_function_is_error() {
+        assert_eq!(
+            err_code(
+                "function f(x) if x > 0 then return end return 1 end",
+                &empty()
+            ),
+            "E0480"
+        );
+    }
+
+    #[test]
+    fn annotated_return_type_with_no_return_is_error() {
+        // No `return` at all used to make the function value-less, silently discarding the
+        // annotation it contradicts.
+        assert_eq!(
+            err_code("---@return number\nfunction f() end", &empty()),
+            "E0480"
+        );
+    }
+
+    #[test]
+    fn a_closure_that_can_fall_off_is_error() {
+        assert_eq!(
+            err_code(
+                "function f()\n\
+                   local g = function(x) if x > 0 then return 1 end end\n\
+                   return g(1)\n\
+                 end",
+                &empty()
+            ),
+            "E0480"
+        );
+    }
+
+    #[test]
+    fn a_return_type_fixed_by_a_later_function_is_still_checked() {
+        // `f`'s return type is only known once `g`'s body has been checked.
+        assert_eq!(
+            err_code(
+                "function f(x) if x > 0 then return g() end end\n\
+                 function g() return 1 end",
+                &empty()
+            ),
+            "E0480"
+        );
+    }
+
+    #[test]
+    fn a_function_that_returns_on_every_path_is_ok() {
+        for src in [
+            "function f(x) if x > 0 then return 1 else return 2 end end",
+            "function f(x) if x > 0 then return 1 elseif x < 0 then return 2 else return 3 end end",
+            "function f(x) do return x + 1 end end",
+            "function f(x) while true do if x > 0 then return x end x = x + 1 end end",
+            "function f(x) while (true) do return x + 1 end end",
+        ] {
+            let info = ok(src, &empty());
+            assert!(
+                info.exports["f"].to_string().ends_with("-> number"),
+                "{src}: {}",
+                info.exports["f"]
+            );
+        }
+    }
+
+    #[test]
+    fn a_loop_that_can_break_can_fall_off() {
+        for src in [
+            "function f(x) while true do if x > 0 then break end return 1 end end",
+            "function f(x) while x > 0 do return 1 end end",
+            "function f(x) for i = 1, x do return i end end",
+            "function f(x) if x > 0 then return 1 elseif x < 0 then return 2 end end",
+        ] {
+            assert_eq!(err_code(src, &empty()), "E0480", "{src}");
+        }
+    }
+
+    #[test]
+    fn a_break_in_a_nested_loop_does_not_leave_the_outer_one() {
+        let src = "function f(x)\n\
+                     while true do\n\
+                       for i = 1, 3 do break end\n\
+                       return x + 1\n\
+                     end\n\
+                   end";
+        ok(src, &empty());
+    }
+
+    #[test]
+    fn an_optional_returning_function_may_end_without_a_value() {
+        // The implicit result is `nil`, which the optional return type holds.
+        let info = ok(
+            "function first_big(xs)\n\
+               for _, x in ipairs(xs) do\n\
+                 if x > 10 then return tonumber(\"1\") end\n\
+               end\n\
+             end",
+            &empty(),
+        );
+        assert_eq!(
+            info.exports["first_big"].to_string(),
+            "fn(array<number>) -> number?"
+        );
+    }
+
+    #[test]
+    fn a_value_less_function_may_return_early() {
+        let info = ok("function f(x) if x > 0 then return end x = 1 end", &empty());
+        assert_eq!(info.exports["f"].to_string(), "fn(number) -> ()");
     }
 
     #[test]

@@ -82,6 +82,14 @@ fn snapshot_type_errors() {
         "reject_const_table_write",
         analyze_diag("C = {x = 1}\nfunction f()\n  C.x = 2\n  return C.x\nend")
     );
+    // A value-returning function must return a value on every path (SPEC §5.5): both a bare
+    // `return` and falling off the closing `end` are reported, at the exit itself.
+    insta::assert_snapshot!(
+        "type_error_missing_return",
+        analyze_diag(
+            "function f(x)\n  if x < 0 then return end\n  if x > 0 then return 1 end\nend"
+        )
+    );
 }
 
 // ---- inferred export signatures ---------------------------------------------
