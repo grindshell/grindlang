@@ -3,7 +3,8 @@
 > Status: Phases 0–8 delivered (front end, resolver, types, interpreter, IR, runtime,
 > cranelift JIT, host embedding API); Phase 9 (hardening, tooling, docs) delivered; top-level
 > code (run once, then frozen — §2 decision 1) delivered since. See the per-phase "Delivered"
-> notes below and [`CLAUDE.md`](CLAUDE.md) for the current shape.
+> notes below and [`CLAUDE.md`](CLAUDE.md) for the current shape. Phase 10, a Ruby surface
+> ([`SPEC-RUBY.md`](SPEC-RUBY.md), draft), is planned and not started.
 
 ## 1. What Grindlang is
 
@@ -417,6 +418,157 @@ history before the commit that deleted it.
 > round-trip is covered by `tests/serde_ir.rs`. The differential/fuzz/property suites are
 > gated on
 > `all(feature = "interp", feature = "jit")`; run `cargo test --features interp`.
+
+### Phase 10 — Ruby surface  (planned)
+
+A second syntax for the same language: a strict subset of Ruby's syntax aimed at game logic and
+dialog DSLs. [`SPEC-RUBY.md`](SPEC-RUBY.md) (draft) is its authoring contract; this section is
+why it is built the way it is. Nothing here is implemented yet.
+
+**Approach: translate into the shared AST.** The backends only see `ir::Program`, and
+everything above the IR sees `ast::Module`. A Ruby frontend that translates into `ast::Module`
+shares the resolver, the checker, lowering, and all three backends, so every Ruby program is
+held to the three-oracle model with no new executor. The alternative — a Ruby AST with its own
+resolver and checker, lowering straight to IR — duplicates about 5k lines of front end and
+loses the tree-walking `Interpreter`, which walks the AST, as an oracle. The Ruby frontend
+therefore produces only what the Lua frontend can, plus the core additions below.
+
+```
+src/ruby/        feature `ruby`, off by default; front end only, no backend dependency
+  mod.rs         parse_ruby(), RubyConfig, entry points
+  lexer.rs       tokens and spans, string interpolation, `# @param` doc lines
+  ast.rs         the Ruby-shaped syntax tree
+  parser.rs      Ruby subset grammar → ruby::ast
+  scope.rs       where each Ruby local is declared
+  desugar.rs     ruby::ast → ast::Module
+  methods.rs     Ruby method → operator or catalog builtin
+  dsl.rs         host-declared keywords → closure tables and records
+```
+
+#### Locked decisions (confirmed with stakeholder, 2026-09-30)
+
+| Decision | Choice | Why |
+|---|---|---|
+| Array indexing | **Ruby indices start at 0.** An index node carries a zero-based flag (C9); lowering and the interpreter add 1 when the base is an array. | The translator can't add the 1 itself: `a[i]` on an array and `m[k]` on a map look alike, and which one it is depends on types. No runtime or backend change. Cost: an out-of-range write reports the 1-based position. |
+| String `+` | **Rejected**, with a hint to use interpolation. | Which `+` is meant depends on types, and overloading the core `+` would change the Lua surface. Revisit with a `+` the checker resolves by type if it becomes the top complaint. |
+| DSL scope | **Handler and data keywords**, declared by the host. | Both are ordinary top-level code building frozen tables of closures and records, so they need no core change. Anything more waits for scripts that need it. |
+| Optional core changes | **C8 in; C7 dropped.** | C7 (`Module::constant`) assumed the host couldn't read a constant's value. It can: `Module::call(name, vec![])` reads one (`SPEC.md` §7.1), so it isn't needed. |
+
+Defaults adopted with them, each specified in SPEC-RUBY.md:
+
+- **Implicit return is syntactic.** An expression in tail position becomes `return e`; an
+  assignment, memory write, or loop there returns nothing. The translator needs no types. It
+  relies on `return f()` of a call that returns nothing, which now returns nothing (C1), and on
+  E0435 rejecting such a call anywhere else.
+- **Values from `if`, `case`, and `?:`** use a new conditional expression (C2), not
+  `c and a or b`, which yields `b` for a `false` or `nil` `a`. Hoisting into a temporary instead
+  would break evaluation order under `&&`, `||`, and loop conditions.
+- **Locals are declared where Ruby declares them.** `ruby/scope.rs` emits `local x = …` at a
+  first assignment that precedes every use, and otherwise a bare `local x` at the start of the
+  scope, which the checker types as optional.
+- **The top level maps by capitalization.** `CONST = …` is an exported constant, lowercase is a
+  private module variable, `private def` is a plain function left out of a generated export
+  table (keeping Ruby's file-wide visibility), and a `def` can't read a top-level lowercase
+  local, as in Ruby.
+- **`@name` is a memory field** of the binding the host designates; `mem.m(x)` is a memory
+  method call.
+- **Collection methods with blocks become loops**, accepted only as the whole right side of an
+  assignment or a `return`, because builtin signatures (`runtime::builtins::Sig`) have no type
+  variables to type a generic `map(arr, fn)`.
+- **Calls without parentheses** only at the start of a statement, with restrictions on the first
+  argument, which removes Ruby's whitespace-dependent parses without a stateful lexer.
+- **Annotations** (`# @param`, `# @return`) reuse `annotations::parse_doc_block` and its type
+  syntax. Numbers stay `f64` and conditions `bool`. Ruby-only diagnostics use E05xx (lexing and
+  parsing) and E06xx (translation and DSLs).
+
+#### Core changes
+
+The only changes outside `src/ruby/`. Each one that changes semantics updates `SPEC.md` and adds
+differential cases (AGENTS.md §6).
+
+- **C1 — `return f()` of a call that returns nothing.** ✅ Landed (7c30866; E0435 in 37fbd61).
+  It type-checked but failed the cranelift verifier; it now calls `f` and returns no value.
+- **C2 — a conditional expression, `ExprKind::Cond`.** Touches the AST, resolver, capture,
+  checker, interpreter, and lowering. The branches join the way `or` operands do (`T` and `nil`
+  give `T?`; no covering type is an error) and narrow like an `if`. Lowering reuses the result
+  temporary and merge block `lower_logic` builds, so no IR op is added and the Vm and JIT are
+  untouched. It has no Lua spelling.
+- **C3 — `StatKind::Continue`.** Allowed only inside a loop, like `break`; jumps to the loop's
+  step block, or a `while` loop's header. The Lua surface gains Luau's `continue` with it.
+- **C4 — `FuncBody::fallthrough`, Error or Nil.** The Lua surface keeps Error (E0480). With
+  Nil, reaching `end` in a function that returns a value returns `nil` and makes its return type
+  optional, reusing `infer_optional_return`.
+- **C5 — entry points that start from an AST.** `analyze_module` and `compile_module` (today's
+  `analyze` and `compile` take Lua text), `Engine::compile_module`, and an interpreter and test
+  harness built from an `ast::Module`.
+- **C6 — wording that follows the surface.** A `Surface` in `ResolveConfig` and `TypeConfig`;
+  operator symbols (`BinOp::symbol` in three checker messages) and Lua-specific hints (`~= nil`,
+  `local`, `ipairs`) go through one helper. No error code changes.
+- **C7 — dropped.** See the locked decisions: the host already reads constants.
+- **C8 — narrowing on `== nil`.** Narrow `x` in the else-branch of `if x == nil`, including the
+  conditions and bodies of later `elseif` arms, and in the else-branch of a C2 conditional.
+  Today only the then-branch of `x ~= nil` narrows (`types.rs` `narrowing_from`), so Ruby's
+  usual `if x.nil? … else … end` would leave `x` optional. It helps Lua authors equally.
+- **C9 — zero-based indexing.** `ExprKind::Index` gains a flag the Lua parser never sets. When
+  it is set and the base is an array, lowering and the interpreter add 1 to the index before the
+  element read or write; a map or record key is used as written. No IR op, runtime, or backend
+  change.
+
+#### Steps
+
+Each step ends on the green bar plus `cargo check --no-default-features --features ruby`. Line
+counts exclude tests; the total is about 6k.
+
+- **R0 — seams.** C5 and C6, with Lua wording only. No behavior change: every existing test
+  and snapshot passes untouched. (~400 lines)
+- **R1 — Ruby lexer and parser** to `ruby::ast`: the grammar of SPEC-RUBY.md §2–3, including
+  its rule for calls without parentheses (§3.4), an E05xx rejection for every construct SPEC-RUBY.md §6 lists, and the 200-level nesting
+  limit (the E0209 rule). Tests: parse fixtures, a snapshot per rejection. (~2.3k lines)
+- **R2 — translating the core subset.** C8 and C9 first. Then everything that maps onto
+  today's AST: scope analysis, the top level, literals, operators, interpolation, nil tests,
+  `if`/`unless`/modifiers, `while`/`until`/`loop`, the iteration forms, memory, the method
+  table, lambdas, multiple and compound assignment, annotations, and implicit return of
+  expression tails. Exit: the Ruby corpus runs the same on all three oracles, and every twin
+  pair lowers to the same IR. (~1.9k lines)
+- **R3 — language additions.** C2, C3, and C4, each with its `SPEC.md` section, and the Ruby
+  forms that need them: `?:`, `if`/`case` as values, `next`, `nil` on falling off the end.
+  (~700 lines)
+- **R4 — collection methods** (SPEC-RUBY.md §4.12), with diagnostics for each position a call
+  can't be translated in. (~400 lines)
+- **R5 — DSL layer.** The keyword declaration API, handler and data keywords, E06xx for unknown
+  keywords, repeated ids, and missing fields, and `examples/embed_ruby.rs` with event handlers
+  and a small dialog tree. (~700 lines)
+- **R6 — integration.** `Engine::compile_ruby`; the CLI's `.rb` detection, `--surface`, the
+  surface in the cache key, and an option to print the translated module as Lua for debugging;
+  Ruby programs in the fuzz corpus; a parse-and-translate benchmark beside the Lua one; docs
+  (SPEC-RUBY.md out of draft, AGENTS.md §5–6, README). (~400 lines)
+
+The first PR is R0: it changes no behavior and turns every later step into a `src/ruby/` change
+plus small, separately reviewable core additions.
+
+#### Testing
+
+- **One harness.** Generalize `Executors` from `tests/top_level_code.rs` into `tests/common`,
+  so any `ast::Module` runs through the Interpreter, the Vm, and the JIT, which must agree.
+- **Twin corpus.** `tests/ruby_twins/` holds `.rb`/`.lua` pairs that must lower to the same
+  `ir::Program`, ignoring spans. This tests the translator directly.
+- **Snapshots** for every E05xx and E06xx, and for shared checker errors worded for Ruby.
+- **Property test.** `prop_differential.rs` prints each generated expression in both syntaxes
+  and compares the results across surfaces as well as backends.
+
+#### Risks
+
+- **Ruby habits the core rejects** — every method returning a value, string `+`, integer
+  division, truthy objects. Mitigated by SPEC-RUBY.md's "Differences from Ruby" table and a
+  Ruby-worded hint on each rejection.
+- **Two syntaxes for every future language change.** Each needs a Ruby spelling or an explicit
+  "Lua only"; R6 adds that to the AGENTS.md §6 checklist.
+- **Iterating the wrong kind of table.** `each` picks `ipairs` or `pairs` by its block's
+  parameter count, not by type; a mismatch is E0412, which needs a Ruby-worded hint to be
+  understandable.
+- **DSL scope creep.** R5 ships two keyword kinds only.
+- **Ruby's lexing edge cases.** The call rule and the rejection list keep the grammar small;
+  when a form is ambiguous, reject it rather than guess.
 
 ## 5. Risks & mitigations
 
