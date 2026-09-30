@@ -34,11 +34,22 @@
 //! A loop that does create values compacts the table at its back edge ([`rt_compact`]). What an
 //! iteration interned is garbage by the next one unless the next can still reach its handle, and
 //! the only way it can is through a local variable — the IR has no other way for a value to
-//! cross a back edge — or the per-call constant cache. So everything interned since the loop was
-//! entered is dropped except what those hold, which moves down to fill the gap. Compacting every
+//! cross a back edge. (A module slot holds a [`Value`], not a handle, so what top-level code
+//! stores in one survives on its own.) So everything interned since the loop was entered is
+//! dropped except what the locals hold, which moves down to fill the gap. Compacting every
 //! iteration would cost more than it saves, so a loop lets the table grow [`COMPACT_SLACK`]
 //! entries past what it last kept before compacting again, which bounds the table's size by the
 //! loop's live values rather than its iteration count.
+//!
+//! ## Module slots
+//!
+//! The values a module's top-level code produces live in its slots ([`Globals`]), which the
+//! [`super::JitModule`] owns and shares into every context, since they outlive any one call.
+//! Once top-level code has run, the module freezes everything reachable from them and hands each
+//! context that set, which the write shims check (`SPEC.md` §3.1). It also copies the bits of
+//! every `number`/`bool` slot into a flat table ([`RtCtx::global_bits`]), which a read of one
+//! loads directly: a scalar constant costs a load, not a call. Top-level code reads its slots
+//! through [`rt_global_get`] instead, which knows whether one has been set yet.
 //!
 //! ## Errors
 //!
@@ -89,6 +100,14 @@ use crate::value::{
 /// A reference-value handle: an index into [`RtCtx::values`]. Handle `0` is always `nil`.
 pub type Handle = u64;
 
+/// A module instance's slots, by slot id: `None` until top-level code sets one. Owned by the
+/// compiled module and shared with each call's context.
+pub type Globals = Rc<RefCell<Vec<Option<Value>>>>;
+
+/// The allocations reachable from a module's slots once its top-level code has run, which may
+/// not be written to. Empty until then.
+pub type Frozen = Rc<std::collections::HashSet<usize>>;
+
 /// The null handle — `nil`.
 pub const NIL: Handle = 0;
 
@@ -136,10 +155,8 @@ pub struct Pools {
     pub memories: Vec<String>,
     /// Lifted-closure function names (`MakeClosure`), by closure id.
     pub closure_names: Vec<String>,
-    /// Reference-valued top-level constants (`ConstRef`), by constant id. Only constants whose
-    /// value is a reference are interned: a scalar has no identity to keep stable, so it is
-    /// re-evaluated rather than cached (see [`RtCtx::const_cache`]).
-    pub consts: Vec<String>,
+    /// The name of each module slot, by slot id, for the read-before-init error.
+    pub globals: Vec<String>,
     /// The function types indirect calls involve — each lifted closure's own, and the type each
     /// indirect call site calls its callee as — displayed for error messages. Parallel to
     /// [`fn_abis`](Self::fn_abis).
@@ -199,9 +216,6 @@ impl Pools {
     pub fn intern_closure_name(&mut self, name: &str) -> u32 {
         Self::intern(&mut self.closure_names, name)
     }
-    pub fn intern_const(&mut self, name: &str) -> u32 {
-        Self::intern(&mut self.consts, name)
-    }
 
     /// Intern a function type an indirect call involves, as `shown`, with the native signature
     /// it lowers to: its parameter reprs (a closure's env excluded) and its return repr.
@@ -236,7 +250,7 @@ pub struct ClosureCode {
     pub fn_type: u32,
 }
 
-/// One invocation's runtime state. Created fresh per top-level call (this *is* the per-call
+/// One invocation's runtime state. Created fresh per host call (this *is* the per-call
 /// arena: the value table is dropped when the call returns). Passed to the generated entry as
 /// an opaque `*mut RtCtx`; shims reconstitute `&mut RtCtx` from it.
 ///
@@ -263,6 +277,15 @@ pub struct RtCtx {
     /// How far a loop lets the table grow past what it last kept before it compacts again (see
     /// [`COMPACT_SLACK`]). Loaded from [`COMPACT_SLACK_OFFSET`] as a loop is entered.
     compact_slack: u64,
+    /// Nonzero while this context runs the module's top-level code, which may not touch host
+    /// memory ([`crate::value::memory_during_init`]). Loaded from [`INITIALIZING_OFFSET`] by a
+    /// read of a scalar module slot, which only takes its native path once this is zero.
+    initializing: u8,
+    /// The bits of every `number`/`bool` module slot, by slot id (an `f64`'s bits, or `0`/`1`),
+    /// filled once top-level code has run and never changed after. A read of such a slot loads
+    /// from here, through [`GLOBAL_BITS_OFFSET`], instead of calling [`rt_global_get`]. Owned by
+    /// the compiled module, which outlives every call it makes with this context.
+    global_bits: *const u64,
     /// The value table; index `0` is permanently `nil`.
     values: Vec<Value>,
     /// The handle already given to each object interned by [`intern_shared`](Self::intern_shared)
@@ -287,19 +310,12 @@ pub struct RtCtx {
     /// can resolve to ([`rt_closure_code_addr`]). Top-level functions are absent, since they are
     /// never values.
     closures: Arc<HashMap<String, ClosureCode>>,
-    /// Reference-valued constants already evaluated during this invocation, by constant id
-    /// (parallel to [`Pools::consts`]).
-    ///
-    /// A constant is memoized **per call** (`SPEC.md` §3): within one invocation every read
-    /// yields the same value — so a constant is equal to itself, which reference values decide
-    /// by identity — and the cache is dropped with the rest of the per-call arena, so nothing
-    /// survives between calls (§1). Populated lazily, so a constant a call never reads costs
-    /// nothing.
-    const_cache: Vec<Option<Handle>>,
-    /// Allocations reachable from the constants read so far this call, which may not be written
-    /// to (`SPEC.md` §3). Empty for a call that has read no composite constant, which is what
+    /// The module's slots (see the module docs).
+    globals: Globals,
+    /// What may not be written to, because it is (part of) a frozen module value (`SPEC.md`
+    /// §3.1). Empty for a module whose top-level code built no composite value, which is what
     /// keeps the check on the write path down to one branch.
-    frozen: std::collections::HashSet<usize>,
+    frozen: Frozen,
     /// The compiled module this context belongs to. Stamped into every closure
     /// [`rt_closure_new`] builds, and compared against a closure's own stamp before invoking it
     /// ([`rt_closure_code_addr`]).
@@ -415,6 +431,12 @@ pub const TABLE_LEN_OFFSET: i32 = std::mem::offset_of!(RtCtx, table_len) as i32;
 /// Byte offset of [`RtCtx::compact_slack`], which a loop loads as it is entered.
 pub const COMPACT_SLACK_OFFSET: i32 = std::mem::offset_of!(RtCtx, compact_slack) as i32;
 
+/// Byte offset of [`RtCtx::initializing`], which a scalar module-slot read loads.
+pub const INITIALIZING_OFFSET: i32 = std::mem::offset_of!(RtCtx, initializing) as i32;
+
+/// Byte offset of [`RtCtx::global_bits`], which a scalar module-slot read loads.
+pub const GLOBAL_BITS_OFFSET: i32 = std::mem::offset_of!(RtCtx, global_bits) as i32;
+
 /// How many entries a loop lets the value table grow past what it last kept before compacting it
 /// again (see the module docs). Each compaction costs a call plus work proportional to what it
 /// scans, so this amortizes that over at least this many new values; in exchange, up to this
@@ -431,17 +453,20 @@ impl RtCtx {
         memory: Vec<Option<Value>>,
         closures: Arc<HashMap<String, ClosureCode>>,
         origin: Rc<ClosureOrigin>,
+        globals: Globals,
     ) -> Self {
         RtCtx {
             errored: 0,
             max_call_depth: DEFAULT_MAX_CALL_DEPTH,
             table_len: 1,
             compact_slack: COMPACT_SLACK,
+            initializing: 0,
+            global_bits: std::ptr::null(),
             values: vec![Value::Nil],
             shared: HashMap::default(),
             compact_scratch: Vec::new(),
-            const_cache: vec![None; pools.consts.len()],
-            frozen: std::collections::HashSet::new(),
+            globals,
+            frozen: Frozen::default(),
             pools,
             host,
             methods,
@@ -570,10 +595,6 @@ impl RtCtx {
         self.values.push(Value::Nil);
         self.table_len = 1;
         self.shared.clear();
-        // Constants are memoized per call: the next invocation re-evaluates what it reads, so
-        // no constant (and nothing reachable from one) survives between calls.
-        self.const_cache.fill(None);
-        self.frozen.clear();
         self.error = None;
         self.errored = 0;
         self.panic = None;
@@ -582,6 +603,22 @@ impl RtCtx {
     /// Set how many script calls may be active at once, for calls entered from now on.
     pub fn set_max_call_depth(&mut self, depth: u32) {
         self.max_call_depth = depth;
+    }
+
+    /// Set what this call may not write to (see [`frozen`](Self::frozen)).
+    pub fn set_frozen(&mut self, frozen: Frozen) {
+        self.frozen = frozen;
+    }
+
+    /// Mark whether this context runs the module's top-level code.
+    pub fn set_initializing(&mut self, initializing: bool) {
+        self.initializing = initializing as u8;
+    }
+
+    /// Point scalar module-slot reads at `bits` (see [`global_bits`](Self::global_bits)), which
+    /// must stay valid and unchanged for as long as this context runs calls.
+    pub fn set_global_bits(&mut self, bits: *const u64) {
+        self.global_bits = bits;
     }
 
     /// Set how far a loop lets the value table grow before compacting it, for loops entered from
@@ -593,10 +630,9 @@ impl RtCtx {
     /// Compact the part of the value table a loop has added since `mark`, the table's length
     /// when the loop was entered (see the module docs).
     ///
-    /// The values `live` holds survive, and so does any constant memoized since `mark`: they move
-    /// down to start at `mark`, and `live`, the constant cache, and the shared-handle index are
-    /// rewritten to match. The rest of the region is dropped. Returns the table length past which
-    /// the loop should compact again.
+    /// The values `live` holds survive: they move down to start at `mark`, and `live` and the
+    /// shared-handle index are rewritten to match. The rest of the region is dropped. Returns the
+    /// table length past which the loop should compact again.
     fn compact(&mut self, mark: usize, live: &mut [Handle]) -> u64 {
         let len = self.values.len();
         let mark = mark.min(len);
@@ -605,7 +641,7 @@ impl RtCtx {
         let mut dest = std::mem::take(&mut self.compact_scratch);
         dest.clear();
         dest.resize(len - mark, NIL);
-        for &h in live.iter().chain(self.const_cache.iter().flatten()) {
+        for &h in live.iter() {
             if in_region(h) {
                 dest[h as usize - mark] = ERR;
             }
@@ -636,7 +672,6 @@ impl RtCtx {
             }
         };
         live.iter_mut().for_each(moved);
-        self.const_cache.iter_mut().flatten().for_each(moved);
         self.compact_scratch = dest;
 
         // Last, so the context is consistent even if dropping a value panics.
@@ -820,15 +855,15 @@ define_shims! {
 
 // ---- constants / refs -------------------------------------------------------
 
-/// Latch the immutable-constant error if `h` refers to (part of) a constant, returning [`ERR`]
-/// for the caller to propagate. `None` means the write may proceed.
+/// Latch the frozen-module-value error if `h` refers to (part of) a frozen module value,
+/// returning [`ERR`] for the caller to propagate. `None` means the write may proceed.
 fn reject_frozen(ctx: &mut RtCtx, h: Handle) -> Option<Handle> {
     if ctx.frozen.is_empty() {
-        return None; // the common case: no composite constant read this call
+        return None; // the common case: no composite module value
     }
     if ctx.get(h).is_frozen(&ctx.frozen) {
         return Some(ctx.fail(RunError::Runtime(
-            crate::value::IMMUTABLE_CONSTANT.to_string(),
+            crate::value::FROZEN_MODULE_VALUE.to_string(),
         )));
     }
     None
@@ -842,31 +877,44 @@ define_shims! {
         ctx.intern_shared(Value::Str(s))
     }
 
-    /// The constant already evaluated during this call, or [`ERR`] as a *miss* marker. A miss
-    /// can't be signalled with [`NIL`] because `nil` is a legal constant value, whereas `ERR` is
-    /// never a valid handle. This is a lookup, not a failure path — it never latches an error.
-    fn rt_const_cached(ctx, id: u32) -> Handle {
-        match ctx.const_cache.get(id as usize) {
-            Some(Some(h)) => *h,
-            _ => ERR,
+    /// Read module slot `slot`, as a result word per `tag`. One top-level code hasn't set yet is
+    /// the read-before-init error, which only top-level code can run into.
+    fn rt_global_get(ctx, slot: u32, tag: u32) -> u64 {
+        // A reference this call has already read has a handle; reuse it without touching the
+        // value's reference count.
+        if tag == TAG_HANDLE {
+            let globals = ctx.globals.borrow();
+            let addr = globals.get(slot as usize).and_then(|v| identity(v.as_ref()?));
+            if let Some(&h) = addr.and_then(|a| ctx.shared.get(&a)) {
+                return h;
+            }
+        }
+        let v = ctx.globals.borrow().get(slot as usize).cloned().flatten();
+        match v {
+            Some(v) => ctx.result(v, tag),
+            None => {
+                let e = crate::value::read_before_init(&ctx.pools.globals[slot as usize]);
+                ctx.fail(e)
+            }
         }
     }
 
-    /// Memoize a freshly evaluated constant for the rest of this call, and mark everything inside
-    /// it unwritable — the runtime half of a constant's immutability (`SPEC.md` §3), which catches
-    /// a write that reached it through an alias and so slipped past `E0307`.
-    fn rt_const_store(ctx, id: u32, h: Handle) {
-        let v = ctx.value(h);
-        v.collect_reachable(&mut ctx.frozen);
-        if let Some(slot) = ctx.const_cache.get_mut(id as usize) {
-            *slot = Some(h);
+    /// Set module slot `slot` to an operand. Only top-level code does.
+    fn rt_global_set(ctx, slot: u32, bits: u64, tag: u32) {
+        let v = ctx.operand(bits, tag);
+        if let Some(s) = ctx.globals.borrow_mut().get_mut(slot as usize) {
+            *s = Some(v);
         }
     }
 
     /// Read a host memory binding, as a result word per `tag`. A binding the host declared but
     /// never provided is an error at the point of use, matching both interpreters — not a silent
-    /// `nil`.
+    /// `nil` — and so is any binding while the module's top-level code runs.
     fn rt_memory_ref(ctx, id: u32, tag: u32) -> u64 {
+        if ctx.initializing != 0 {
+            let e = crate::value::memory_during_init(&ctx.pools.memories[id as usize]);
+            return ctx.fail(e);
+        }
         match ctx.memory.get(id as usize).cloned().flatten() {
             Some(v) => ctx.result(v, tag),
             None => {
@@ -1201,8 +1249,11 @@ define_shims! {
         ctx.result(v, tag)
     }
 
-    /// Write a value into a cell.
+    /// Write a value into a cell, unless a closure kept in a module value captured it.
     fn rt_cell_set(ctx, cell: Handle, bits: u64, tag: u32) {
+        if reject_frozen(ctx, cell).is_some() {
+            return;
+        }
         let v = ctx.operand(bits, tag);
         if let Value::Cell(c) = ctx.get(cell) {
             *c.borrow_mut() = v;
@@ -1349,8 +1400,8 @@ shim_table! {
     rt_unbox_number(*mut RtCtx, Handle) -> f64;
     rt_unbox_bool(*mut RtCtx, Handle) -> i8;
     rt_const_string(*mut RtCtx, u32) -> Handle;
-    rt_const_cached(*mut RtCtx, u32) -> Handle;
-    rt_const_store(*mut RtCtx, u32, Handle);
+    rt_global_get(*mut RtCtx, u32, u32) -> u64;
+    rt_global_set(*mut RtCtx, u32, u64, u32);
     rt_memory_ref(*mut RtCtx, u32, u32) -> u64;
     rt_namespace_field(*mut RtCtx, u32, u32) -> u64;
     rt_array_new(*mut RtCtx, u32) -> Handle;
@@ -1403,6 +1454,7 @@ mod tests {
                 module_id: 0,
                 keepalive: Rc::new(()),
             }),
+            Globals::default(),
         )
     }
 
@@ -1465,6 +1517,7 @@ mod tests {
                 module_id: 0,
                 keepalive: Rc::new(()),
             }),
+            Globals::default(),
         );
 
         // SAFETY: a live, exclusive context, and no arguments to read.

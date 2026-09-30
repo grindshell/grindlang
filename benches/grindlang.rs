@@ -131,6 +131,21 @@ function mapread(n)
   return s
 end";
 
+/// Module values read per iteration: a scalar constant and a field of a table one, both set once
+/// by top-level code (`SPEC.md` §3.1) and read from the module's slots on every access.
+const CONSTREAD: &str = "\
+SCALE = 1.5
+T = {a = 1, b = 2}
+function constread(n)
+  local s = 0
+  local i = 1
+  while i <= n do
+    s = s + SCALE * T.a + T.b
+    i = i + 1
+  end
+  return s
+end";
+
 // ---- workloads (Luau twins) -------------------------------------------------
 
 const FIB_LUAU: &str = "\
@@ -184,6 +199,20 @@ function fieldwrite(n)
   return t.b
 end";
 
+/// Luau keeps module-level values in upvalues, which is what `local` gives it.
+const CONSTREAD_LUAU: &str = "\
+local SCALE = 1.5
+local T = {a = 1, b = 2}
+function constread(n)
+  local s = 0
+  local i = 1
+  while i <= n do
+    s = s + SCALE * T.a + T.b
+    i = i + 1
+  end
+  return s
+end";
+
 // The remaining workloads are valid Luau as written, so each is its own twin.
 const UPVALUE_LUAU: &str = UPVALUE;
 const MINMAX_LUAU: &str = MINMAX;
@@ -232,6 +261,13 @@ fn workloads() -> Vec<(
             vec![1000.0],
         ),
         ("mapread", MAPREAD, MAPREAD_LUAU, "mapread", vec![1000.0]),
+        (
+            "constread",
+            CONSTREAD,
+            CONSTREAD_LUAU,
+            "constread",
+            vec![1000.0],
+        ),
     ]
 }
 

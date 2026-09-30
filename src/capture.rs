@@ -12,7 +12,11 @@
 //! * **referenced symbols** — every in-function [`SymbolId`] mentioned anywhere in `B`,
 //!   *including* through nested function literals (a nested closure's upvalues must flow out
 //!   through `B`'s own capture). Only ids resolving to a `Local`/`Upvalue` binding count;
-//!   top-level names, builtins, host fns, and memory are not captured.
+//!   top-level names (module variables included), builtins, host fns, and memory are not
+//!   captured.
+//!
+//! Top-level code runs as a function of its own at depth 0, alongside the declared functions, so
+//! a function literal written in it is at depth 1 and captures the locals of its blocks.
 //! * **upvalues** — the referenced symbols declared in a *strictly shallower* function
 //!   (`func_depth < d`); these are what `B` captures from its enclosing scopes.
 //! * **boxed locals** of a function `F` — `F`'s own params/locals that are referenced inside
@@ -55,6 +59,29 @@ pub fn boxed_locals(res: &Resolution, body: &FuncBody, depth: usize) -> HashSet<
             }
         }
     });
+    captured
+}
+
+/// The locals of top-level code (the chunk, which runs as a function at depth 0) that some
+/// function literal in it captures — i.e. those that must be boxed as shared cells. Only the
+/// constants and statements are top-level code; declared functions are separate bodies. A
+/// module variable is never among these: it is read through its slot, not captured.
+pub fn boxed_chunk_locals(res: &Resolution, decls: &[TopDecl]) -> HashSet<SymbolId> {
+    let mut captured = HashSet::new();
+    let mut note = |child: &FuncBody| {
+        for id in referenced_symbols(res, child) {
+            if res.symbols[id as usize].func_depth == 0 {
+                captured.insert(id);
+            }
+        }
+    };
+    for decl in decls {
+        match decl {
+            TopDecl::Const(c) => visit_expr_literals(&c.value, &mut note),
+            TopDecl::Stat(s) => visit_stat_literals(s, &mut note),
+            TopDecl::Function(_) => {}
+        }
+    }
     captured
 }
 

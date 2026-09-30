@@ -25,26 +25,35 @@ impl<T> Spanned<T> {
 /// An identifier occurrence.
 pub type Ident = Spanned<String>;
 
-/// A whole compiled script: a set of export declarations and an optional curated
+/// A whole compiled script: its top-level items in source order and an optional curated
 /// export table (`return { ... }`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Module {
+    /// Every top-level item, in source order. The constants and statements among them are the
+    /// module's **top-level code**, which runs once when the module initializes (`SPEC.md` §3.1);
+    /// the functions are declarations, and run only when called.
     pub decls: Vec<TopDecl>,
     /// Fields of the trailing `return { ... }`, if present.
     pub export: Option<Spanned<Vec<Field>>>,
     pub span: Span,
 }
 
-/// A top-level declaration: an exported function or an exported constant.
+/// A top-level item: a function, a constant, or a statement of top-level code.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TopDecl {
     Function(FuncDecl),
     Const(ConstDecl),
+    /// A statement run once when the module initializes. A top-level `local` declares a
+    /// *module variable*, which the functions declared after it can read.
+    Stat(Box<Stat>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FuncDecl {
     pub name: Ident,
+    /// Whether this is a `local function`: private to the module rather than exported, and in
+    /// scope only from its declaration on, where a plain `function` is in scope everywhere.
+    pub local: bool,
     pub body: FuncBody,
     /// Type annotations gathered from the `---@` doc-comment block above the declaration
     /// (`SPEC.md` §5.6). Empty when the function has no annotations.
@@ -93,10 +102,10 @@ pub struct ParamAnn {
     pub ty: Spanned<TypeAnn>,
 }
 
+/// `NAME = expr` at the top level: an exported constant, set once by top-level code.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConstDecl {
     pub name: Ident,
-    /// Validated as compile-time-constant in a later phase; parsed as a general expr.
     pub value: Expr,
     pub span: Span,
 }
@@ -189,7 +198,7 @@ pub enum ExprKind {
     Bool(bool),
     Number(f64),
     Str(String),
-    /// Anonymous function `function(...) ... end` (in-body only; SPEC §5.5).
+    /// Anonymous function `function(...) ... end` (SPEC §5.5).
     Function(FuncBody),
     /// A bare name reference.
     Name(String),

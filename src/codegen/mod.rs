@@ -132,19 +132,26 @@ pub struct JitModule {
     /// makes the same check compiled code does.
     origin: Rc<rt::ClosureOrigin>,
     pools: Rc<Pools>,
-    /// export name → its target (function or constant).
+    /// export name → its target (function or module slot).
     exports: std::collections::BTreeMap<String, ExportTarget>,
     /// function name → trampoline.
     fn_tramps: HashMap<String, TrampFn>,
-    /// constant name → trampoline.
-    const_tramps: HashMap<String, TrampFn>,
+    /// The trampoline of the module's top-level code ([`Program::init`]).
+    init_tramp: TrampFn,
+    /// Whether the top-level code has run (see [`JitModule::init`]).
+    init_state: InitState,
+    /// The module's slots, shared with each call's context.
+    globals: rt::Globals,
+    /// The bits of each `number`/`bool` slot, by slot id, filled once top-level code has run
+    /// (`RtCtx::global_bits`). Never resized, so the pointer each context holds stays valid.
+    global_bits: Box<[u64]>,
+    /// What top-level code built, frozen once it has run; handed to each call's context.
+    frozen: rt::Frozen,
     /// lifted-closure name → env-trampoline (for host [`JitModule::call_value`]).
     closure_tramps: HashMap<String, EnvTrampFn>,
     /// function name → (param reprs, return repr) — the bits-ABI contract the driver uses to
     /// encode args / decode the result without boxing scalars.
     fn_sigs: HashMap<String, (Vec<Repr>, Repr)>,
-    /// constant name → return repr (constants take no parameters).
-    const_rets: HashMap<String, Repr>,
     /// lifted-closure name → (source-param reprs excluding the env, return repr).
     closure_sigs: HashMap<String, (Vec<Repr>, Repr)>,
     /// function name → finalized native address (the direct-call fast path).
@@ -160,13 +167,23 @@ pub struct JitModule {
     /// and re-cloning the shared bindings on every invocation. Taken out for the duration of a
     /// call (so reentrant calls allocate fresh) and `reset` before reuse.
     cached_ctx: Option<RtCtx>,
-    /// Set when `host`/`memory` change, so the pooled context's resolved bindings are rebuilt
-    /// on the next call rather than every call.
+    /// Set when `host`/`memory` change, or top-level code has run, so the pooled context's
+    /// resolved bindings are rebuilt on the next call rather than every call.
     bindings_dirty: bool,
     /// The most script calls that may be active at once (`SPEC.md` §7.3).
     max_call_depth: u32,
     /// How far a loop lets the value table grow before compacting it (see `rt::COMPACT_SLACK`).
     compact_slack: u32,
+}
+
+/// Whether a module instance has run its top-level code yet (`SPEC.md` §3.1).
+enum InitState {
+    NotRun,
+    /// It is running now, or a host function panicked out of it, which leaves it to run again.
+    Running,
+    Done,
+    /// It failed; every later call reports the same error.
+    Failed(RunError),
 }
 
 impl JitModule {
@@ -195,17 +212,14 @@ impl JitModule {
         // Declare the runtime shims as imports.
         let shims = declare_shims(&mut module, call_conv, &shim_table)?;
 
-        // Declare every function and constant (typed bodies + uniform trampolines).
+        // Declare every function (typed bodies + uniform trampolines).
         let mut typed_ids: HashMap<String, FuncId> = HashMap::new();
-        let mut const_ids: HashMap<String, FuncId> = HashMap::new();
         let mut fn_tramp_ids: HashMap<String, FuncId> = HashMap::new();
-        let mut const_tramp_ids: HashMap<String, FuncId> = HashMap::new();
         // Lifted closures get an env-trampoline (not a plain one): they are never exported and
         // are reached only indirectly (in-script) or via the host `call_value` path.
         let mut closure_tramp_ids: HashMap<String, FuncId> = HashMap::new();
         // ABI signatures the driver needs to encode args / decode results at call time.
         let mut fn_sigs: HashMap<String, (Vec<Repr>, Repr)> = HashMap::new();
-        let mut const_rets: HashMap<String, Repr> = HashMap::new();
         let mut closure_sigs: HashMap<String, (Vec<Repr>, Repr)> = HashMap::new();
 
         for (name, f) in &program.functions {
@@ -233,24 +247,26 @@ impl JitModule {
                 fn_sigs.insert(name.clone(), (params, ret));
             }
         }
-        for (name, c) in &program.constants {
-            let ret = Repr::of(&c.ret);
-            let sig = typed_signature(call_conv, &[], ret);
-            let id = module
-                .declare_function(&format!("cn_{name}"), Linkage::Local, &sig)
-                .map_err(|e| JitError::Cranelift(e.to_string()))?;
-            const_ids.insert(name.clone(), id);
-
-            let tsig = trampoline_signature(call_conv, false);
-            let tid = module
-                .declare_function(&format!("ct_{name}"), Linkage::Export, &tsig)
-                .map_err(|e| JitError::Cranelift(e.to_string()))?;
-            const_tramp_ids.insert(name.clone(), tid);
-            const_rets.insert(name.clone(), ret);
-        }
+        // The module's top-level code: no parameters, no result. Its name isn't an identifier,
+        // so it can't collide with a function's.
+        let init_id = module
+            .declare_function(
+                "fn_$init",
+                Linkage::Local,
+                &typed_signature(call_conv, &[], Repr::Unit),
+            )
+            .map_err(|e| JitError::Cranelift(e.to_string()))?;
+        let init_tramp_id = module
+            .declare_function(
+                "tr_$init",
+                Linkage::Export,
+                &trampoline_signature(call_conv, false),
+            )
+            .map_err(|e| JitError::Cranelift(e.to_string()))?;
 
         // Translate every body, interning constants/names into the shared pools.
         let mut pools = Pools::default();
+        pools.globals = program.globals.iter().map(|g| g.name.clone()).collect();
         // Each closure's function type, which an indirect call checks it against.
         let mut closure_types: HashMap<String, u32> = HashMap::new();
         for (name, f) in program.functions.iter().filter(|(_, f)| f.is_closure) {
@@ -266,8 +282,6 @@ impl JitModule {
             call_conv,
             shims: &shims,
             typed_ids: &typed_ids,
-            const_ids: &const_ids,
-            const_rets: &const_rets,
         };
 
         let mut fbctx = FunctionBuilderContext::new();
@@ -282,17 +296,16 @@ impl JitModule {
                 true,
             )?;
         }
-        for (name, c) in &program.constants {
-            define_body(
-                &mut module,
-                &cx,
-                &mut pools,
-                &mut fbctx,
-                const_ids[name],
-                c,
-                false,
-            )?;
-        }
+        // Top-level code isn't a script call, so it counts no depth.
+        define_body(
+            &mut module,
+            &cx,
+            &mut pools,
+            &mut fbctx,
+            init_id,
+            &program.init,
+            false,
+        )?;
 
         // Trampolines (declared functions whose only job is arg/result marshaling).
         for (name, f) in &program.functions {
@@ -314,18 +327,15 @@ impl JitModule {
                 f.is_closure,
             )?;
         }
-        for (name, c) in &program.constants {
-            let ret = Repr::of(&c.ret);
-            define_trampoline(
-                &mut module,
-                &mut fbctx,
-                const_tramp_ids[name],
-                const_ids[name],
-                &[],
-                ret,
-                false,
-            )?;
-        }
+        define_trampoline(
+            &mut module,
+            &mut fbctx,
+            init_tramp_id,
+            init_id,
+            &[],
+            Repr::Unit,
+            false,
+        )?;
 
         module
             .finalize_definitions()
@@ -339,13 +349,10 @@ impl JitModule {
             let f: TrampFn = unsafe { std::mem::transmute::<*const u8, TrampFn>(ptr) };
             fn_tramps.insert(name.clone(), f);
         }
-        let mut const_tramps = HashMap::new();
-        for (name, &tid) in &const_tramp_ids {
-            let ptr = module.get_finalized_function(tid);
-            // SAFETY: as above.
-            let f: TrampFn = unsafe { std::mem::transmute::<*const u8, TrampFn>(ptr) };
-            const_tramps.insert(name.clone(), f);
-        }
+        // SAFETY: `init_tramp_id` was defined with `trampoline_signature`, matching `TrampFn`.
+        let init_tramp: TrampFn = unsafe {
+            std::mem::transmute::<*const u8, TrampFn>(module.get_finalized_function(init_tramp_id))
+        };
         let mut closure_tramps = HashMap::new();
         for (name, &tid) in &closure_tramp_ids {
             let ptr = module.get_finalized_function(tid);
@@ -380,10 +387,13 @@ impl JitModule {
             pools: Rc::new(pools),
             exports: program.exports.clone(),
             fn_tramps,
-            const_tramps,
+            init_tramp,
+            init_state: InitState::NotRun,
+            globals: rt::Globals::default(),
+            global_bits: vec![0; program.globals.len()].into_boxed_slice(),
+            frozen: rt::Frozen::default(),
             closure_tramps,
             fn_sigs,
-            const_rets,
             closure_sigs,
             code_addrs,
             closures: Arc::new(closures),
@@ -456,8 +466,66 @@ impl JitModule {
         self.memory.get(name).cloned()
     }
 
+    /// Run the module's top-level code, if it hasn't run yet, then freeze what it built
+    /// (`SPEC.md` §3.1). Every call does this first; a host calls it directly to run top-level
+    /// code — and see its errors — before the first call. Top-level code may call host
+    /// functions, so register those first.
+    ///
+    /// A failure is final: every later call reports it. A host function that panics leaves it
+    /// to run again from the start next time.
+    pub fn init(&mut self) -> Result<(), RunError> {
+        match &self.init_state {
+            InitState::Done => return Ok(()),
+            InitState::Failed(e) => return Err(e.clone()),
+            InitState::NotRun | InitState::Running => {}
+        }
+        self.init_state = InitState::Running;
+        *self.globals.borrow_mut() = vec![None; self.pools.globals.len()];
+        self.frozen = rt::Frozen::default();
+        self.bindings_dirty = true;
+
+        let mut ctx = self.take_ctx();
+        ctx.set_initializing(true);
+        // SAFETY: `init_tramp` has the `TrampFn` ABI and takes no arguments; `ctx` outlives the
+        // call.
+        unsafe { (self.init_tramp)(&mut ctx as *mut RtCtx, std::ptr::null(), 0) };
+        let result = match ctx.take_error() {
+            Some(e) => Err(e),
+            None => Ok(Value::Nil),
+        };
+        ctx.set_initializing(false);
+        // Resumes a host function's panic, leaving the state `Running` so the next call retries.
+        let result = self.finish(ctx, result);
+
+        match result {
+            Ok(_) => {
+                let mut frozen = std::collections::HashSet::new();
+                for (slot, v) in self.globals.borrow().iter().enumerate() {
+                    let Some(v) = v else { continue };
+                    v.collect_reachable(&mut frozen);
+                    // Only a slot whose type is a scalar is read from here, and it holds one.
+                    self.global_bits[slot] = match v {
+                        Value::Number(n) => n.to_bits(),
+                        Value::Bool(b) => *b as u64,
+                        _ => 0,
+                    };
+                }
+                self.frozen = Rc::new(frozen);
+                self.init_state = InitState::Done;
+                // The pooled context picks up the frozen set with its next rebinding.
+                self.bindings_dirty = true;
+                Ok(())
+            }
+            Err(e) => {
+                self.init_state = InitState::Failed(e.clone());
+                Err(e)
+            }
+        }
+    }
+
     /// Call an exported function by name with `args`.
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RunError> {
+        self.init()?;
         let mut ctx = self.take_ctx();
         let result = self.dispatch(&mut ctx, name, args);
         self.finish(ctx, result)
@@ -471,52 +539,49 @@ impl JitModule {
             .exports
             .get(name)
             .ok_or_else(|| RunError::UnknownExport(name.to_string()))?;
-        let (tramp, params, ret): (TrampFn, &[Repr], Repr) =
-            match target {
-                ExportTarget::Function(n) => {
-                    let (params, ret) = self
-                        .fn_sigs
-                        .get(n)
-                        .ok_or_else(|| RunError::Internal(format!("missing signature `{n}`")))?;
-                    if args.len() != params.len() {
-                        return Err(RunError::ArityMismatch {
-                            name: name.to_string(),
-                            expected: params.len(),
-                            got: args.len(),
-                        });
-                    }
-                    // Fast path: an all-`number` export is called directly at its native typed
-                    // address, skipping the trampoline hop and the argument buffer.
-                    if *ret == Repr::Number
-                        && params.len() <= MAX_DIRECT_ARGS
-                        && params.iter().all(|&r| r == Repr::Number)
-                        && let Some(&addr) = self.code_addrs.get(n)
-                    {
-                        return self.call_direct_number(ctx, addr, params.len(), &args);
-                    }
-                    let tramp = *self
-                        .fn_tramps
-                        .get(n)
-                        .ok_or_else(|| RunError::Internal(format!("missing trampoline `{n}`")))?;
-                    (tramp, params.as_slice(), *ret)
+        let (tramp, params, ret): (TrampFn, &[Repr], Repr) = match target {
+            ExportTarget::Function(n) => {
+                let (params, ret) = self
+                    .fn_sigs
+                    .get(n)
+                    .ok_or_else(|| RunError::Internal(format!("missing signature `{n}`")))?;
+                if args.len() != params.len() {
+                    return Err(RunError::ArityMismatch {
+                        name: name.to_string(),
+                        expected: params.len(),
+                        got: args.len(),
+                    });
                 }
-                ExportTarget::Const(n) => {
-                    if !args.is_empty() {
-                        return Err(RunError::ArityMismatch {
-                            name: name.to_string(),
-                            expected: 0,
-                            got: args.len(),
-                        });
-                    }
-                    let tramp = *self.const_tramps.get(n).ok_or_else(|| {
-                        RunError::Internal(format!("missing const trampoline `{n}`"))
-                    })?;
-                    let ret = *self.const_rets.get(n).ok_or_else(|| {
-                        RunError::Internal(format!("missing const signature `{n}`"))
-                    })?;
-                    (tramp, &[], ret)
+                // Fast path: an all-`number` export is called directly at its native typed
+                // address, skipping the trampoline hop and the argument buffer.
+                if *ret == Repr::Number
+                    && params.len() <= MAX_DIRECT_ARGS
+                    && params.iter().all(|&r| r == Repr::Number)
+                    && let Some(&addr) = self.code_addrs.get(n)
+                {
+                    return self.call_direct_number(ctx, addr, params.len(), &args);
                 }
-            };
+                let tramp = *self
+                    .fn_tramps
+                    .get(n)
+                    .ok_or_else(|| RunError::Internal(format!("missing trampoline `{n}`")))?;
+                (tramp, params.as_slice(), *ret)
+            }
+            // A constant or module variable is read, not called: it takes no arguments.
+            ExportTarget::Global(slot) => {
+                if !args.is_empty() {
+                    return Err(RunError::ArityMismatch {
+                        name: name.to_string(),
+                        expected: 0,
+                        got: args.len(),
+                    });
+                }
+                let v = self.globals.borrow().get(*slot as usize).cloned().flatten();
+                return v.ok_or_else(|| {
+                    crate::value::read_before_init(&self.pools.globals[*slot as usize])
+                });
+            }
+        };
 
         let argv = encode_args(ctx, params, args)?;
         let argv = argv.as_slice();
@@ -599,6 +664,7 @@ impl JitModule {
     /// closure after its module is dropped stays sound (it keeps the code mapped); it simply
     /// can no longer be invoked.
     pub fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RunError> {
+        self.init()?;
         let code = match &callee {
             Value::Closure(c) => {
                 if rt::closure_module_id(c) != Some(self.origin.module_id) {
@@ -691,14 +757,18 @@ impl JitModule {
     /// Build a fresh per-invocation [`RtCtx`], resolving host/memory bindings into pool-id
     /// order and threading the indirect-call address table plus this module's closure origin.
     fn make_ctx(&self) -> RtCtx {
-        RtCtx::new(
+        let mut ctx = RtCtx::new(
             self.pools.clone(),
             self.resolve_host(),
             self.resolve_methods(),
             self.resolve_memory(),
             self.closures.clone(),
             self.origin.clone(),
-        )
+            self.globals.clone(),
+        );
+        ctx.set_frozen(self.frozen.clone());
+        ctx.set_global_bits(self.global_bits.as_ptr());
+        ctx
     }
 
     /// Obtain a ready-to-use context for one invocation: reuse the pooled one (rebuilding its
@@ -713,6 +783,8 @@ impl JitModule {
                     let methods = self.resolve_methods();
                     let memory = self.resolve_memory();
                     ctx.rebind(host, methods, memory);
+                    ctx.set_frozen(self.frozen.clone());
+                    ctx.set_global_bits(self.global_bits.as_ptr());
                 }
                 ctx.reset();
                 ctx

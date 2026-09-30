@@ -1,0 +1,9 @@
+---
+source: tests/snapshots.rs
+expression: "analyze_diag(\"local ready = true\\nif ready then\\n  return\\nend\")"
+---
+error[E0309]: top-level code cannot `return`; the only top-level `return` is a module's trailing export table
+  --> 3:3
+   |
+  3|   return
+   |   ^^^^^^

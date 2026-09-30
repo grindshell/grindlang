@@ -1,0 +1,9 @@
+---
+source: tests/snapshots.rs
+expression: "analyze_diag(\"local count = 0\\nfunction bump()\\n  count = count + 1\\nend\")"
+---
+error[E0308]: cannot assign to module variable `count` in a function: only top-level code sets module variables, and they are frozen once the module has initialized. Use host memory (`SPEC.md` §7) for state that changes between calls.
+  --> 3:3
+   |
+  3|   count = count + 1
+   |   ^^^^^

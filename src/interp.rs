@@ -56,6 +56,23 @@ pub struct Func {
     captured: Frame,
 }
 
+impl Func {
+    /// Collect the addresses of the slots this closure captured and of everything reachable from
+    /// their values — [`Value::collect_reachable`] for a closure, which can write its slots.
+    pub(crate) fn collect_reachable(&self, out: &mut std::collections::HashSet<usize>) {
+        for slot in self.captured.values() {
+            if out.insert(slot_addr(slot)) {
+                slot.borrow().collect_reachable(out);
+            }
+        }
+    }
+}
+
+/// A slot's address, for the frozen set.
+fn slot_addr(slot: &Slot) -> usize {
+    Rc::as_ptr(slot) as *const () as usize
+}
+
 /// A single variable's storage: a shared, mutable cell.
 ///
 /// Closures capture the individual slots of their free variables, *not* the frames those
@@ -89,11 +106,20 @@ enum Flow {
 /// What an exported name refers to.
 #[derive(Clone)]
 enum Export {
-    /// A fixed value: a top-level function, or an export-table entry evaluated at construction.
+    /// A top-level function.
     Value(Value),
-    /// A top-level constant, held by *name* rather than pre-evaluated so that reading it goes
-    /// through the per-call cache and sees the same value an in-script reference does.
-    Const(String),
+    /// A constant or module variable, by module slot: read, not called.
+    Global(u32),
+}
+
+/// Whether a module instance has run its top-level code yet (`SPEC.md` §3.1).
+enum InitState {
+    NotRun,
+    /// It is running now. Only a function top-level code calls can observe this.
+    Running,
+    Done,
+    /// It failed; every later call reports the same error.
+    Failed(RunError),
 }
 
 /// The reference interpreter for one resolved module.
@@ -101,18 +127,17 @@ pub struct Interpreter<'a> {
     res: &'a Resolution,
     /// Top-level function declarations, by declared name.
     funcs: HashMap<String, Value>,
-    /// Top-level constant declarations, evaluated on demand into [`consts`](Self::consts).
-    const_exprs: HashMap<String, Expr>,
-    /// Constants evaluated during the current call, cleared when a new top-level call starts.
-    /// Memoizing per call keeps a constant equal to itself within one invocation (reference
-    /// values compare by identity) without letting it survive between calls, which `SPEC.md`
-    /// §1 reserves for host memory.
-    consts: HashMap<String, Value>,
-    /// Allocations reachable from the constants read so far this call, which may not be written
-    /// to (`SPEC.md` §3). Cleared alongside [`consts`](Self::consts).
+    /// The module's top-level code: its constants and statements, in order. Shared rather than
+    /// taken while it runs, so a host function panicking out of it can't lose it.
+    chunk: Rc<Vec<TopDecl>>,
+    /// The module slots, by slot id: `None` until top-level code sets one.
+    globals: Vec<Option<Value>>,
+    init: InitState,
+    /// Allocations reachable from the module slots once top-level code has run, which may not
+    /// be written to (`SPEC.md` §3.1). Empty until then.
     frozen: std::collections::HashSet<usize>,
     /// The public surface callable via [`Interpreter::call`] — the curated export table if
-    /// present, otherwise every top-level declaration.
+    /// present, otherwise every top-level declaration `local` doesn't make private.
     exports: HashMap<String, Export>,
     /// Host-registered native functions, by name.
     host: HashMap<String, Value>,
@@ -130,14 +155,15 @@ pub struct Interpreter<'a> {
 }
 
 impl<'a> Interpreter<'a> {
-    /// Build an interpreter for a resolved module. Evaluates top-level constants and the
-    /// export table eagerly.
+    /// Build an interpreter for a resolved module. Its top-level code runs later, before the
+    /// first call (or at [`init`](Self::init)), once the host has registered its functions.
     pub fn new(module: &Module, res: &'a Resolution) -> Result<Self, RunError> {
         let mut me = Interpreter {
             res,
             funcs: HashMap::new(),
-            const_exprs: HashMap::new(),
-            consts: HashMap::new(),
+            chunk: Rc::new(Vec::new()),
+            globals: Vec::new(),
+            init: InitState::NotRun,
             frozen: std::collections::HashSet::new(),
             exports: HashMap::new(),
             host: HashMap::new(),
@@ -147,82 +173,161 @@ impl<'a> Interpreter<'a> {
             depth: 0,
             max_call_depth: DEFAULT_MAX_CALL_DEPTH,
         };
-        me.init(module)?;
+        me.build(module)?;
         Ok(me)
     }
 
-    fn init(&mut self, module: &Module) -> Result<(), RunError> {
-        // Top-level functions: closures over nothing (all free names are global).
+    fn build(&mut self, module: &Module) -> Result<(), RunError> {
+        // Top-level functions: closures over nothing (a module variable is read from its slot).
+        let mut chunk = Vec::new();
         for decl in &module.decls {
-            if let TopDecl::Function(f) = decl {
-                let func = Func {
-                    params: self.param_ids(&f.body),
-                    body: Rc::new(f.body.clone()),
-                    captured: Frame::new(),
-                };
-                self.funcs
-                    .insert(f.name.node.clone(), Value::Function(Rc::new(func)));
+            match decl {
+                TopDecl::Function(f) => {
+                    let func = Func {
+                        params: self.param_ids(&f.body),
+                        body: Rc::new(f.body.clone()),
+                        captured: Frame::new(),
+                    };
+                    self.funcs
+                        .insert(f.name.node.clone(), Value::Function(Rc::new(func)));
+                }
+                TopDecl::Const(_) | TopDecl::Stat(_) => chunk.push(decl.clone()),
             }
         }
+        self.chunk = Rc::new(chunk);
 
-        // Top-level constants are *not* evaluated here: they are memoized per call, so their
-        // bodies are kept and evaluated on first use within an invocation.
-        for decl in &module.decls {
-            if let TopDecl::Const(c) = decl {
-                self.const_exprs
-                    .insert(c.name.node.clone(), c.value.clone());
-            }
-        }
-
-        // Exports.
-        self.env = vec![new_frame()];
+        let slot = |name: &str| {
+            self.res
+                .global_slot(name)
+                .ok_or_else(|| RunError::Internal(format!("no module slot for `{name}`")))
+        };
+        let mut exports = HashMap::new();
         if let Some(export) = &module.export {
             for field in &export.node {
                 if let Field::Named { name, value } = field {
-                    // A curated entry naming a constant stays a *reference* to it, so reading
-                    // the export goes through the per-call cache like any other read.
+                    // The checker (`E0411`) only admits a bare name of a top-level function,
+                    // constant, or `local`.
                     let export = match self.res.binding(value.span) {
-                        Some(Binding::TopConst(n)) => Export::Const(n.clone()),
-                        _ => Export::Value(self.eval_expr(value)?),
+                        Some(Binding::TopFunction(n)) => Export::Value(self.funcs[n].clone()),
+                        Some(b) => Export::Global(self.res.slot_of(b).ok_or_else(|| {
+                            RunError::Internal("export entry has no slot".into())
+                        })?),
+                        None => return Err(RunError::Internal("unresolved export".into())),
                     };
-                    self.exports.insert(name.node.clone(), export);
+                    exports.insert(name.node.clone(), export);
                 }
             }
         } else {
-            for k in self.funcs.keys() {
-                self.exports
-                    .insert(k.clone(), Export::Value(self.funcs[k].clone()));
-            }
-            for k in self.const_exprs.keys() {
-                self.exports.insert(k.clone(), Export::Const(k.clone()));
+            for decl in &module.decls {
+                match decl {
+                    TopDecl::Function(f) if !f.local => {
+                        let v = self.funcs[&f.name.node].clone();
+                        exports.insert(f.name.node.clone(), Export::Value(v));
+                    }
+                    TopDecl::Const(c) => {
+                        exports.insert(c.name.node.clone(), Export::Global(slot(&c.name.node)?));
+                    }
+                    TopDecl::Function(_) | TopDecl::Stat(_) => {}
+                }
             }
         }
-
-        self.env.clear();
+        self.exports = exports;
         Ok(())
     }
 
-    /// The value of top-level constant `name` for the current call, evaluating it on first use.
+    /// Run the module's top-level code, if it hasn't run yet, then freeze what it built
+    /// (`SPEC.md` §3.1). Every call does this first; a host calls it directly to run top-level
+    /// code — and see its errors — before the first call.
     ///
-    /// A `constexpr` references no names (the resolver's `E0303` rule), so an empty environment
-    /// is enough — and evaluating in one keeps a constant independent of wherever it is read.
-    fn const_value(&mut self, name: &str) -> Result<Value, RunError> {
-        if let Some(v) = self.consts.get(name) {
-            return Ok(v.clone());
+    /// A failure is final: every later call reports it. A host function that panics leaves it
+    /// to run again from the start next time.
+    pub fn init(&mut self) -> Result<(), RunError> {
+        match &self.init {
+            InitState::Done => return Ok(()),
+            InitState::Failed(e) => return Err(e.clone()),
+            InitState::NotRun | InitState::Running => {}
         }
-        let expr = self
-            .const_exprs
-            .get(name)
-            .cloned()
-            .ok_or_else(|| RunError::Internal(format!("missing const `{name}`")))?;
-        let saved = std::mem::replace(&mut self.env, vec![new_frame()]);
-        let evaluated = self.eval_expr(&expr);
-        self.env = saved;
-        let v = evaluated?;
-        // Everything inside the constant becomes unwritable for the rest of the call.
-        v.collect_reachable(&mut self.frozen);
-        self.consts.insert(name.to_string(), v.clone());
-        Ok(v)
+        self.init = InitState::Running;
+        self.globals = vec![None; self.res.globals.len()];
+        self.frozen.clear();
+        self.depth = 0;
+        // Top-level code runs in a frame of its own, which holds the locals of its blocks.
+        self.env = vec![new_frame()];
+        let chunk = Rc::clone(&self.chunk);
+        let result = self.run_chunk(&chunk);
+        self.env.clear();
+        match result {
+            Ok(()) => {
+                let mut frozen = std::collections::HashSet::new();
+                for v in self.globals.iter().flatten() {
+                    v.collect_reachable(&mut frozen);
+                }
+                self.frozen = frozen;
+                self.init = InitState::Done;
+                Ok(())
+            }
+            Err(e) => {
+                self.init = InitState::Failed(e.clone());
+                Err(e)
+            }
+        }
+    }
+
+    fn run_chunk(&mut self, chunk: &[TopDecl]) -> Result<(), RunError> {
+        for decl in chunk {
+            match decl {
+                TopDecl::Const(c) => {
+                    let v = self.eval_expr(&c.value)?;
+                    self.set_global(&Binding::TopConst(c.name.node.clone()), v)?;
+                }
+                TopDecl::Stat(stat) => match &stat.kind {
+                    StatKind::Local { names, exprs } => {
+                        let values = self.eval_rhs(exprs)?;
+                        for (i, name) in names.iter().enumerate() {
+                            let v = values.get(i).cloned().unwrap_or(Value::Nil);
+                            let id = self.res.def(name.span).ok_or_else(|| {
+                                RunError::Internal(format!("no symbol id for `{}`", name.node))
+                            })?;
+                            self.set_global(&Binding::Module(id), v)?;
+                        }
+                    }
+                    // Top-level code can't `return` or `break` out of itself (the resolver's
+                    // `E0309` and `E0306`), so the flow is always `Normal`.
+                    _ => {
+                        self.exec_stat(stat)?;
+                    }
+                },
+                TopDecl::Function(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn initializing(&self) -> bool {
+        matches!(self.init, InitState::Running)
+    }
+
+    /// The module slot a constant or module-variable binding refers to.
+    fn slot(&self, binding: &Binding) -> Result<usize, RunError> {
+        self.res
+            .slot_of(binding)
+            .map(|s| s as usize)
+            .ok_or_else(|| RunError::Internal(format!("no module slot for {binding:?}")))
+    }
+
+    /// The value in module slot `slot`, or the read-before-init error if top-level code hasn't
+    /// set it yet.
+    fn global(&self, slot: usize) -> Result<Value, RunError> {
+        match self.globals.get(slot) {
+            Some(Some(v)) => Ok(v.clone()),
+            _ => Err(crate::value::read_before_init(&self.res.globals[slot])),
+        }
+    }
+
+    fn set_global(&mut self, binding: &Binding, v: Value) -> Result<(), RunError> {
+        let slot = self.slot(binding)?;
+        self.globals[slot] = Some(v);
+        Ok(())
     }
 
     /// Register a host function callable from scripts under `name`.
@@ -267,42 +372,35 @@ impl<'a> Interpreter<'a> {
     /// exported constant through this entry point failed with "attempted to call a table
     /// value" while the other two backends returned it.
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RunError> {
+        self.begin_call()?;
         let export = self
             .exports
             .get(name)
             .cloned()
             .ok_or_else(|| RunError::UnknownExport(name.to_string()))?;
         Self::check_arity(name, Self::export_arity(&export), args.len())?;
-        self.begin_call();
         match export {
-            Export::Const(n) => self.const_value(&n),
-            Export::Value(v) if matches!(v, Value::Function(_) | Value::Native(_)) => {
-                self.call_value(&v, args)
-            }
-            Export::Value(v) => Ok(v),
+            Export::Global(slot) => self.global(slot as usize),
+            Export::Value(v) => self.call_value(&v, args),
         }
     }
 
-    /// Start a top-level invocation: drop the previous call's memoized constants so this one
-    /// re-evaluates what it reads (`SPEC.md` §1 — only host memory survives between calls).
-    ///
-    /// Also start with no calls active. A call normally leaves none behind, but one a host
-    /// function panicked out of never unwound its depth count or environment, and the host may
-    /// have caught that panic and kept using this interpreter.
-    fn begin_call(&mut self) {
-        self.consts.clear();
-        self.frozen.clear();
+    /// Start a top-level invocation — after running top-level code, if it hasn't run — with no
+    /// calls active. A call normally leaves none behind, but one a host function panicked out of
+    /// never unwound its depth count or environment, and the host may have caught that panic and
+    /// kept using this interpreter.
+    fn begin_call(&mut self) -> Result<(), RunError> {
+        self.init()?;
         self.depth = 0;
         self.env.clear();
+        Ok(())
     }
 
-    /// How many arguments an export accepts, or `None` when there is no declared arity to check
-    /// (a host function reached through the export table — the host owns its own signature).
-    /// A constant, or any other plain value, is *read* rather than called, so it takes none.
+    /// How many arguments an export accepts. A constant or module variable is *read* rather
+    /// than called, so it takes none.
     fn export_arity(export: &Export) -> Option<usize> {
         match export {
             Export::Value(Value::Function(f)) => Some(f.params.len()),
-            Export::Value(Value::Native(_)) => None,
             _ => Some(0),
         }
     }
@@ -337,7 +435,7 @@ impl<'a> Interpreter<'a> {
             _ => None,
         };
         Self::check_arity("closure", arity, args.len())?;
-        self.begin_call();
+        self.begin_call()?;
         self.call_value(&callee, args)
     }
 
@@ -628,6 +726,12 @@ impl<'a> Interpreter<'a> {
 
         for frame in self.env.iter().rev() {
             if let Some(slot) = frame.get(&id) {
+                // A closure kept in a module value can't change what it captured.
+                if !self.frozen.is_empty() && self.frozen.contains(&slot_addr(slot)) {
+                    return Err(RunError::Runtime(
+                        crate::value::FROZEN_MODULE_VALUE.to_string(),
+                    ));
+                }
                 *slot.borrow_mut() = value;
                 return Ok(());
             }
@@ -672,12 +776,12 @@ impl<'a> Interpreter<'a> {
 
     // ---- assignment targets --------------------------------------------------
 
-    /// Refuse a write to a value that is (part of) a constant. `E0307` rejects the syntactic
-    /// form at check time; this catches the same write reached through an alias.
+    /// Refuse a write to a value that is (part of) a frozen module value. `E0307` rejects the
+    /// syntactic form at check time; this catches the same write reached through an alias.
     fn reject_frozen(&self, base: &Value) -> Result<(), RunError> {
         if base.is_frozen(&self.frozen) {
             return Err(RunError::Runtime(
-                crate::value::IMMUTABLE_CONSTANT.to_string(),
+                crate::value::FROZEN_MODULE_VALUE.to_string(),
             ));
         }
         Ok(())
@@ -685,7 +789,14 @@ impl<'a> Interpreter<'a> {
 
     fn assign_to(&mut self, target: &Expr, value: Value) -> Result<(), RunError> {
         match &target.kind {
-            ExprKind::Name(_) => self.assign_symbol(target.span, value),
+            ExprKind::Name(_) => {
+                let res = self.res;
+                match res.binding(target.span) {
+                    // Only top-level code assigns a module variable (the resolver's `E0308`).
+                    Some(b @ Binding::Module(_)) => self.set_global(b, value),
+                    _ => self.assign_symbol(target.span, value),
+                }
+            }
             ExprKind::Field { base, name } => {
                 let base_v = self.eval_expr(base)?;
                 self.reject_frozen(&base_v)?;
@@ -793,13 +904,11 @@ impl<'a> Interpreter<'a> {
                 .get(n)
                 .cloned()
                 .ok_or_else(|| RunError::Internal(format!("missing function `{n}`"))),
-            Binding::TopConst(n) => {
-                let n = n.clone();
-                self.const_value(&n)
-            }
+            Binding::TopConst(_) | Binding::Module(_) => self.global(self.slot(binding)?),
             Binding::HostFunction(n) => self.host.get(n).cloned().ok_or_else(|| {
                 RunError::Runtime(format!("host function `{n}` was not registered"))
             }),
+            Binding::Memory(n) if self.initializing() => Err(crate::value::memory_during_init(n)),
             Binding::Memory(n) => self
                 .memory
                 .get(n)

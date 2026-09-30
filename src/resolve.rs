@@ -1,20 +1,26 @@
 //! Resolver: name binding + the deeper constraint rules (`PLAN.md` Phase 2).
 //!
-//! The parser already enforced the *structural* contract (no top-level locals, no
-//! `repeat`/varargs/goto, generic-`for` iterators restricted, assignable targets). The
-//! resolver enforces the rules that need a symbol table:
+//! The parser already enforced the *structural* contract (no `repeat`/varargs/goto,
+//! generic-`for` iterators restricted, assignable targets). The resolver enforces the rules
+//! that need a symbol table:
 //!
 //!   * **No free globals.** Every name must resolve to a local/param/loop-var, a captured
-//!     upvalue, another top-level declaration, a builtin, a host-registered function, or
-//!     the host memory binding. Anything else is an error — there is no ambient global
-//!     namespace (this is also how the "no ambient stdlib / determinism" rule is enforced,
-//!     SPEC §1, §6, §7).
+//!     upvalue, a module variable, another top-level declaration, a builtin, a
+//!     host-registered function, or the host memory binding. Anything else is an error —
+//!     there is no ambient global namespace (this is also how the "no ambient stdlib /
+//!     determinism" rule is enforced, SPEC §1, §6, §7).
+//!   * **Lua scoping at the top level** (SPEC §3.1). A `function` or constant is in scope
+//!     everywhere; a top-level `local` or `local function` only from its declaration on,
+//!     including inside the functions declared after it.
 //!   * **Immutable bindings.** Top-level functions/constants, builtins, host functions, and
 //!     the memory handle itself cannot be assigned to. (`mem.field = …` is fine — that's a
 //!     field write, not a rebind.)
-//!   * **Constant expressions.** A top-level `name = <expr>` RHS must be compile-time
-//!     constant: literals, table constructors of constants, and operators over them. No
-//!     names, calls, or indexing (SPEC §3.1).
+//!   * **Only top-level code changes module values.** A module variable is assigned, and a
+//!     module value written through, only by top-level code; a function body that tries is
+//!     rejected (`E0308`, `E0307`), since by the time a call runs the module has initialized
+//!     and frozen them.
+//!   * **Top-level code** may not `return` (`E0309`) or touch host memory (`E0310`), which
+//!     isn't bound until after the module initializes.
 //!   * **`break` only inside a loop.**
 //!   * **No shadowing reserved names** by a top-level declaration (SPEC §7).
 //!   * **Duplicate top-level declarations** are rejected.
@@ -26,7 +32,7 @@
 //! Unlike the parser, the resolver does **not** bail on the first error — it collects as
 //! many diagnostics as it can in one pass.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, Diagnostics, Span};
@@ -65,6 +71,8 @@ pub enum SymbolKind {
     Param,
     Local,
     LoopVar,
+    /// A top-level `local`: a module variable, kept in a module slot rather than a frame.
+    Module,
 }
 
 /// A definition of an in-function symbol.
@@ -84,7 +92,10 @@ pub enum Binding {
     Local(SymbolId),
     /// A symbol captured from an enclosing function (closure upvalue).
     Upvalue(SymbolId),
-    /// A top-level function declaration.
+    /// A top-level `local` — a module variable. Read and written through its module slot, never
+    /// captured: every function that can see it reads the slot directly.
+    Module(SymbolId),
+    /// A top-level function declaration (a `function` or a top-level `local function`).
     TopFunction(String),
     /// A top-level constant declaration.
     TopConst(String),
@@ -107,6 +118,11 @@ pub struct Resolution {
     pub defs: HashMap<Span, SymbolId>,
     /// All in-function symbol definitions, indexed by [`SymbolId`].
     pub symbols: Vec<SymbolInfo>,
+    /// The module's **slots**, in the order top-level code sets them: one for each constant
+    /// and each top-level `local`. A module instance keeps each value its top-level code
+    /// builds in the slot of the name it is bound to (`SPEC.md` §3.1). Top-level names are
+    /// unique, so a slot is identified by its name.
+    pub globals: Vec<String>,
 }
 
 impl Resolution {
@@ -118,6 +134,24 @@ impl Resolution {
     /// Look up the [`SymbolId`] introduced at the definition site `span`.
     pub fn def(&self, span: Span) -> Option<SymbolId> {
         self.defs.get(&span).copied()
+    }
+
+    /// The slot of the constant or module variable named `name`.
+    pub fn global_slot(&self, name: &str) -> Option<u32> {
+        self.globals
+            .iter()
+            .position(|g| g == name)
+            .map(|i| i as u32)
+    }
+
+    /// The slot a [`Binding::Module`] or [`Binding::TopConst`] refers to; `None` for any other
+    /// binding.
+    pub fn slot_of(&self, binding: &Binding) -> Option<u32> {
+        match binding {
+            Binding::Module(id) => self.global_slot(&self.symbols[*id as usize].name),
+            Binding::TopConst(name) => self.global_slot(name),
+            _ => None,
+        }
     }
 }
 
@@ -134,6 +168,7 @@ pub fn resolve(module: &Module, cfg: &ResolveConfig) -> Result<Resolution, Diagn
             bindings: r.bindings,
             defs: r.defs,
             symbols: r.symbols,
+            globals: r.globals,
         })
     }
 }
@@ -156,8 +191,16 @@ struct FuncScope {
 
 struct Resolver<'a> {
     cfg: &'a ResolveConfig,
+    /// The top-level functions in scope: every `function`, plus each `local function` once its
+    /// declaration is reached.
     top_funcs: HashMap<String, Span>,
     top_consts: HashMap<String, Span>,
+    /// The module variables (top-level `local`s) declared so far.
+    module_scope: HashMap<String, SymbolId>,
+    globals: Vec<String>,
+    /// Whether the code being resolved is top-level code itself, rather than a function body
+    /// (including a function literal written in top-level code).
+    in_chunk: bool,
     func_stack: Vec<FuncScope>,
     symbols: Vec<SymbolInfo>,
     bindings: HashMap<Span, Binding>,
@@ -172,6 +215,9 @@ impl<'a> Resolver<'a> {
             cfg,
             top_funcs: HashMap::new(),
             top_consts: HashMap::new(),
+            module_scope: HashMap::new(),
+            globals: Vec::new(),
+            in_chunk: false,
             func_stack: Vec::new(),
             symbols: Vec::new(),
             bindings: HashMap::new(),
@@ -188,49 +234,85 @@ impl<'a> Resolver<'a> {
     // ---- top level -----------------------------------------------------------
 
     fn resolve_module(&mut self, module: &Module) {
-        // Pass 1: collect every top-level name so functions are mutually in scope, while
-        // rejecting duplicates and reserved-name shadowing.
+        // Pass 1: check every top-level name for duplicates and reserved-name shadowing, and
+        // bring the ones in scope everywhere — functions and constants — into scope, so
+        // functions are mutually in scope.
+        let mut seen: HashSet<&str> = HashSet::new();
         for decl in &module.decls {
-            let (name, span) = match decl {
-                TopDecl::Function(f) => (&f.name.node, f.name.span),
-                TopDecl::Const(c) => (&c.name.node, c.name.span),
+            let names: Vec<&Ident> = match decl {
+                TopDecl::Function(f) => vec![&f.name],
+                TopDecl::Const(c) => vec![&c.name],
+                TopDecl::Stat(stat) => match &stat.kind {
+                    StatKind::Local { names, .. } => names.iter().collect(),
+                    _ => Vec::new(),
+                },
             };
-
-            if let Some(reason) = self.reserved_reason(name) {
-                self.error(
-                    "E0304",
-                    format!("top-level declaration `{name}` shadows {reason}"),
-                    span,
-                );
-                // Still register it below so uses don't also cascade into free-global errors.
+            for ident in names {
+                let (name, span) = (&ident.node, ident.span);
+                if let Some(reason) = self.reserved_reason(name) {
+                    self.error(
+                        "E0304",
+                        format!("top-level declaration `{name}` shadows {reason}"),
+                        span,
+                    );
+                    // Still register it so uses don't also cascade into free-global errors.
+                }
+                if !seen.insert(name) {
+                    self.error(
+                        "E0305",
+                        format!("duplicate top-level declaration `{name}`"),
+                        span,
+                    );
+                }
             }
-
-            let dup = self.top_funcs.contains_key(name) || self.top_consts.contains_key(name);
-            if dup {
-                self.error(
-                    "E0305",
-                    format!("duplicate top-level declaration `{name}`"),
-                    span,
-                );
-            }
-
             match decl {
-                TopDecl::Function(_) => {
-                    self.top_funcs.insert(name.clone(), span);
+                TopDecl::Function(f) if !f.local => {
+                    self.top_funcs.insert(f.name.node.clone(), f.name.span);
                 }
-                TopDecl::Const(_) => {
-                    self.top_consts.insert(name.clone(), span);
+                TopDecl::Const(c) => {
+                    self.top_consts.insert(c.name.node.clone(), c.name.span);
                 }
+                _ => {}
             }
         }
 
-        // Pass 2: validate const RHSs and resolve function bodies.
+        // Pass 2: resolve every item in order, so a top-level `local` is in scope from its
+        // declaration on. Top-level code runs in one function scope of its own: the locals of
+        // its nested blocks are that scope's, and a function literal in it captures them.
+        self.in_chunk = true;
+        self.enter_function();
         for decl in &module.decls {
             match decl {
-                TopDecl::Const(c) => self.check_const_expr(&c.value),
-                TopDecl::Function(f) => self.resolve_func_body(&f.body),
+                TopDecl::Function(f) => {
+                    if f.local {
+                        self.top_funcs.insert(f.name.node.clone(), f.name.span);
+                    }
+                    // A declared function is outermost: it captures nothing from top-level code
+                    // (a module variable is read through its slot, not captured).
+                    let chunk = std::mem::take(&mut self.func_stack);
+                    self.resolve_func_body(&f.body);
+                    self.func_stack = chunk;
+                }
+                TopDecl::Const(c) => {
+                    self.resolve_expr(&c.value);
+                    self.globals.push(c.name.node.clone());
+                }
+                TopDecl::Stat(stat) => match &stat.kind {
+                    StatKind::Local { names, exprs } => {
+                        // Initializers see the scope before the new variables.
+                        for e in exprs {
+                            self.resolve_expr(e);
+                        }
+                        for n in names {
+                            self.declare_module_var(n);
+                        }
+                    }
+                    _ => self.resolve_stat(stat),
+                },
             }
         }
+        self.exit_function();
+        self.in_chunk = false;
 
         // Pass 3: the curated export table references top-level names.
         if let Some(export) = &module.export {
@@ -238,6 +320,20 @@ impl<'a> Resolver<'a> {
                 self.resolve_export_field(field);
             }
         }
+    }
+
+    /// Declare a top-level `local`: a module variable, with a slot of its own.
+    fn declare_module_var(&mut self, name: &Ident) {
+        let id = self.symbols.len() as SymbolId;
+        self.symbols.push(SymbolInfo {
+            name: name.node.clone(),
+            def_span: name.span,
+            kind: SymbolKind::Module,
+            func_depth: 0,
+        });
+        self.defs.insert(name.span, id);
+        self.module_scope.insert(name.node.clone(), id);
+        self.globals.push(name.node.clone());
     }
 
     /// Why `name` is reserved (for the shadowing diagnostic), or `None`.
@@ -260,42 +356,6 @@ impl<'a> Resolver<'a> {
             Field::Keyed { key, value } => {
                 self.resolve_expr(key);
                 self.resolve_expr(value);
-            }
-        }
-    }
-
-    // ---- constant expressions ------------------------------------------------
-
-    /// Validate that a top-level constant initializer is compile-time constant.
-    fn check_const_expr(&mut self, expr: &Expr) {
-        match &expr.kind {
-            ExprKind::Nil | ExprKind::Bool(_) | ExprKind::Number(_) | ExprKind::Str(_) => {}
-            ExprKind::Paren(inner) => self.check_const_expr(inner),
-            ExprKind::Unary { operand, .. } => self.check_const_expr(operand),
-            ExprKind::Binary { lhs, rhs, .. } => {
-                self.check_const_expr(lhs);
-                self.check_const_expr(rhs);
-            }
-            ExprKind::Table(fields) => {
-                for field in fields {
-                    match field {
-                        Field::Positional(e) => self.check_const_expr(e),
-                        Field::Named { value, .. } => self.check_const_expr(value),
-                        Field::Keyed { key, value } => {
-                            self.check_const_expr(key);
-                            self.check_const_expr(value);
-                        }
-                    }
-                }
-            }
-            _ => {
-                self.error(
-                    "E0303",
-                    "constant declarations may only contain literal values, table \
-                     constructors of constants, and operators over them; names, calls, \
-                     and indexing are not allowed",
-                    expr.span,
-                );
             }
         }
     }
@@ -364,6 +424,9 @@ impl<'a> Resolver<'a> {
                 }
             }
         }
+        if let Some(&id) = self.module_scope.get(name) {
+            return Some(Binding::Module(id));
+        }
         if self.top_funcs.contains_key(name) {
             return Some(Binding::TopFunction(name.to_string()));
         }
@@ -384,6 +447,14 @@ impl<'a> Resolver<'a> {
 
     fn resolve_name(&mut self, name: &str, span: Span) {
         match self.lookup(name) {
+            Some(Binding::Memory(m)) if self.in_chunk => self.error(
+                "E0310",
+                format!(
+                    "top-level code cannot use host memory `{m}`: it runs once, when the module \
+                     initializes, before any memory is bound. Read memory inside a function."
+                ),
+                span,
+            ),
             Some(b) => {
                 self.bindings.insert(span, b);
             }
@@ -410,7 +481,11 @@ impl<'a> Resolver<'a> {
         // `break` cannot cross a function boundary.
         let saved_loop_depth = self.loop_depth;
         self.loop_depth = 0;
+        // A function body is not top-level code, even when written in top-level code: it runs
+        // when called, which may be after the module has initialized.
+        let saved_in_chunk = std::mem::replace(&mut self.in_chunk, false);
         self.resolve_stats(&body.block);
+        self.in_chunk = saved_in_chunk;
         self.loop_depth = saved_loop_depth;
         self.exit_function();
     }
@@ -428,6 +503,14 @@ impl<'a> Resolver<'a> {
             self.resolve_stat(stat);
         }
         if let Some(ret) = &block.ret {
+            if self.in_chunk {
+                self.error(
+                    "E0309",
+                    "top-level code cannot `return`; the only top-level `return` is a \
+                     module's trailing export table",
+                    ret.span,
+                );
+            }
             for e in &ret.exprs {
                 self.resolve_expr(e);
             }
@@ -534,6 +617,27 @@ impl<'a> Resolver<'a> {
                 Some(b @ (Binding::Local(_) | Binding::Upvalue(_))) => {
                     self.bindings.insert(expr.span, b);
                 }
+                Some(b @ Binding::Module(_)) if self.in_chunk => {
+                    self.bindings.insert(expr.span, b);
+                }
+                Some(Binding::Module(_)) => self.error(
+                    "E0308",
+                    format!(
+                        "cannot assign to module variable `{n}` in a function: only top-level \
+                         code sets module variables, and they are frozen once the module has \
+                         initialized. Use host memory (`SPEC.md` §7) for state that changes \
+                         between calls."
+                    ),
+                    expr.span,
+                ),
+                Some(Binding::Memory(m)) if self.in_chunk => self.error(
+                    "E0310",
+                    format!(
+                        "top-level code cannot use host memory `{m}`: it runs once, when the \
+                         module initializes, before any memory is bound"
+                    ),
+                    expr.span,
+                ),
                 Some(_) => self.error(
                     "E0302",
                     format!(
@@ -570,30 +674,36 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// Reject a write *through* a top-level constant (`C.x = …`, `C.a[1] = …`).
+    /// Reject a write *through* a module value (`C.x = …`, `C.a[1] = …`) in a function body.
     ///
-    /// A `constdecl` is an immutable binding (`SPEC.md` §3), which the `Name` arm above already
-    /// enforces against rebinding. Writing through one is the same promise one level down: a
-    /// constant is a compile-time value, so mutating it would be module-level state surviving
-    /// between calls, which §1 reserves for host memory alone.
+    /// What top-level code builds is frozen once the module has initialized (`SPEC.md` §3.1),
+    /// and a function only ever runs after that — so the write would fail every time. Mutating
+    /// it would be module-level state surviving between calls, which §1 reserves for host memory
+    /// alone. Top-level code itself may write through module values: it is what builds them.
     ///
     /// Field writes through **memory** stay legal — that is the whole point of memory (§7) —
     /// so this checks the root binding rather than blanket-rejecting field targets.
     fn reject_const_write(&mut self, target: &Expr) {
+        if self.in_chunk {
+            return;
+        }
         let Some(root) = Self::root_name(target) else {
             return;
         };
-        if matches!(self.lookup(root), Some(Binding::TopConst(_))) {
-            self.error(
-                "E0307",
-                format!(
-                    "cannot assign through `{root}`: it is a top-level constant, and constants \
-                     are immutable all the way down. Use host memory (`SPEC.md` §7) for state \
-                     that changes between calls."
-                ),
-                target.span,
-            );
-        }
+        let what = match self.lookup(root) {
+            Some(Binding::TopConst(_)) => "a top-level constant",
+            Some(Binding::Module(_)) => "a module variable",
+            _ => return,
+        };
+        self.error(
+            "E0307",
+            format!(
+                "cannot assign through `{root}` in a function: it is {what}, and what top-level \
+                 code builds is frozen once the module has initialized. Use host memory \
+                 (`SPEC.md` §7) for state that changes between calls."
+            ),
+            target.span,
+        );
     }
 
     // ---- expressions ---------------------------------------------------------
@@ -800,13 +910,132 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_constant_const_rhs_name() {
-        assert_eq!(err_code("A = 1\nB = A", &empty()), "E0303");
+    fn a_constant_may_be_computed_from_names_and_calls() {
+        ok(
+            "A = 1\nB = A + f(2)\nfunction f(x) return x * 2 end",
+            &empty(),
+        );
     }
 
     #[test]
-    fn rejects_non_constant_const_rhs_call() {
-        assert_eq!(err_code("X = f()", &empty()), "E0303");
+    fn a_constant_is_in_scope_before_its_declaration() {
+        // Like a Lua global: whether it has been set yet is a runtime question.
+        ok("function f() return LATE end\nLATE = 1", &empty());
+    }
+
+    #[test]
+    fn a_top_level_local_is_in_scope_only_after_its_declaration() {
+        ok("local k = 2\nfunction f(x) return x * k end", &empty());
+        assert_eq!(
+            err_code("function f(x) return x * k end\nlocal k = 2", &empty()),
+            "E0300"
+        );
+        assert_eq!(err_code("local a = b\nlocal b = 1", &empty()), "E0300");
+    }
+
+    #[test]
+    fn a_top_level_local_function_is_in_scope_only_after_its_declaration() {
+        ok(
+            "local function helper(x) return x + 1 end\nfunction f() return helper(1) end",
+            &empty(),
+        );
+        assert_eq!(
+            err_code(
+                "function f() return helper(1) end\nlocal function helper(x) return x end",
+                &empty()
+            ),
+            "E0300"
+        );
+    }
+
+    #[test]
+    fn module_variables_are_slots_not_upvalues() {
+        let r = ok(
+            "local k = 2\nfunction f(x) return x * k end\nK = k + 1",
+            &empty(),
+        );
+        assert!(r.bindings.values().any(|b| matches!(b, Binding::Module(_))));
+        assert!(
+            !r.bindings
+                .values()
+                .any(|b| matches!(b, Binding::Upvalue(_)))
+        );
+        assert_eq!(r.globals, ["k", "K"]);
+    }
+
+    #[test]
+    fn a_closure_in_top_level_code_captures_a_block_local() {
+        let r = ok(
+            "local t = {}\ndo\n  local n = 0\n  t[1] = function() return n end\nend",
+            &empty(),
+        );
+        assert!(
+            r.bindings
+                .values()
+                .any(|b| matches!(b, Binding::Upvalue(_)))
+        );
+    }
+
+    #[test]
+    fn top_level_code_may_assign_module_variables() {
+        ok(
+            "local total = 0\nfor i = 1, 3 do total = total + i end\ntotal = total * 2",
+            &empty(),
+        );
+        ok("C = {}\nC.x = 1\nlocal t = {}\nt[1] = 2", &empty());
+    }
+
+    #[test]
+    fn a_function_cannot_assign_a_module_variable() {
+        assert_eq!(
+            err_code("local n = 0\nfunction f() n = n + 1 end", &empty()),
+            "E0308"
+        );
+        // A closure written in top-level code is a function too.
+        assert_eq!(
+            err_code("local n = 0\nlocal g = function() n = 1 end", &empty()),
+            "E0308"
+        );
+    }
+
+    #[test]
+    fn a_function_cannot_write_through_a_module_value() {
+        assert_eq!(
+            err_code("local t = {}\nfunction f() t.x = 1 end", &empty()),
+            "E0307"
+        );
+        assert_eq!(
+            err_code("C = {}\nfunction f() C.x = 1 end", &empty()),
+            "E0307"
+        );
+    }
+
+    #[test]
+    fn top_level_code_cannot_return() {
+        assert_eq!(err_code("if true then return end", &empty()), "E0309");
+        // A function written in top-level code may.
+        ok("local g = function() return 1 end", &empty());
+    }
+
+    #[test]
+    fn top_level_code_cannot_use_memory() {
+        let cfg = ResolveConfig::with_memory("mem");
+        assert_eq!(err_code("local g = mem.gold", &cfg), "E0310");
+        assert_eq!(err_code("mem.gold = 1", &cfg), "E0310");
+        // A function reads it when called, after memory is bound.
+        ok("local g = function() return mem.gold end", &cfg);
+    }
+
+    #[test]
+    fn rejects_duplicate_top_level_local() {
+        assert_eq!(err_code("local x = 1\nlocal x = 2", &empty()), "E0305");
+        assert_eq!(err_code("function x() end\nlocal x = 2", &empty()), "E0305");
+        assert_eq!(err_code("local math = 1", &empty()), "E0304");
+    }
+
+    #[test]
+    fn a_block_local_in_top_level_code_may_shadow() {
+        ok("local x = 1\ndo local x = 2 end", &empty());
     }
 
     #[test]

@@ -7,7 +7,8 @@
 //! [`interp_vm_jit_agree`] covers single-value functions; [`multi_return_oracles_agree`] covers
 //! Tier-A multi-return (`SPEC.md` §5.5) — a generated tuple return consumed both as a direct
 //! pass-through (exercising `MakeTuple` + tuple `Display` across the host boundary) and via a
-//! parallel-binding unpack (exercising `TupleGet`).
+//! parallel-binding unpack (exercising `TupleGet`); [`top_level_code_oracles_agree`] computes the
+//! expression in top-level code instead of a function (`SPEC.md` §3.1).
 //!
 //! proptest **shrinks** any failure to a minimal expression + inputs, which is the point:
 //! a codegen divergence is reported as the smallest program that triggers it.
@@ -101,6 +102,49 @@ proptest! {
 
         prop_assert_eq!(&si, &sv, "AST vs IR mismatch:\n{}", src);
         prop_assert_eq!(&sv, &sj, "IR vs JIT mismatch:\n{}", src);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// AST == IR == JIT for a generated expression computed by **top-level code** (`SPEC.md`
+    /// §3.1): the inputs are module variables, the expression initializes a constant and — built
+    /// up in a loop — a second module variable, and exported functions read both back. Exercises
+    /// the init function and the module slots rather than parameters and locals.
+    #[test]
+    fn top_level_code_oracles_agree(
+        expr in arb_expr(),
+        a in -50.0f64..50.0,
+        b in -50.0f64..50.0,
+        c in -50.0f64..50.0,
+        reps in 0u32..4,
+    ) {
+        let src = format!(
+            "local a, b, c = {a:?}, {b:?}, {c:?}\n\
+             K = {expr}\n\
+             local acc = 0\n\
+             for i = 1, {reps} do acc = acc + K * i end\n\
+             function k() return K end\n\
+             function total() return acc end"
+        );
+
+        let cfg = TypeConfig::default();
+        let (module, res, info) = grindlang::analyze(&src, &cfg).expect("analyze top-level code");
+        let program = grindlang::ir::lower(&module, &res, &info, &cfg).expect("lower");
+        grindlang::ir::verify(&program).expect("verify");
+
+        let mut interp = Interpreter::new(&module, &res).expect("interp");
+        let mut vm = Vm::new(&program);
+        let mut jit = JitModule::compile(&program).expect("jit compile");
+
+        for func in ["k", "total", "K"] {
+            let si = render(&interp.call(func, vec![]));
+            let sv = render(&vm.call(func, vec![]));
+            let sj = render(&jit.call(func, vec![]));
+            prop_assert_eq!(&si, &sv, "AST vs IR mismatch in `{}`:\n{}", func, src);
+            prop_assert_eq!(&sv, &sj, "IR vs JIT mismatch in `{}`:\n{}", func, src);
+        }
     }
 }
 

@@ -6,7 +6,8 @@
 //!
 //! Grindlang scripts are **not** standalone programs. Each script evaluates to a module
 //! table of exported functions and constants; the host compiles it once and calls its
-//! exports many times. State persists between calls only through host-provided memory.
+//! exports many times. Its top-level code runs once, before the first call, and what it
+//! builds is then frozen. State persists between calls only through host-provided memory.
 //!
 //! See `SPEC.md` for the language definition and `PLAN.md` for the implementation
 //! roadmap. The crate was built in phases, all delivered:

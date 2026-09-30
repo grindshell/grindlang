@@ -32,6 +32,16 @@
 //!
 //! Named top-level and host functions are not values: they are only ever called directly
 //! ([`Op::CallScript`] / [`Op::CallHost`]), which the checker enforces (`E0434`).
+//!
+//! ## Top-level code
+//!
+//! A module's constants and top-level statements lower, in order, into one more function,
+//! [`Program::init`], which each module instance runs once before its first call. The values it
+//! produces live in **module slots** ([`Program::globals`]), one per constant and top-level
+//! `local`, read with [`Op::GlobalGet`] and written (by top-level code only) with
+//! [`Op::GlobalSet`]. A slot is not a local or an upvalue: every function reads it directly, so
+//! no function captures it. Once init has run, a backend freezes everything reachable from the
+//! slots, so no call can change what the next one sees (`SPEC.md` §3.1).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -66,20 +76,36 @@ pub enum LowerError {
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Program {
-    /// Top-level functions, by declared name.
+    /// Top-level functions, by declared name, and the lifted closures.
     pub functions: BTreeMap<String, Function>,
-    /// Top-level constants as zero-argument initializer functions, by declared name.
-    pub constants: BTreeMap<String, Function>,
+    /// The module's top-level code, run once per module instance before its first call
+    /// (`SPEC.md` §3.1). It sets the [`globals`](Self::globals) with [`Op::GlobalSet`]; what it
+    /// leaves in them is frozen from then on.
+    pub init: Function,
+    /// The module's slots, by slot id: one per constant and top-level `local`.
+    pub globals: Vec<Global>,
     /// Public surface: export name → what it refers to.
     pub exports: BTreeMap<String, ExportTarget>,
 }
+
+/// A module slot: a constant or a module variable (a top-level `local`).
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Global {
+    pub name: String,
+    pub ty: Type,
+}
+
+/// The name of [`Program::init`]. Not an identifier, so it can't collide with a function's.
+pub const INIT_NAME: &str = "$init";
 
 /// What an exported name refers to within a [`Program`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ExportTarget {
     Function(String),
-    Const(String),
+    /// A constant or module variable, by slot id: read, not called.
+    Global(u32),
 }
 
 /// A lowered function: a typed CFG.
@@ -193,8 +219,11 @@ pub enum Op {
     /// A builtin namespace member call (`math.floor`, `string.sub`).
     CallBuiltinMember(String, String, Vec<ValueId>),
 
-    /// Read a top-level constant.
-    ConstRef(String),
+    /// Read a module slot — a constant or module variable. Fails if top-level code hasn't set
+    /// it yet, which can only happen while the module initializes.
+    GlobalGet(u32),
+    /// Write a module slot (no result). Only top-level code does.
+    GlobalSet(u32, ValueId),
     /// Read a host memory handle.
     MemoryRef(String),
     /// A builtin namespace value field (`math.pi`, `math.huge`).
@@ -259,24 +288,19 @@ pub fn lower(
     cfg: &TypeConfig,
 ) -> Result<Program, LowerError> {
     let mut functions = BTreeMap::new();
-    let mut constants = BTreeMap::new();
     // Nested closures discovered while lowering are lifted into their own functions; lifting
     // one may discover more, so drain a work queue until it is empty.
     let mut queue: Vec<Pending> = Vec::new();
 
     for decl in &module.decls {
-        match decl {
-            TopDecl::Function(f) => {
-                let (lowered, discovered) = lower_function(&f.name.node, &f.body, res, types, cfg)?;
-                functions.insert(f.name.node.clone(), lowered);
-                queue.extend(discovered);
-            }
-            TopDecl::Const(c) => {
-                let lowered = lower_const(&c.name.node, &c.value, res, types, cfg)?;
-                constants.insert(c.name.node.clone(), lowered);
-            }
+        if let TopDecl::Function(f) = decl {
+            let (lowered, discovered) = lower_function(&f.name.node, &f.body, res, types, cfg)?;
+            functions.insert(f.name.node.clone(), lowered);
+            queue.extend(discovered);
         }
     }
+    let (init, discovered) = lower_init(module, res, types, cfg)?;
+    queue.extend(discovered);
 
     while let Some(p) = queue.pop() {
         let (lowered, discovered) = lower_closure(&p, res, types, cfg)?;
@@ -284,18 +308,43 @@ pub fn lower(
         queue.extend(discovered);
     }
 
+    let globals = res
+        .globals
+        .iter()
+        .map(|name| Global {
+            name: name.clone(),
+            ty: global_type(name, res, types),
+        })
+        .collect();
     let exports = lower_exports(module, res)?;
     Ok(Program {
         functions,
-        constants,
+        init,
+        globals,
         exports,
     })
+}
+
+/// The type of the module slot `name`: its constant's, or its module variable's.
+fn global_type(name: &str, res: &Resolution, types: &TypeInfo) -> Type {
+    if let Some(t) = types.constants.get(name) {
+        return t.clone();
+    }
+    res.symbols
+        .iter()
+        .position(|s| s.kind == crate::resolve::SymbolKind::Module && s.name == name)
+        .and_then(|id| types.symbol_types.get(id).cloned())
+        .unwrap_or(Type::Error)
 }
 
 fn lower_exports(
     module: &Module,
     res: &Resolution,
 ) -> Result<BTreeMap<String, ExportTarget>, LowerError> {
+    let slot = |name: &str| {
+        res.global_slot(name)
+            .ok_or_else(|| LowerError::Internal(format!("no slot for `{name}`")))
+    };
     let mut exports = BTreeMap::new();
     if let Some(export) = &module.export {
         for field in &export.node {
@@ -304,24 +353,31 @@ fn lower_exports(
                     "export field is not `name = value`".into(),
                 ));
             };
-            // The checker (`E0411`) only admits a bare name of a top-level function or constant.
-            let target = match (&value.kind, res.binding(value.span)) {
-                (ExprKind::Name(_), Some(Binding::TopFunction(n))) => {
-                    ExportTarget::Function(n.clone())
-                }
-                (ExprKind::Name(_), Some(Binding::TopConst(n))) => ExportTarget::Const(n.clone()),
-                _ => {
-                    return Err(LowerError::Internal(
-                        "export entry is not a top-level function or constant".into(),
-                    ));
-                }
-            };
+            // The checker (`E0411`) only admits a bare name of a top-level function, constant,
+            // or `local`.
+            let binding = res.binding(value.span);
+            let target =
+                match (&value.kind, binding) {
+                    (ExprKind::Name(_), Some(Binding::TopFunction(n))) => {
+                        ExportTarget::Function(n.clone())
+                    }
+                    (ExprKind::Name(_), Some(b @ (Binding::TopConst(_) | Binding::Module(_)))) => {
+                        ExportTarget::Global(res.slot_of(b).ok_or_else(|| {
+                            LowerError::Internal("export entry has no slot".into())
+                        })?)
+                    }
+                    _ => {
+                        return Err(LowerError::Internal(
+                            "export entry is not a top-level function, constant, or `local`".into(),
+                        ));
+                    }
+                };
             exports.insert(name.node.clone(), target);
         }
     } else {
         for decl in &module.decls {
             match decl {
-                TopDecl::Function(f) => {
+                TopDecl::Function(f) if !f.local => {
                     exports.insert(
                         f.name.node.clone(),
                         ExportTarget::Function(f.name.node.clone()),
@@ -330,13 +386,59 @@ fn lower_exports(
                 TopDecl::Const(c) => {
                     exports.insert(
                         c.name.node.clone(),
-                        ExportTarget::Const(c.name.node.clone()),
+                        ExportTarget::Global(slot(&c.name.node)?),
                     );
                 }
+                TopDecl::Function(_) | TopDecl::Stat(_) => {}
             }
         }
     }
     Ok(exports)
+}
+
+/// Lower the module's top-level code — its constants and statements, in order — into
+/// [`Program::init`]. A top-level `local` and a constant are stored into their slots; the
+/// locals of nested blocks are the init function's own, which a closure in it may capture.
+fn lower_init(
+    module: &Module,
+    res: &Resolution,
+    types: &TypeInfo,
+    cfg: &TypeConfig,
+) -> Result<(Function, Vec<Pending>), LowerError> {
+    let mut fl = FnLowerer::new(INIT_NAME.to_string(), Type::Unit, res, types, cfg);
+    fl.set_boxed(crate::capture::boxed_chunk_locals(res, &module.decls));
+    for decl in &module.decls {
+        match decl {
+            TopDecl::Function(_) => {}
+            TopDecl::Const(c) => {
+                let v = fl.lower_expr(&c.value)?;
+                let slot = fl.slot(&Binding::TopConst(c.name.node.clone()))?;
+                fl.emit_stmt(Op::GlobalSet(slot, v));
+            }
+            TopDecl::Stat(stat) => match &stat.kind {
+                StatKind::Local { names, exprs } => {
+                    let vals = fl.lower_multi_rhs(exprs)?;
+                    for (i, name) in names.iter().enumerate() {
+                        let v = match vals.get(i).copied() {
+                            Some(v) => v,
+                            None => fl.emit_value(Op::ConstNil, Type::Nil),
+                        };
+                        let id = fl.local_id(name.span)?;
+                        let slot = fl.slot(&Binding::Module(id))?;
+                        fl.emit_stmt(Op::GlobalSet(slot, v));
+                    }
+                }
+                // Top-level code can't `return` or `break` out of itself (the resolver's `E0309`
+                // and `E0306`), so no statement ends it early.
+                _ => {
+                    fl.lower_stat(stat)?;
+                }
+            },
+        }
+    }
+    fl.terminate(Terminator::Return(None));
+    let discovered = std::mem::take(&mut fl.discovered);
+    Ok((fl.finish(), discovered))
 }
 
 fn lower_function(
@@ -395,20 +497,6 @@ fn lower_closure(
     }
     let discovered = std::mem::take(&mut fl.discovered);
     Ok((fl.finish(), discovered))
-}
-
-fn lower_const(
-    name: &str,
-    value: &Expr,
-    res: &Resolution,
-    types: &TypeInfo,
-    cfg: &TypeConfig,
-) -> Result<Function, LowerError> {
-    let ret = types.constants.get(name).cloned().unwrap_or(Type::Error);
-    let mut fl = FnLowerer::new(format!("const::{name}"), ret, res, types, cfg);
-    let v = fl.lower_expr(value)?;
-    fl.terminate(Terminator::Return(Some(v)));
-    Ok(fl.finish())
 }
 
 struct FnLowerer<'a> {
@@ -571,6 +659,13 @@ impl<'a> FnLowerer<'a> {
         self.res
             .def(span)
             .ok_or_else(|| LowerError::Internal("missing symbol id for local".into()))
+    }
+
+    /// The module slot a constant or module-variable binding refers to.
+    fn slot(&self, binding: &Binding) -> Result<u32, LowerError> {
+        self.res
+            .slot_of(binding)
+            .ok_or_else(|| LowerError::Internal(format!("no module slot for {binding:?}")))
     }
 
     // ---- closure conversion helpers ------------------------------------------
@@ -823,6 +918,12 @@ impl<'a> FnLowerer<'a> {
             ExprKind::Name(_) => {
                 let id = match self.res.binding(target.span) {
                     Some(Binding::Local(id) | Binding::Upvalue(id)) => *id,
+                    // Only top-level code assigns a module variable (the resolver's `E0308`).
+                    Some(b @ Binding::Module(_)) => {
+                        let slot = self.slot(b)?;
+                        self.emit_stmt(Op::GlobalSet(slot, v));
+                        return Ok(());
+                    }
                     _ => {
                         return Err(LowerError::Internal(
                             "assignment target is not a mutable local".into(),
@@ -1212,7 +1313,14 @@ impl<'a> FnLowerer<'a> {
             }
             Binding::TopConst(n) => {
                 let ty = self.types.constants.get(&n).cloned().unwrap_or(Type::Error);
-                Ok(self.emit_value(Op::ConstRef(n), ty))
+                let slot = self.slot(binding)?;
+                Ok(self.emit_value(Op::GlobalGet(slot), ty))
+            }
+            Binding::Module(id) => {
+                let ty = self.symbol_type(id);
+                let slot = self.slot(binding)?;
+                let v = self.emit_value(Op::GlobalGet(slot), ty);
+                Ok(self.narrow(expr.span, v))
             }
             Binding::Memory(n) => {
                 let ty = self.cfg.memory.get(&n).cloned().unwrap_or(Type::Error);
@@ -1572,8 +1680,22 @@ impl<'a> FnLowerer<'a> {
 
 /// Structural validity check on a lowered [`Program`].
 pub fn verify(program: &Program) -> Result<(), LowerError> {
-    for f in program.functions.values().chain(program.constants.values()) {
+    for f in program
+        .functions
+        .values()
+        .chain(std::iter::once(&program.init))
+    {
         verify_function(f)?;
+        for instr in f.blocks.iter().flat_map(|b| &b.instrs) {
+            if let Op::GlobalGet(slot) | Op::GlobalSet(slot, _) = instr.op
+                && slot as usize >= program.globals.len()
+            {
+                return Err(LowerError::Internal(format!(
+                    "function `{}` references undefined module slot {slot}",
+                    f.name
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1647,7 +1769,20 @@ mod vm {
     use super::*;
     use crate::runtime::builtins::{field_value, member_call, value_call};
     use crate::runtime::ops;
-    use crate::value::{DEFAULT_MAX_CALL_DEPTH, NativeFn, RunError, Value, call_depth_exceeded};
+    use crate::value::{
+        DEFAULT_MAX_CALL_DEPTH, FROZEN_MODULE_VALUE, NativeFn, RunError, Value,
+        call_depth_exceeded, memory_during_init, read_before_init,
+    };
+
+    /// Whether a module instance has run its top-level code yet (`SPEC.md` §3.1).
+    enum InitState {
+        NotRun,
+        /// It is running now. Only a function top-level code calls can observe this.
+        Running,
+        Done,
+        /// It failed; every later call reports the same error.
+        Failed(RunError),
+    }
 
     /// Executes a lowered [`Program`].
     pub struct Vm<'a> {
@@ -1657,13 +1792,11 @@ mod vm {
         /// called with the receiver prepended to the call arguments.
         methods: HashMap<String, NativeFn>,
         memory: HashMap<String, Value>,
-        /// Constants evaluated during the current call, cleared when a new top-level call
-        /// starts. Memoizing per call keeps a constant equal to itself within one invocation
-        /// (reference values compare by identity) without letting it survive between calls,
-        /// which `SPEC.md` §1 reserves for host memory.
-        const_cache: HashMap<String, Value>,
-        /// Allocations reachable from the constants read so far this call, which may not be
-        /// written to (`SPEC.md` §3). Cleared alongside `const_cache`.
+        /// The module slots, by slot id: `None` until top-level code sets one.
+        globals: Vec<Option<Value>>,
+        init: InitState,
+        /// Allocations reachable from the module slots once top-level code has run, which may
+        /// not be written to (`SPEC.md` §3.1). Empty until then.
         frozen: std::collections::HashSet<usize>,
         /// Script calls currently active, checked against `max_call_depth`.
         depth: u32,
@@ -1701,11 +1834,51 @@ mod vm {
                 host: HashMap::new(),
                 methods: HashMap::new(),
                 memory: HashMap::new(),
-                const_cache: HashMap::new(),
+                globals: Vec::new(),
+                init: InitState::NotRun,
                 frozen: std::collections::HashSet::new(),
                 depth: 0,
                 max_call_depth: DEFAULT_MAX_CALL_DEPTH,
             }
+        }
+
+        /// Run the module's top-level code, if it hasn't run yet, then freeze what it built
+        /// (`SPEC.md` §3.1). Every call does this first; a host calls it directly to run
+        /// top-level code — and see its errors — before the first call.
+        ///
+        /// A failure is final: every later call reports it. A host function that panics leaves
+        /// it to run again from the start next time.
+        pub fn init(&mut self) -> Result<(), RunError> {
+            match &self.init {
+                InitState::Done => return Ok(()),
+                InitState::Failed(e) => return Err(e.clone()),
+                InitState::NotRun | InitState::Running => {}
+            }
+            self.init = InitState::Running;
+            self.globals = vec![None; self.program.globals.len()];
+            self.frozen.clear();
+            self.depth = 0;
+            // Top-level code isn't a script call: it counts no depth, like the other backends.
+            let program = self.program;
+            match self.run_function(&program.init, Vec::new()) {
+                Ok(_) => {
+                    let mut frozen = std::collections::HashSet::new();
+                    for v in self.globals.iter().flatten() {
+                        v.collect_reachable(&mut frozen);
+                    }
+                    self.frozen = frozen;
+                    self.init = InitState::Done;
+                    Ok(())
+                }
+                Err(e) => {
+                    self.init = InitState::Failed(e.clone());
+                    Err(e)
+                }
+            }
+        }
+
+        fn initializing(&self) -> bool {
+            matches!(self.init, InitState::Running)
         }
 
         /// Set how many script calls may be active at once before a call fails (`SPEC.md`
@@ -1738,19 +1911,19 @@ mod vm {
             self.memory.get(name).cloned()
         }
 
-        /// Start a top-level invocation: drop the previous call's memoized constants, and start
-        /// with no calls active. A call normally leaves none behind, but one a host function
-        /// panicked out of never unwound its depth count, and the host may have caught that
-        /// panic and kept using this VM.
-        fn begin_call(&mut self) {
-            self.const_cache.clear();
-            self.frozen.clear();
+        /// Start a top-level invocation — after running top-level code, if it hasn't run — with
+        /// no calls active. A call normally leaves none behind, but one a host function panicked
+        /// out of never unwound its depth count, and the host may have caught that panic and kept
+        /// using this VM.
+        fn begin_call(&mut self) -> Result<(), RunError> {
+            self.init()?;
             self.depth = 0;
+            Ok(())
         }
 
         /// Call an exported function by name.
         pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RunError> {
-            self.begin_call();
+            self.begin_call()?;
             let target = self
                 .program
                 .exports
@@ -1759,13 +1932,13 @@ mod vm {
             match target {
                 ExportTarget::Function(f) => {
                     let func = self.lookup_function(f)?;
-                    // A constant is read, not called, so its arity is zero.
                     check_arity(name, func.params.len(), args.len())?;
                     self.call_function(func, args)
                 }
-                ExportTarget::Const(c) => {
+                // A constant is read, not called, so its arity is zero.
+                ExportTarget::Global(slot) => {
                     check_arity(name, 0, args.len())?;
-                    self.const_value(c)
+                    self.global(*slot)
                 }
             }
         }
@@ -1773,7 +1946,7 @@ mod vm {
         /// Host-invoke a closure value previously returned by a call. The closure's captured
         /// cells are shared (by `Rc`), so upvalue writes persist across host calls.
         pub fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RunError> {
-            self.begin_call();
+            self.begin_call()?;
             let code = match &callee {
                 Value::Closure(c) => c.code.clone(),
                 other => {
@@ -1800,37 +1973,28 @@ mod vm {
                 .ok_or_else(|| RunError::Internal(format!("missing IR function `{name}`")))
         }
 
-        fn const_value(&mut self, name: &str) -> Result<Value, RunError> {
-            if let Some(v) = self.const_cache.get(name) {
-                return Ok(v.clone());
+        /// The value in module slot `slot`, or the read-before-init error if top-level code
+        /// hasn't set it yet.
+        fn global(&self, slot: u32) -> Result<Value, RunError> {
+            match self.globals.get(slot as usize) {
+                Some(Some(v)) => Ok(v.clone()),
+                _ => Err(read_before_init(&self.program.globals[slot as usize].name)),
             }
-            let func = self
-                .program
-                .constants
-                .get(name)
-                .ok_or_else(|| RunError::Internal(format!("missing IR constant `{name}`")))?;
-            let v = self.run_function(func, Vec::new())?;
-            // Everything inside the constant becomes unwritable for the rest of the call.
-            v.collect_reachable(&mut self.frozen);
-            self.const_cache.insert(name.to_string(), v.clone());
-            Ok(v)
         }
 
-        /// Refuse a write to a value that is (part of) a constant. `E0307` rejects the syntactic
-        /// form at check time; this catches the same write reached through an alias.
+        /// Refuse a write to a value that is (part of) a frozen module value. `E0307` rejects the
+        /// syntactic form at check time; this catches the same write reached through an alias.
         fn reject_frozen(&self, base: &Value) -> Result<(), RunError> {
             if base.is_frozen(&self.frozen) {
-                return Err(RunError::Runtime(
-                    crate::value::IMMUTABLE_CONSTANT.to_string(),
-                ));
+                return Err(RunError::Runtime(FROZEN_MODULE_VALUE.to_string()));
             }
             Ok(())
         }
 
         /// Run a script function or closure as a call, counted against the call-depth limit.
-        /// Constant initializers go straight to [`run_function`](Self::run_function): reading a
-        /// constant is not a call in the other two backends either, so counting it here would
-        /// make the VM fail one call earlier than they do.
+        /// Top-level code goes straight to [`run_function`](Self::run_function): it is not a
+        /// call in the other two backends either, so counting it here would make the VM fail one
+        /// call earlier than they do.
         fn call_function(&mut self, func: &Function, args: Vec<Value>) -> Result<Value, RunError> {
             if self.depth >= self.max_call_depth {
                 return Err(call_depth_exceeded(self.max_call_depth));
@@ -2034,7 +2198,15 @@ mod vm {
                     let argv = self.eval_args(act, args)?;
                     member_call(ns, member, &argv)?
                 }
-                Op::ConstRef(name) => self.const_value(name)?,
+                Op::GlobalGet(slot) => self.global(*slot)?,
+                Op::GlobalSet(slot, v) => {
+                    let val = self.val(act, *v)?;
+                    self.globals[*slot as usize] = Some(val);
+                    Value::Nil
+                }
+                Op::MemoryRef(name) if self.initializing() => {
+                    return Err(memory_during_init(name));
+                }
                 Op::MemoryRef(name) => self
                     .memory
                     .get(name)
@@ -2052,7 +2224,10 @@ mod vm {
                 },
                 Op::CellSet(cell, v) => {
                     let val = self.val(act, *v)?;
-                    match self.val(act, *cell)? {
+                    let cell = self.val(act, *cell)?;
+                    // A closure kept in a module value can't change what it captured.
+                    self.reject_frozen(&cell)?;
+                    match cell {
                         Value::Cell(c) => *c.borrow_mut() = val,
                         other => return Err(shape_error("CellSet", &other)),
                     }
@@ -2146,12 +2321,41 @@ mod tests {
             "K = 7\nfunction impl() return K end\nreturn { run = impl }",
             &TypeConfig::default(),
         );
-        assert!(p.constants.contains_key("K"));
+        assert_eq!(
+            p.globals,
+            [Global {
+                name: "K".into(),
+                ty: Type::Number
+            }]
+        );
         assert_eq!(
             p.exports.get("run"),
             Some(&ExportTarget::Function("impl".into()))
         );
         assert!(!p.exports.contains_key("impl"));
+    }
+
+    #[test]
+    fn top_level_code_lowers_into_init_and_sets_slots() {
+        let p = build(
+            "local k = 2\nfor i = 1, 3 do k = k + i end\nK = k * 2\nlocal function helper() return k end",
+            &TypeConfig::default(),
+        );
+        let names: Vec<&str> = p.globals.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["k", "K"]);
+        let sets = p
+            .init
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instrs)
+            .filter(|i| matches!(i.op, Op::GlobalSet(..)))
+            .count();
+        assert_eq!(sets, 3, "`local k`, the loop's `k = …`, and `K`");
+        // The constant exports; the `local` and the `local function` are private.
+        assert_eq!(p.exports.get("K"), Some(&ExportTarget::Global(1)));
+        assert!(!p.exports.contains_key("k"));
+        assert!(!p.exports.contains_key("helper"));
+        assert!(p.functions.contains_key("helper"));
     }
 
     #[test]

@@ -40,7 +40,8 @@ fn constraint_violations_report_expected_codes() {
         ("function f() return ghost end", "E0300"), // free global
         ("K = 1\nfunction f() K = 2 end", "E0302"), // assign to const
         ("function f() break end", "E0306"),        // break outside loop
-        ("X = f()", "E0303"),                       // non-constant const RHS
+        ("local n = 0\nfunction f() n = 1 end", "E0308"), // module var set in a function
+        ("if true then return end", "E0309"),       // `return` in top-level code
         ("function f() end\nfunction f() end", "E0305"), // duplicate decl
         ("function math() end", "E0304"),           // shadow builtin
         ("function f() return ipairs end", "E0301"), // ipairs as value

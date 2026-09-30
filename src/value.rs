@@ -133,15 +133,38 @@ pub struct ClosureObj {
     pub origin: Option<Rc<dyn Any>>,
 }
 
-/// The error every backend raises when a script writes through a constant.
+/// The error every backend raises when a script writes to a frozen module value.
 ///
-/// `E0307` rejects the syntactic form (`C.x = …`) at check time, but that check keys on the
-/// *root* of the assignment target, so aliasing a constant into a local first gets past it.
-/// This is the runtime half that makes "immutable all the way down" (`SPEC.md` §3) true however
-/// the constant was reached.
+/// `E0307` rejects the syntactic form (`C.x = …` in a function) at check time, but that check
+/// keys on the *root* of the assignment target, so aliasing a module value into a local first
+/// gets past it. This is the runtime half that makes what top-level code builds immutable once
+/// the module has initialized (`SPEC.md` §3.1), however it was reached.
 #[cfg(any(feature = "interp", feature = "jit"))]
-pub const IMMUTABLE_CONSTANT: &str = "cannot modify a constant: constants are immutable, \
-     including through an alias. Use host memory (`SPEC.md` §7) for state that changes.";
+pub const FROZEN_MODULE_VALUE: &str = "cannot modify a frozen module value: what top-level code \
+     builds is immutable once the module has initialized, including through an alias. Use host \
+     memory (`SPEC.md` §7) for state that changes.";
+
+/// The error every backend raises when top-level code reads a constant or module variable before
+/// the code that sets it has run — say, by calling a function declared above a constant it
+/// reads (`SPEC.md` §3.1). Only possible while the module initializes: afterwards every one is
+/// set.
+#[cfg(any(feature = "interp", feature = "jit"))]
+pub fn read_before_init(name: &str) -> RunError {
+    RunError::Runtime(format!(
+        "`{name}` was read before the top-level code that sets it ran"
+    ))
+}
+
+/// The error every backend raises when host memory is used while the module initializes. Its
+/// top-level code runs before any memory is bound, and what it builds is frozen, so it could only
+/// ever see a snapshot (`SPEC.md` §3.1). `E0310` rejects the direct form; this catches a function
+/// that top-level code calls.
+#[cfg(any(feature = "interp", feature = "jit"))]
+pub fn memory_during_init(name: &str) -> RunError {
+    RunError::Runtime(format!(
+        "host memory `{name}` is not available while the module initializes"
+    ))
+}
 
 /// How many script calls may be active at once before a call fails (`SPEC.md` §7.3), unless the
 /// host sets its own limit.
@@ -168,15 +191,17 @@ pub fn call_depth_exceeded(limit: u32) -> RunError {
 }
 
 impl Value {
-    /// Collect the address of every table/array allocation reachable from this value.
+    /// Collect the address of every mutable allocation reachable from this value: tables,
+    /// arrays, and the upvalue cells a closure captured.
     ///
-    /// A backend calls this on a constant when it memoizes it, and refuses writes to anything
-    /// in the resulting set for the rest of the call. Addresses are stable to compare because
-    /// the memo keeps every one of these allocations alive for exactly as long as the set does,
-    /// so nothing can be freed and another object land at the same address.
+    /// A backend calls this on its module values once top-level code has run, and refuses writes
+    /// to anything in the resulting set from then on (`SPEC.md` §3.1). A closure's cells count:
+    /// otherwise a closure kept in a module value could carry state from one call to the next.
+    /// Addresses are stable to compare because the module values keep every one of these
+    /// allocations alive for as long as the set exists, so nothing can be freed and another
+    /// object land at the same address.
     ///
-    /// Recursion terminates on its own: a value already in the set is not descended into, and a
-    /// `constexpr` builds only from literals so it cannot be cyclic anyway.
+    /// Recursion terminates on its own: a value already in the set is not descended into.
     #[cfg(any(feature = "interp", feature = "jit"))]
     pub fn collect_reachable(&self, out: &mut std::collections::HashSet<usize>) {
         // A container already recorded has had its contents walked. Stopping here is what makes
@@ -204,6 +229,15 @@ impl Value {
                     v.collect_reachable(out);
                 }
             }
+            Value::Cell(c) => c.borrow().collect_reachable(out),
+            // A closure's environment is its cells, which it can write.
+            Value::Closure(c) => {
+                for cell in &c.env {
+                    cell.collect_reachable(out);
+                }
+            }
+            #[cfg(feature = "interp")]
+            Value::Function(f) => f.collect_reachable(out),
             _ => {}
         }
     }
@@ -215,15 +249,16 @@ impl Value {
         match self {
             Value::Table(t) => Some(Rc::as_ptr(t) as *const () as usize),
             Value::Array(a) => Some(Rc::as_ptr(a) as *const () as usize),
+            Value::Cell(c) => Some(Rc::as_ptr(c) as *const () as usize),
             _ => None,
         }
     }
 
-    /// Whether writing to this value is forbidden because it is (part of) a constant.
+    /// Whether writing to this value is forbidden because it is (part of) a frozen module value.
     #[cfg(any(feature = "interp", feature = "jit"))]
     pub fn is_frozen(&self, frozen: &std::collections::HashSet<usize>) -> bool {
-        // The common case is a module with no composite constants, where the set is empty and
-        // this costs one predictable branch.
+        // The common case is a module with no composite module values, where the set is empty
+        // and this costs one predictable branch.
         !frozen.is_empty() && self.container_addr().is_some_and(|a| frozen.contains(&a))
     }
 

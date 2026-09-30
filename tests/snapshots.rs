@@ -46,8 +46,10 @@ fn signature(src: &str, cfg: &TypeConfig) -> String {
 
 #[test]
 fn snapshot_rejected_constructs() {
-    insta::assert_snapshot!("reject_top_level_local", parse_diag("local g = 1"));
-    insta::assert_snapshot!("reject_top_level_statement", parse_diag("doThing()"));
+    insta::assert_snapshot!(
+        "reject_export_table_not_last",
+        parse_diag("function f() return 1 end\nreturn { g = f }\nX = 1")
+    );
     insta::assert_snapshot!(
         "reject_repeat_until",
         parse_diag("function f() repeat until true end")
@@ -86,11 +88,21 @@ fn snapshot_type_errors() {
         "type_error_or_left_never_nil",
         analyze_diag("function f(n)\n  return n + 1 or 0\nend")
     );
-    // A constant is immutable all the way down (SPEC §3): writing through one names the
-    // constant, not the field, and points at host memory as the place state belongs.
+    // What top-level code builds is frozen once the module initializes (SPEC §3.1): writing
+    // through a constant in a function names the constant, not the field, and points at host
+    // memory as the place state belongs. Setting a module variable in a function likewise.
     insta::assert_snapshot!(
         "reject_const_table_write",
         analyze_diag("C = {x = 1}\nfunction f()\n  C.x = 2\n  return C.x\nend")
+    );
+    insta::assert_snapshot!(
+        "reject_module_var_write_in_function",
+        analyze_diag("local count = 0\nfunction bump()\n  count = count + 1\nend")
+    );
+    // Top-level code runs once, as the module initializes; only the export table returns.
+    insta::assert_snapshot!(
+        "reject_top_level_return",
+        analyze_diag("local ready = true\nif ready then\n  return\nend")
     );
     // A value-returning function must return a value on every path (SPEC §5.5): both a bare
     // `return` and falling off the closing `end` are reported, at the exit itself.

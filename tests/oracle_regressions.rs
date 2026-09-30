@@ -653,8 +653,9 @@ fn memory_binding_is_observed_after_being_set() {
 // state is host memory), while the JIT rebuilt it per read (so the write was lost).
 //
 // Resolved by closing the SPEC gap rather than standardizing on a SPEC violation: a `constdecl`
-// is immutable all the way down, and writing through one is `E0307` at check time. See
-// `const_identity_is_consistent` below for what that does *not* cover.
+// is immutable all the way down, and writing through one is `E0307` at check time. Constants are
+// now built once, by the module's top-level code, and frozen with everything else it builds
+// (SPEC §3.1), so they have one identity for the module's lifetime.
 
 /// Writing through a constant is rejected — directly, nested, and through an index.
 #[test]
@@ -743,8 +744,8 @@ fn exported_constant_reads_back_consistently() {
 /// same value. The AST evaluated constants once at construction (`true`) while the VM and JIT
 /// produced a fresh value per read (`false`) — a value not equal to itself.
 ///
-/// Fixed by memoizing constants **per call** in all three backends, which is the lifetime that
-/// satisfies both halves: stable identity within an invocation, nothing surviving between them.
+/// First fixed by memoizing constants per call; now every backend builds a constant once, when
+/// the module initializes, and freezes it, so nothing about it survives between calls to change.
 #[test]
 fn a_constant_is_equal_to_itself() {
     let src = "C = {x = 1}\nfunction f()\n  local a = C\n  local b = C\n  return a == b\nend\n";
@@ -758,7 +759,7 @@ fn a_constant_is_equal_to_itself() {
 }
 
 /// The same identity, reached through the two ways a constant is read: in-script, and as an
-/// export. Both must observe the call's one memoized value.
+/// export. Both must observe the module's one value.
 #[test]
 fn a_constant_read_as_an_export_matches_the_in_script_read() {
     let src = "C = {x = 1}\nfunction f() return C end\n";
@@ -792,7 +793,7 @@ end
 ";
     let cfg = TypeConfig::default();
     let (mut interp, mut vm, mut jit) = triple(src, &cfg);
-    // Repeated, because a per-call frozen set that leaked would change the verdict on call 2.
+    // Repeated, because a frozen set that a call could lose would change the verdict on call 2.
     for i in 0..3 {
         let a = interp.call("f", vec![]);
         let b = vm.call("f", vec![]);
@@ -800,7 +801,7 @@ end
         assert_agree(&format!("aliased write, call {i}"), &a, &b, &c);
         let e = c.expect_err("writing through an aliased constant must fail");
         assert!(
-            format!("{e}").contains("cannot modify a constant"),
+            format!("{e}").contains("cannot modify a frozen module value"),
             "call {i}: got {e:?}"
         );
     }
@@ -885,8 +886,8 @@ fn structurally_identical_tables_are_not_equal() {
     assert_eq!(c.expect("identity").to_string(), "false");
 }
 
-/// A scalar constant skips the cache entirely (it has no identity to keep stable). It must
-/// still read correctly and identically everywhere.
+/// A scalar constant has no identity to keep stable, but must still read correctly and
+/// identically everywhere.
 #[test]
 fn scalar_constants_still_read_correctly() {
     let src = "MAX = 99\nSCALE = 1.5\nfunction f() return MAX * SCALE end\n";
@@ -1127,7 +1128,7 @@ end
     assert_agree("map-key write through an alias", &a, &b, &c);
     let e = c.expect_err("a map constant must be unwritable through an alias");
     assert!(
-        format!("{e}").contains("cannot modify a constant"),
+        format!("{e}").contains("cannot modify a frozen module value"),
         "got {e:?}"
     );
 }
@@ -1145,9 +1146,9 @@ fn a_map_constant_is_readable() {
     assert_eq!(c.expect("map read").to_string(), "1");
 }
 
-/// The freeze is scoped to the *invocation*, not to the function that read the constant: a
-/// callee's read must still forbid the caller's write. Nothing else pins that boundary — every
-/// other alias test reads and writes inside one function.
+/// The freeze belongs to the *module*, not to the function that read the constant: a callee's
+/// read must still forbid the caller's write. Nothing else pins that boundary — every other alias
+/// test reads and writes inside one function.
 #[test]
 fn a_constant_read_in_a_callee_is_frozen_for_the_caller() {
     let src = "\
@@ -1167,7 +1168,7 @@ end
     assert_agree("write to a constant returned by a callee", &a, &b, &c);
     let e = c.expect_err("a constant returned by a callee must stay unwritable");
     assert!(
-        format!("{e}").contains("cannot modify a constant"),
+        format!("{e}").contains("cannot modify a frozen module value"),
         "got {e:?}"
     );
 }

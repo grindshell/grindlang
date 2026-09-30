@@ -1,11 +1,9 @@
 //! Recursive-descent + Pratt parser for the Grindlang grammar (`SPEC.md` §3).
 //!
 //! Two responsibilities beyond building the AST:
-//!   * **Enforce the top-level constraint contract** structurally — the chunk is a list
-//!     of function/const declarations plus an optional curated `return { ... }`. A
-//!     top-level `local`, a stray statement, etc. are rejected here with a pointed
-//!     diagnostic. (Deeper rules — const-ness of `const` RHS, no free globals, type
-//!     checks — belong to later phases.)
+//!   * **Shape the chunk** — function declarations, `NAME = expr` constants, and top-level
+//!     statements in source order, plus an optional curated `return { ... }` that must come
+//!     last. (Scoping, the no-free-globals rule, and type checks belong to later phases.)
 //!   * **Reject unsupported-but-lexable constructs** (`repeat`/`until`, `goto`/labels,
 //!     varargs `...`) where they appear, with a "not supported in Grindlang" message.
 //!
@@ -20,6 +18,8 @@
 //! (`E0209`). It measures the tree's height rather than its own recursion: a left-associative
 //! chain like `1 + 1 + … + 1` or a suffix chain like `a.b.c…` is parsed by a loop but still
 //! builds a tree as deep as it is long.
+
+use std::collections::HashSet;
 
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, Diagnostics, Span};
@@ -195,18 +195,32 @@ impl Parser {
 
     // ---- module / top level --------------------------------------------------
 
+    /// The chunk: function declarations, constants, and top-level statements in any order, then
+    /// an optional export table (`SPEC.md` §3.1).
+    ///
+    /// `NAME = expr` is a constant declaration unless `NAME` is a top-level `local` declared
+    /// above it, in which case it assigns that module variable, as it would in Lua. Only the
+    /// top-level locals seen so far can be in scope there, so the parser can tell the two apart.
     fn parse_module(&mut self) -> PResult<Module> {
         let start = self.peek_span();
         let mut decls = Vec::new();
         let mut export = None;
+        let mut top_locals: HashSet<String> = HashSet::new();
 
         loop {
             match self.peek() {
                 TokenKind::Eof => break,
                 TokenKind::Function => {
-                    decls.push(TopDecl::Function(self.parse_func_decl()?));
+                    decls.push(TopDecl::Function(self.parse_func_decl(false)?));
                 }
-                TokenKind::Name(_) if matches!(self.peek_at(1), TokenKind::Assign) => {
+                TokenKind::Local if matches!(self.peek_at(1), TokenKind::Function) => {
+                    let f = self.parse_func_decl(true)?;
+                    top_locals.insert(f.name.node.clone());
+                    decls.push(TopDecl::Function(f));
+                }
+                TokenKind::Name(n)
+                    if matches!(self.peek_at(1), TokenKind::Assign) && !top_locals.contains(n) =>
+                {
                     decls.push(TopDecl::Const(self.parse_const_decl()?));
                 }
                 TokenKind::Return => {
@@ -221,33 +235,21 @@ impl Parser {
                     }
                     break;
                 }
-                TokenKind::Local => {
-                    return self.err(
-                        "E0103",
-                        "top-level `local` variables are not allowed in Grindlang; \
-                         declare module functions/constants at the top level and keep \
-                         mutable locals inside function bodies",
-                        self.peek_span(),
-                    );
-                }
-                TokenKind::Name(_) => {
-                    // A name not followed by `=` at top level — likely a stray call or
-                    // an attempt at an executable statement.
-                    return self.err(
-                        "E0104",
-                        "unexpected statement at module top level; the top level may only \
-                         contain `function` declarations, `name = <const>` declarations, \
-                         and an optional trailing `return { ... }`",
-                        self.peek_span(),
-                    );
-                }
-                other => {
+                TokenKind::End | TokenKind::Else | TokenKind::Elseif | TokenKind::Until => {
                     let msg = format!(
-                        "unexpected {} at module top level; expected a `function` or \
-                         `name = <const>` declaration",
-                        other.describe()
+                        "unexpected {} at module top level; it does not close anything",
+                        self.peek().describe()
                     );
                     return self.err("E0105", msg, self.peek_span());
+                }
+                _ => {
+                    let stat = self.parse_stat()?;
+                    if let StatKind::Local { names, .. } = &stat.kind {
+                        top_locals.extend(names.iter().map(|n| n.node.clone()));
+                    }
+                    if !matches!(stat.kind, StatKind::Empty) {
+                        decls.push(TopDecl::Stat(Box::new(stat)));
+                    }
                 }
             }
         }
@@ -260,16 +262,22 @@ impl Parser {
         })
     }
 
-    fn parse_func_decl(&mut self) -> PResult<FuncDecl> {
-        // Doc comments sitting between the previous token and the `function` keyword annotate
-        // this declaration (`SPEC.md` §5.6).
+    /// A top-level `function name(...)`, or with `local`, a `local function name(...)`.
+    fn parse_func_decl(&mut self, local: bool) -> PResult<FuncDecl> {
+        // Doc comments sitting between the previous token and the declaration annotate it
+        // (`SPEC.md` §5.6).
         let annotations = self.gather_annotations_before(self.peek_span().start);
-        let kw = self.expect(TokenKind::Function)?;
+        let start = self.peek_span();
+        if local {
+            self.expect(TokenKind::Local)?;
+        }
+        self.expect(TokenKind::Function)?;
         let name = self.expect_name()?;
         let body = self.parse_func_body()?;
-        let span = kw.span.to(body.span);
+        let span = start.to(body.span);
         Ok(FuncDecl {
             name,
+            local,
             body,
             annotations,
             span,
@@ -1216,13 +1224,45 @@ mod tests {
     }
 
     #[test]
-    fn rejects_top_level_local() {
-        assert_eq!(err_code("local x = 1"), "E0103");
+    fn parses_top_level_statements_in_order() {
+        let m = parse_ok(
+            "local rate = 2\n\
+             for i = 1, 3 do rate = rate + i end\n\
+             function f(x) return x * rate end\n\
+             setup()\n\
+             TOTAL = f(1)",
+        );
+        assert!(
+            matches!(&m.decls[0], TopDecl::Stat(s) if matches!(s.kind, StatKind::Local { .. }))
+        );
+        assert!(
+            matches!(&m.decls[1], TopDecl::Stat(s) if matches!(s.kind, StatKind::NumericFor { .. }))
+        );
+        assert!(matches!(m.decls[2], TopDecl::Function(_)));
+        assert!(matches!(&m.decls[3], TopDecl::Stat(s) if matches!(s.kind, StatKind::Call(_))));
+        assert!(matches!(m.decls[4], TopDecl::Const(_)));
+    }
+
+    /// `x = …` assigns a top-level local declared above it, as in Lua; with no such local it
+    /// declares a constant.
+    #[test]
+    fn a_name_assignment_is_a_constant_unless_a_top_level_local_is_in_scope() {
+        let m = parse_ok("X = 1\nlocal y = 1\ny = 2");
+        assert!(matches!(m.decls[0], TopDecl::Const(_)));
+        assert!(
+            matches!(&m.decls[2], TopDecl::Stat(s) if matches!(s.kind, StatKind::Assign { .. }))
+        );
     }
 
     #[test]
-    fn rejects_top_level_statement() {
-        assert_eq!(err_code("foo()"), "E0104");
+    fn a_top_level_local_function_is_a_private_declaration() {
+        let m = parse_ok("local function helper(x) return x end");
+        assert!(func_decl(&m, 0).local);
+    }
+
+    #[test]
+    fn rejects_a_stray_block_closer_at_top_level() {
+        assert_eq!(err_code("end"), "E0105");
     }
 
     #[test]

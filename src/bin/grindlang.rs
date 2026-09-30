@@ -3,7 +3,8 @@
 //! A Grindlang script is a **module**, not a standalone program (see `SPEC.md`): it evaluates
 //! to a table of exported functions and constants. This runner picks one export as an entry
 //! point — `main` by default, or another name via `--call NAME` — compiles the script with the
-//! cranelift JIT, invokes that export with no arguments, and prints the value it returns.
+//! cranelift JIT, runs its top-level code, invokes that export with no arguments, and prints
+//! the value it returns.
 //!
 //! Because the runner registers no host functions and binds no memory, a script run this way
 //! may use only the in-language builtins (`math.*` / `string.*`); anything needing host
@@ -163,6 +164,10 @@ fn execute(program: &Program, entry: &str, file: &str) -> Result<(), String> {
 
     let mut jit =
         JitModule::compile(program).map_err(|e| format!("JIT-compiling '{file}': {e}"))?;
+    // The call below would run the top-level code too; running it first reports its errors as
+    // its own rather than as the entry's.
+    jit.init()
+        .map_err(|e| format!("top-level code in '{file}' raised: {e}"))?;
     let result = jit
         .call(entry, Vec::new())
         .map_err(|e| format!("'{entry}' raised: {e}"))?;
@@ -185,7 +190,7 @@ fn compile_source(src: &str, file: &str) -> Result<Program, String> {
 fn validate_entry(program: &Program, entry: &str) -> Result<(), String> {
     match program.exports.get(entry) {
         None => Err(missing_entry(program, entry)),
-        Some(ExportTarget::Const(_)) => Err(format!(
+        Some(ExportTarget::Global(_)) => Err(format!(
             "entry export '{entry}' is a constant, not a function; nothing to run.",
         )),
         Some(ExportTarget::Function(fname)) => {
@@ -212,7 +217,7 @@ fn missing_entry(program: &Program, entry: &str) -> String {
                 .functions
                 .get(fname)
                 .is_some_and(|f| f.params.is_empty()),
-            ExportTarget::Const(_) => false,
+            ExportTarget::Global(_) => false,
         })
         .map(|(name, _)| name.as_str())
         .collect();
@@ -307,7 +312,7 @@ mod cache {
 
     /// On-disk envelope version. Bump when [`Program`]'s serialized shape or this envelope
     /// changes, so a cache written by an older build is rejected rather than misread.
-    const FORMAT: u32 = 3;
+    const FORMAT: u32 = 4;
 
     #[derive(serde::Serialize, serde::Deserialize)]
     struct Envelope {

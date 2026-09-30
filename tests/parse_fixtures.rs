@@ -31,11 +31,11 @@ fn dialog_decision_fixture_parses() {
 #[test]
 fn rejected_constructs_report_expected_codes() {
     let cases: &[(&str, &str)] = &[
-        ("local g = 1", "E0103"),                               // top-level local
-        ("doThing()", "E0104"),                                 // top-level statement
-        ("function f() repeat until true end", "E0201"),        // repeat/until
-        ("function f(...) end", "E0200"),                       // varargs
-        ("function f() ::lbl:: end", "E0202"),                  // labels/goto
+        ("function f() end end", "E0105"),    // stray top-level `end`
+        ("return { f = f }\nX = 1", "E0102"), // export table not last
+        ("function f() repeat until true end", "E0201"), // repeat/until
+        ("function f(...) end", "E0200"),     // varargs
+        ("function f() ::lbl:: end", "E0202"), // labels/goto
         ("function f(t) for x in each(t) do end end", "E0203"), // bad iterator
     ];
     for (src, code) in cases {

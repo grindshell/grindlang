@@ -79,6 +79,9 @@ pub enum BuildError {
     /// Cranelift codegen failed.
     #[error("{0}")]
     Jit(#[from] JitError),
+    /// The module's top-level code raised a runtime error as it ran (`SPEC.md` §3.1).
+    #[error("top-level code failed: {0}")]
+    Init(#[source] RunError),
 }
 
 /// A failure from a typed call: the script raised an error, or its result couldn't be
@@ -530,7 +533,9 @@ impl Engine {
 
     /// Compile a script source into a runnable [`Module`], type-checked against this engine's
     /// host functions and memory schema, and JIT-compiled to native code. The engine's host
-    /// closures are installed into the module.
+    /// closures are installed into the module, and then its top-level code runs (`SPEC.md`
+    /// §3.1) — once, so a runtime error in it is a [`BuildError::Init`] here rather than a
+    /// failure of every call. Memory is bound afterwards, and top-level code can't use it.
     ///
     /// To recompile on change, simply call `compile` again — each call yields an independent
     /// `Module` owning its own native code, which is freed when the `Module` is dropped (or,
@@ -550,6 +555,7 @@ impl Engine {
                 jit.set_method_fn(format!("{mem}:{method}"), native.clone());
             }
         }
+        jit.init().map_err(BuildError::Init)?;
         Ok(Module {
             jit,
             exports: info.exports,

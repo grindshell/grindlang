@@ -1,8 +1,9 @@
 # Grindlang — Implementation Plan
 
 > Status: Phases 0–8 delivered (front end, resolver, types, interpreter, IR, runtime,
-> cranelift JIT, host embedding API); Phase 9 (hardening, tooling, docs) delivered. See the
-> per-phase "Delivered" notes below and [`CLAUDE.md`](CLAUDE.md) for the current shape.
+> cranelift JIT, host embedding API); Phase 9 (hardening, tooling, docs) delivered; top-level
+> code (run once, then frozen — §2 decision 1) delivered since. See the per-phase "Delivered"
+> notes below and [`CLAUDE.md`](CLAUDE.md) for the current shape.
 
 ## 1. What Grindlang is
 
@@ -45,16 +46,22 @@ This simplifies the runtime considerably.
 These follow from the locked decisions in §1 and the trust model above. They are
 final design intent, not options — revisit only with a concrete consumer need.
 
-1. **Top-level shape (resolves "no top-level locals").** The top level of a script is a
-   set of **export declarations**, not an executable statement list. Two forms:
-   `function name(...) ... end` (exported function) and `name = <const-expr>` (exported
-   constant, where the RHS is compile-time-evaluable: literals and arithmetic/string
-   ops over literals). All top-level names are mutually in scope (so functions can call
-   each other and recurse), are **immutable bindings** (not mutable "locals"), and are
-   **the module's exports** by default. The implicit module table is assembled from
-   them — no `local M = {}` boilerplate, no mandatory `return`. An optional trailing
-   `return { ... }` may re-export/rename a subset for a curated public surface. Mutable
-   working variables (`local x = ...`) are legal **only inside function bodies**.
+1. **Top-level code runs once, then freezes (Starlark-style).** The top level of a script
+   is Lua-like: `function name(...)` declarations, `NAME = expr` constants, and ordinary
+   statements — `local`s, loops, `if`s, calls — in any order. The statements and constant
+   initializers are the module's **top-level code**, which runs **once** per module instance,
+   before its first call; everything it builds is then **frozen**, so no call can change what
+   the next one sees and host memory stays the only state that persists between calls.
+   Scoping follows Lua: a `function` or constant is in scope everywhere, a top-level `local`
+   or `local function` only from its declaration on; reading a value before the code that
+   sets it has run is a runtime error. `function`s and constants are **the module's exports**
+   by default — no `local M = {}` boilerplate, no mandatory `return` — and `local` makes a
+   name private. An optional trailing `return { ... }` may re-export/rename a subset for a
+   curated public surface. Only top-level code sets module values; a function that tries is
+   a compile error. (Superseded the original shape, where the top level was declarations
+   only and a constant's initializer had to be a literal expression; chosen over true Luau
+   semantics, where top-level locals are mutable module state, to keep §1's rule that only
+   host memory persists. See `SPEC.md` §3.1.)
 2. **`nil` is modeled as optional types `T?`.** Bare `nil` is assignable only to optional
    slots. A `T?` value must be narrowed (via an `if v ~= nil then` check, which flows the
    type to `T` inside the branch) before it can be used as a `T`. The type system stays
@@ -71,7 +78,9 @@ final design intent, not options — revisit only with a concrete consumer need.
    Without that, a loop building a string by concatenation keeps every intermediate string
    until the call returns, which is quadratic memory. It is still not a GC: nothing is traced,
    because the IR carries a value across a back edge only in a local, so which values survive
-   is known from the code (see `codegen::rt`'s module docs).
+   is known from the code (see `codegen::rt`'s module docs). What top-level code builds
+   (decision 1) is the exception: it lives as long as the module, in the module's slots, and
+   being frozen, it is shared by every call rather than changed by any.
 5. **No fuel budget, no sandbox.** Per the trust model, scripts are trusted dev code.
    An *opt-in* debug step counter may exist purely to help developers catch accidental
    infinite loops during authoring, but it is off by default and is not a security or
@@ -81,7 +90,9 @@ final design intent, not options — revisit only with a concrete consumer need.
    stack use, not work — an infinite loop still runs forever.
 6. **Closures are allowed within an invocation** (they live in the arena) and cannot be
    persisted across calls. Module-level exported functions are compiled once and are not
-   closures over per-call state.
+   closures over per-call state: a module variable they read lives in a module slot, not an
+   upvalue. A closure top-level code builds may be kept in a module value, and is frozen with
+   it — it can read what it captured, but not change it.
 7. **No ambient stdlib.** There is no global `os`/`io`/time/random namespace — not for
    sandboxing, but for cleanliness and explicitness. The host injects exactly the
    capabilities a given embedding needs as registered functions; a small curated set of
@@ -155,9 +166,9 @@ Each phase is independently testable and leaves the crate green
 
 ### Phase 2 — Resolver + constraint enforcement
 - Scope/name resolution (locals, params, upvalues for in-call closures).
-- Enforce the **constraint contract**: no top-level locals; top level is the module
-  table + function decls; no free globals (only host-registered names + memory handle);
-  banned constructs rejected; determinism rules.
+- Enforce the **constraint contract**: no free globals (only host-registered names + memory
+  handle); banned constructs rejected; determinism rules. (Originally also: no top-level
+  locals, top level is the module table + function decls — lifted by top-level code, below.)
 - **Exit:** valid module shapes pass; every constraint violation has a targeted,
   span-pointing error with a test.
 
@@ -171,18 +182,18 @@ Each phase is independently testable and leaves the crate green
 - **Exit:** well-typed programs check; ill-typed programs produce precise errors;
   export signature is queryable.
 
-#### Constants: immutability and per-call identity  ✅ done
+#### Constants: immutability and per-call identity  ✅ done (memo superseded by top-level code)
 
 A `constdecl` is immutable all the way down (`SPEC.md` §3): writing through one is `E0307`,
 resolved in `resolve.rs` by checking what the assignment target is *rooted* in, so `mem.x = …`
 stays legal, a local shadowing a constant stays writable, and `C.x = …` does not.
 
-Constants are **memoized per call** in all three backends — the lifetime that satisfies both
-halves of the problem at once. Within an invocation every read yields the same value, so a
-constant is equal to itself (reference values compare by identity, `SPEC.md` §3.5); the memo
-dies with the call, so nothing survives between calls (§1). The JIT caches lazily in `RtCtx`
-(`rt_const_cached`/`rt_const_store`, keyed by a constant pool id) so a constant a call never
-reads is never built; scalar constants skip the cache entirely, having no identity to keep.
+Constants were first **memoized per call** in all three backends — within an invocation every
+read yielded the same value, so a constant was equal to itself (reference values compare by
+identity, `SPEC.md` §3.5), and the memo died with the call, so nothing survived between calls
+(§1). Top-level code (below) replaced the memo: a constant is now built once, when the module
+initializes, and frozen, which gives it one identity for the module's lifetime while still
+letting nothing change between calls.
 
 Two things surfaced while doing this, both fixed:
 
@@ -194,25 +205,56 @@ Two things surfaced while doing this, both fixed:
   drift go unnoticed. §3.5 now states value-vs-identity explicitly.
 
 The syntactic check keys on the assignment target's root, so `local t = C; t.x = …` gets past
-it. That is closed at run time: when a backend memoizes a constant it records the addresses of
-every table/array reachable from it (`Value::collect_reachable`), and the write paths refuse an
-assignment whose base is in that set. Nested tables and array elements are covered, reads
-through an alias are not affected, and the set is cleared with the memo each call.
+it. That is closed at run time: a backend records the addresses of every table/array reachable
+from a constant (`Value::collect_reachable`), and the write paths refuse an assignment whose
+base is in that set. Nested tables and array elements are covered, and reads through an alias
+are not affected.
 
 The escape-restriction alternative was rejected: forbidding a composite constant from appearing
 anywhere but as the base of a read would have made `local a = C; local b = C; a == b`
-unexpressible, i.e. it would have made the per-call identity above unobservable rather than
-correct. Freezing keeps aliasing available for reads, which is what makes identity meaningful.
-
-Cost is nil in the common case. The frozen set is empty for any call that has read no composite
-constant, so the write path pays one predictable branch; the `call/jit/fieldwrite` benchmark
-(added with this work, since every prior call benchmark was read-only or scalar) measures no
-change. Only a module that actually reads a composite constant pays a hash lookup per write.
+unexpressible, i.e. it would have made identity unobservable rather than correct. Freezing keeps
+aliasing available for reads, which is what makes identity meaningful.
 
 The one thing a frozen *marker on the value* would buy over this address set is protection for
 a constant escaping to the host — the host holds a `Value` and can mutate it through `Rc`
 regardless. That is not reachable from script code, and the host is trusted (`PLAN.md` §1
 trust model), so it is left alone.
+
+#### Top-level code: run once, then freeze  ✅ done
+
+Evaluated while asking how far Grindlang could move toward Luau: of the three meanings
+top-level statements could have in a compile-once, call-many module — a per-call `main`, true
+Luau (top-level locals as mutable module state), or Starlark's run-once-then-freeze — the last
+keeps §1's rule that only host memory persists, so it is the one built (§2 decision 1, `SPEC.md`
+§3.1). Locked sub-decisions: Lua scoping (a `function` or constant is in scope everywhere, a
+`local` from its declaration on); top-level code may call host functions but not use memory,
+which is bound per instance after it runs; `local` makes a name private; and `NAME = expr`
+constants became frozen module values like any other, dropping the literal-only rule (`E0303`)
+and the per-call memo.
+
+- **Front end.** The chunk is a list of `TopDecl`s in source order: functions, constants, and
+  statements. A top-level `local` is a **module variable** (`Binding::Module`), which every
+  function after it reads through a **module slot** — never an upvalue, so declared functions
+  stay plain functions (`CallScript`, `E0434`). The resolver enforces the rest: `E0308` (a
+  function assigns a module variable), `E0307` extended to module variables (a function writes
+  through one), `E0309` (`return` in top-level code), `E0310` (memory in top-level code).
+- **IR.** Top-level code lowers into one more function, `Program::init`, which sets slots with
+  `Op::GlobalSet`; every function reads them with `Op::GlobalGet`, which fails on a slot not set
+  yet (only possible while init runs). `ExportTarget::Global` exports a slot.
+- **Backends.** Each runs init once, before the first call (or at `init()`), counting it as no
+  script call; a failure is sticky, and a host panic leaves it to run again. Then it freezes
+  everything reachable from the slots — including a closure's captured cells, or a closure kept
+  in a module value would carry state between calls — and the write paths (field, index, cell)
+  refuse a write into that set. Memory is refused while init runs. `Engine::compile` runs init
+  eagerly, so its errors are `BuildError::Init`.
+- **Cost.** The frozen set is now permanent rather than per call, so any module whose top-level
+  code built a composite value pays a hash lookup per table write; one that built none pays the
+  one predictable branch as before. In the JIT a `number`/`bool` slot is read with two loads
+  from a table of bits filled after init (`RtCtx::global_bits`) rather than through a shim, and
+  a reference slot reuses the call's handle for the object when it has one. The
+  `call/jit/constread` benchmark (added with this work) measures the constant path; it was 38%
+  slower than the per-call memo through the shim alone, and is within about 6% with the fast
+  path.
 
 ### Phase 4 — Reference interpreter (semantics oracle)
 - Tree-walking interpreter over the typed AST/IR implementing the canonical semantics,

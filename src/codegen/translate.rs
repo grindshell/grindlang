@@ -25,8 +25,8 @@
 //!   bit pattern, `ERR`'s included;
 //! - a NaN comparison → detected natively, raised on the failing edge only;
 //! - `rt_closure_code_addr` → address `0` (jumping there would fault);
-//! - a script / const / indirect call → nothing, so the caller loads the context's `errored`
-//!   byte directly (see [`ERRORED_OFFSET`](super::rt::ERRORED_OFFSET)).
+//! - a script / indirect call → nothing, so the caller loads the context's `errored` byte
+//!   directly (see [`ERRORED_OFFSET`](super::rt::ERRORED_OFFSET)).
 //!
 //! Every shim call is guarded, even one whose op can't fail, because any shim can panic: the
 //! panic stops at the shim and comes back as a failure (see [`super::rt`]'s module docs). The
@@ -93,17 +93,6 @@ fn repr_of(ty: &Type) -> Repr {
     Repr::of(ty)
 }
 
-/// A constant's return repr.
-///
-/// Indexed, not defaulted: `const_rets` is filled for every constant in the program before any
-/// body is translated, and [`Translator::call_const_body`] indexes `const_ids` the same way one
-/// step later. A fallback here would not be conservative — guessing `Ptr` for a *scalar*
-/// constant makes [`Translator::translate_const_ref`] pass an `f64` where the memo path wants an
-/// `i64` handle, which fails cranelift's verifier rather than merely costing a lookup.
-fn repr_of_const(cx: &Context<'_>, name: &str) -> Repr {
-    cx.const_rets[name]
-}
-
 /// Build the typed signature of a compiled function: `(ctx, depth, params...) -> ret`, where
 /// `depth` is the call budget (see the module docs). A lifted closure's hidden env parameter is
 /// simply its first `Ptr` param.
@@ -142,11 +131,6 @@ pub struct Context<'a> {
     pub call_conv: CallConv,
     pub shims: &'a HashMap<&'static str, FuncId>,
     pub typed_ids: &'a HashMap<String, FuncId>,
-    pub const_ids: &'a HashMap<String, FuncId>,
-    /// Each constant's return repr, so [`Translator::translate_const_ref`] can tell a
-    /// reference-valued constant (memoized per call, to keep its identity stable) from a scalar
-    /// one (re-evaluated, since a scalar has no identity to keep).
-    pub const_rets: &'a HashMap<String, Repr>,
 }
 
 /// Translates one IR [`Function`] into the builder's clif function.
@@ -158,8 +142,8 @@ pub struct Translator<'a, 'b> {
     func: &'a Function,
 
     /// Whether this body is a script call, counted against the call-depth limit (`SPEC.md`
-    /// §7.3). A constant initializer is not: reading a constant isn't a call in the
-    /// interpreters, so counting it here would make the JIT fail one call sooner than they do.
+    /// §7.3). The module's top-level code is not: it isn't a call in the interpreters, so
+    /// counting it here would make the JIT fail one call sooner than they do.
     counts_calls: bool,
 
     ctx_val: ClifValue,
@@ -789,7 +773,13 @@ impl<'a, 'b> Translator<'a, 'b> {
                 let ret = self.dest_repr(dest);
                 Some(self.translate_call_builtin_member(ns, member, args, ret))
             }
-            Op::ConstRef(name) => self.translate_const_ref(name),
+            Op::GlobalGet(slot) => Some(self.translate_global_get(*slot, self.dest_repr(dest))),
+            Op::GlobalSet(slot, v) => {
+                let s = self.iconst32(*slot);
+                let [word, tag] = self.operand_args(*v);
+                self.call_checked_shim("rt_global_set", &[self.ctx_val, s, word, tag]);
+                None
+            }
             Op::MemoryRef(name) => {
                 let idx = self.pools.intern_memory(name);
                 let i = self.iconst32(idx);
@@ -1039,64 +1029,46 @@ impl<'a, 'b> Translator<'a, 'b> {
         result
     }
 
-    /// Read a top-level constant.
+    /// Read module slot `slot` as `repr`.
     ///
-    /// A **reference-valued** constant is memoized for the duration of the call: every read in
-    /// one invocation yields the same value, so a constant is equal to itself (reference values
-    /// compare by identity), while the cache dies with the call so nothing survives between
-    /// them (`SPEC.md` §1, §3). A **scalar** constant skips all of this — it has no identity to
-    /// keep stable, and caching one would mean boxing it into the value table per call.
-    ///
-    /// The lookup is lazy: a constant this call never reads is never evaluated.
-    fn translate_const_ref(&mut self, name: &str) -> Option<ClifValue> {
-        if repr_of_const(self.cx, name) != Repr::Ptr {
-            return self.call_const_body(name);
-        }
-
-        let idc = {
-            let id = self.pools.intern_const(name);
-            self.iconst32(id)
+    /// A `number` or `bool` slot never changes once top-level code has run, so outside top-level
+    /// code its bits are loaded straight from the module's scalar table — two loads and a
+    /// branch, where a constant used to be a native call. Top-level code itself takes the shim,
+    /// which knows whether the slot has been set yet.
+    fn translate_global_get(&mut self, slot: u32, repr: Repr) -> ClifValue {
+        let Some(ty) = clif_ty(repr).filter(|_| matches!(repr, Repr::Number | Repr::Bool)) else {
+            let s = self.iconst32(slot);
+            return self.call_read_shim("rt_global_get", &[self.ctx_val, s], repr);
         };
-        // `ERR` marks a miss: `nil` is a legal constant value, so the null handle can't. That makes
-        // the sentinel no use for spotting a failure here, so the call is guarded on the flag.
-        let cached = self
-            .call_checked_shim("rt_const_cached", &[self.ctx_val, idc])
-            .unwrap();
-        let miss = self
-            .builder
-            .ins()
-            .icmp_imm(IntCC::Equal, cached, ERR as i64);
-
-        let eval = self.builder.create_block();
+        let initializing = self.builder.ins().load(
+            types::I8,
+            MemFlags::trusted(),
+            self.ctx_val,
+            super::rt::INITIALIZING_OFFSET,
+        );
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        self.builder.set_cold_block(slow);
         let done = self.builder.create_block();
-        self.builder.append_block_param(done, types::I64);
-        self.builder
-            .ins()
-            .brif(miss, eval, &[], done, &[cached.into()]);
+        self.builder.append_block_param(done, ty);
+        self.builder.ins().brif(initializing, slow, &[], fast, &[]);
 
-        self.builder.switch_to_block(eval);
-        let fresh = self
-            .call_const_body(name)
-            .expect("a reference-valued constant returns a handle");
-        self.call_checked_shim("rt_const_store", &[self.ctx_val, idc, fresh]);
-        self.builder.ins().jump(done, &[fresh.into()]);
+        self.builder.switch_to_block(fast);
+        let base = self.load_ctx_u64(super::rt::GLOBAL_BITS_OFFSET);
+        let bits =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), base, (slot * 8) as i32);
+        let v = decode_word(&mut self.builder, repr, bits).expect("a scalar repr has a value");
+        self.builder.ins().jump(done, &[v.into()]);
+
+        self.builder.switch_to_block(slow);
+        let s = self.iconst32(slot);
+        let v = self.call_read_shim("rt_global_get", &[self.ctx_val, s], repr);
+        self.builder.ins().jump(done, &[v.into()]);
 
         self.builder.switch_to_block(done);
-        Some(self.builder.block_params(done)[0])
-    }
-
-    /// Invoke a constant's compiled body, propagating a failure the way any script call does —
-    /// a `constexpr` can contain a comparison, so its body is not unconditionally infallible.
-    fn call_const_body(&mut self, name: &str) -> Option<ClifValue> {
-        let id = self.cx.const_ids[name];
-        let fref = self.script_ref(id);
-        let call = self
-            .builder
-            .ins()
-            .call(fref, &[self.ctx_val, self.depth_val]);
-        let result = self.builder.inst_results(call).first().copied();
-        self.guard_errored();
-        result
+        self.builder.block_params(done)[0]
     }
 
     fn translate_call_host(&mut self, name: &str, args: &[ValueId], ret: Repr) -> ClifValue {
@@ -1299,7 +1271,11 @@ fn never_interns(func: &Function, op: &Op, dest: Option<ValueId>) -> bool {
         Op::Unary(..) | Op::Truthy(_) => true,
         Op::Binary(bop, ..) => *bop != BinOp::Concat,
         // Writes pass their operand as bits; nothing is interned.
-        Op::ArraySet(..) | Op::MapSet(..) | Op::FieldSet(..) | Op::CellSet(..) => true,
+        Op::ArraySet(..)
+        | Op::MapSet(..)
+        | Op::FieldSet(..)
+        | Op::CellSet(..)
+        | Op::GlobalSet(..) => true,
         // A scalar stored into a reference-typed local, or unwrapped into a reference, is boxed.
         Op::LocalSet(id, v) => {
             let into = func.locals.get(id).map_or(Repr::Ptr, repr_of);
@@ -1312,13 +1288,14 @@ fn never_interns(func: &Function, op: &Op, dest: Option<ValueId>) -> bool {
         | Op::MapGet(..)
         | Op::FieldGet(..)
         | Op::CellGet(_)
+        | Op::GlobalGet(_)
         | Op::MemoryRef(_)
         | Op::NamespaceField(..)
         | Op::CallHost(..)
         | Op::CallMethod(..)
         | Op::CallBuiltinValue(..)
         | Op::CallBuiltinMember(..) => dest_scalar,
-        // Script calls, constants, strings, and everything that builds a value.
+        // Script calls, strings, and everything that builds a value.
         _ => false,
     }
 }

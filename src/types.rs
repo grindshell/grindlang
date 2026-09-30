@@ -546,34 +546,57 @@ impl<'a> Checker<'a> {
     }
 
     fn run(&mut self, module: &Module) -> BTreeMap<String, Type> {
-        // Pass 1: constant types (no name references allowed in const RHS).
-        for decl in &module.decls {
-            if let TopDecl::Const(c) = decl {
-                let t = self.check_expr(&c.value);
-                let t = self.u.deep(&t);
-                self.const_types.insert(c.name.node.clone(), t);
-            }
-        }
-
-        // Pass 2: pre-create a signature (fresh vars) for every top-level function so
+        // Pass 1: pre-create a signature (fresh vars) for every top-level function so
         // calls — including mutual recursion — resolve before bodies are checked. `---@`
         // annotations pin parameter/return vars here, *before* Pass 3, so the body sees a
         // record/array parameter's shape and an otherwise-untypeable parameter is no longer
-        // ambiguous (`SPEC.md` §5.6).
+        // ambiguous (`SPEC.md` §5.6). Each constant gets a fresh type too, since it is in
+        // scope everywhere, above its declaration included.
         for decl in &module.decls {
-            if let TopDecl::Function(f) = decl {
-                let sig = self.make_sig(&f.body.params);
-                if !f.annotations.is_empty() {
-                    self.apply_fn_annotations(f, &sig);
+            match decl {
+                TopDecl::Function(f) => {
+                    let sig = self.make_sig(&f.body.params);
+                    if !f.annotations.is_empty() {
+                        self.apply_fn_annotations(f, &sig);
+                    }
+                    // A declared return type is the author's to give; `nil` against a
+                    // non-optional one is then reported at the `return`.
+                    if f.annotations.ret.is_empty() {
+                        self.infer_optional_return(&f.body, &sig);
+                    }
+                    self.func_sigs.insert(f.name.node.clone(), sig);
                 }
-                // A declared return type is the author's to give; `nil` against a non-optional
-                // one is then reported at the `return`.
-                if f.annotations.ret.is_empty() {
-                    self.infer_optional_return(&f.body, &sig);
+                TopDecl::Const(c) => {
+                    let t = self.u.fresh();
+                    self.const_types.insert(c.name.node.clone(), t);
                 }
-                self.func_sigs.insert(f.name.node.clone(), sig);
+                TopDecl::Stat(_) => {}
             }
         }
+
+        // Pass 2: check top-level code in order — the constants' initializers and the
+        // top-level statements. It returns nothing (the resolver rejects a `return` in it).
+        self.return_stack.push(ReturnFrame {
+            ret: Type::Unit,
+            widen: false,
+            saw_value: false,
+            bare_returns: Vec::new(),
+        });
+        for decl in &module.decls {
+            match decl {
+                TopDecl::Const(c) => {
+                    let t = self.check_expr(&c.value);
+                    let declared = self.const_types[&c.name.node].clone();
+                    if self.u.unify(&declared, &t).is_err() {
+                        let msg = self.mismatch("constant type mismatch", &t, &declared);
+                        self.error("E0402", msg, c.value.span);
+                    }
+                }
+                TopDecl::Stat(s) => self.check_stat(s),
+                TopDecl::Function(_) => {}
+            }
+        }
+        self.return_stack.pop();
 
         // Pass 3: check function bodies against their pre-created signatures.
         for decl in &module.decls {
@@ -628,11 +651,14 @@ impl<'a> Checker<'a> {
                             (ExprKind::Name(_), Some(Binding::TopConst(c))) => {
                                 self.const_types[c].clone()
                             }
+                            (ExprKind::Name(_), Some(Binding::Module(id))) => {
+                                self.sym_types[*id as usize].clone()
+                            }
                             _ => {
                                 self.error(
                                     "E0411",
-                                    "a module export entry must name a top-level function or \
-                                     constant",
+                                    "a module export entry must name a top-level function, \
+                                     constant, or `local`",
                                     value.span,
                                 );
                                 Type::Error
@@ -653,16 +679,19 @@ impl<'a> Checker<'a> {
                 }
             }
         } else {
+            // Everything but what `local` makes private: a `local function` and a top-level
+            // `local` are the module's own.
             for decl in &module.decls {
                 match decl {
-                    TopDecl::Function(f) => {
+                    TopDecl::Function(f) if !f.local => {
                         let sig = self.func_sigs[&f.name.node].clone();
                         exports.insert(f.name.node.clone(), self.u.deep(&Type::Function(sig)));
                     }
                     TopDecl::Const(c) => {
                         let t = self.const_types[&c.name.node].clone();
-                        exports.insert(c.name.node.clone(), t);
+                        exports.insert(c.name.node.clone(), self.u.deep(&t));
                     }
+                    TopDecl::Function(_) | TopDecl::Stat(_) => {}
                 }
             }
         }
@@ -1338,7 +1367,7 @@ impl<'a> Checker<'a> {
             return Type::Error;
         };
         match binding.clone() {
-            Binding::Local(id) | Binding::Upvalue(id) => self
+            Binding::Local(id) | Binding::Upvalue(id) | Binding::Module(id) => self
                 .read_narrowed(&Place::Symbol(id), expr.span)
                 .unwrap_or_else(|| self.sym_types[id as usize].clone()),
             // A direct call types its callee without coming through here (`check_call`), so
@@ -2253,8 +2282,12 @@ impl<'a> Checker<'a> {
     fn place_of(&self, expr: &Expr) -> Option<Place> {
         match &expr.kind {
             ExprKind::Paren(inner) => self.place_of(inner),
+            // A module variable narrows like a local: only top-level code assigns one, and a
+            // function it calls can't, so a guard in either still holds where it is checked.
             ExprKind::Name(_) => match self.res.binding(expr.span)? {
-                Binding::Local(id) | Binding::Upvalue(id) => Some(Place::Symbol(*id)),
+                Binding::Local(id) | Binding::Upvalue(id) | Binding::Module(id) => {
+                    Some(Place::Symbol(*id))
+                }
                 Binding::Memory(name) => Some(Place::Memory(name.clone())),
                 _ => None,
             },

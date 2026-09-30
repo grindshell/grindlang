@@ -9,11 +9,12 @@
 
 ## 1. What a Grindlang program is
 
-A Grindlang script is **not** a runnable program. It is a **module definition**: it
-evaluates, at compile time, to a **table of exported functions and constants**. The host
-compiles a script once into a `Module`, then calls its exported functions many times.
-The only state that survives between calls is **host-provided memory** (Rust-owned,
-exposed as a userdata-like value — see §7).
+A Grindlang script is **not** a standalone program. It is a **module definition**: it
+evaluates to a **table of exported functions and constants**. The host compiles a script once
+into a `Module`, then calls its exported functions many times. The script's **top-level
+code** — its top-level statements and constant initializers — runs **once**, before the first
+call, and everything it builds is then **frozen** (§3.1). The only state that survives between
+calls is **host-provided memory** (Rust-owned, exposed as a userdata-like value — see §7).
 
 Grindlang reuses **Lua's surface syntax** so existing Lua syntax highlighters and LSPs
 work on it, but it is **statically typed** and a **constrained subset** of Lua. A script
@@ -21,13 +22,12 @@ that is valid Lua may be rejected by Grindlang's checker — that is intended.
 
 ### Hard rules (the constraint contract)
 
-- **No top-level local variables.** The top level contains only export declarations
-  (§4). Mutable variables (`local x = …`) are legal **only inside function bodies**.
-- **No free globals.** The only names in scope at the top level are other top-level
-  declarations and **host-injected bindings** (§7). There is no implicit global table,
-  no `_G`, no ambient stdlib.
-- **No top-level executable statements.** The top level is a set of *declarations*, not a
-  statement sequence; nothing "runs" at load time beyond evaluating constant expressions.
+- **Top-level code runs once, then freezes.** A module's top-level `local`s, loops, `if`s,
+  and calls run when it initializes; after that, nothing they built can change — not by a
+  call, and not by a closure they built. Only host memory changes between calls (§3.1).
+- **No free globals.** The only names in scope are locals, top-level declarations, and
+  **host-injected bindings** (§7). There is no implicit global table, no `_G`, no ambient
+  stdlib.
 - **Numbers are `f64` only.** One numeric type. No integer subtype, no bitwise ops _(v1)_.
 - **Statically typed.** Every expression has a type known at compile time (§5).
 
@@ -103,48 +103,83 @@ terminal. `Name`, `Number`, `String` are lexical tokens from §2.
 ### 3.1 Top level (chunk)
 
 ```ebnf
-chunk      ::= {topdecl} [exportstat]
+chunk      ::= {topitem} [exportstat]
 
-topdecl    ::= funcdecl
+topitem    ::= funcdecl
+             | 'local' 'function' Name funcbody   -- a private function
              | constdecl
+             | stat                               -- top-level code (§3.3)
 
 funcdecl   ::= 'function' Name funcbody
-constdecl  ::= Name '=' constexpr
+constdecl  ::= Name '=' exp
 
 exportstat ::= 'return' tablecons [';']
 ```
 
-- A `funcdecl`'s `Name` and a `constdecl`'s `Name` are **module exports** and are
-  **immutable bindings**. All top-level names are mutually in scope, so functions may
-  call one another and recurse (including mutual recursion).
-- `constexpr` is a **compile-time-evaluable** expression: literals, `tablecons` of
-  constants, and `unop`/`binop` over constants. In v1 a `constexpr` may **not** reference
-  names (not even other top-level constants), call functions, or index/field-access —
-  only literal values and operators over them. (This avoids const-ordering and cycle
-  analysis; revisit if a consumer needs constant folding across declarations.)
-- A constant is **immutable all the way down**, not just as a binding. Writing *through* one —
-  `C.x = …`, `C.a.b = …`, `C.arr[1] = …` — is an `E0307` error, alongside the `E0302` that
-  rejects rebinding `C` itself. A constant is a compile-time value, so a mutable one would be
-  module-level state surviving between calls, which §1 reserves for host memory. Reading
-  through a constant is of course fine, and writing through **memory** stays fine (§7) — the
-  rule keys on what the assignment target is rooted in, not on its shape.
+**Top-level code.** A module's `constdecl`s and top-level `stat`s are its **top-level code**,
+which runs **once** per module instance, in source order, before the module's first call.
+Everything it builds is then **frozen**: no later call can change it, which is what keeps §1's
+rule that only host memory survives between calls. It can loop, branch, call functions, and
+build tables — a lookup table computed once, for instance:
 
-  The guarantee holds **however the constant was reached**, not just syntactically. Binding one
-  to a local first (`local t = C; t.x = …`) gets past `E0307`, which keys on the assignment
-  target's root, and is refused at run time instead — as is a write into a constant's *nested*
-  table or array. Reading through an alias stays fine; only writing is refused.
-- A constant is **memoized per call**. Within one invocation every read of `C` yields the same
-  value — so `C == C`, which matters because reference values compare by *identity* (§3.5), not
-  structurally — and the memo is discarded when the call ends, so no constant (nor anything
-  reachable from one) survives between calls, per §1. A composite constant is therefore rebuilt
-  by the first call that reads it and never by a call that doesn't. Scalar constants have no
-  identity to preserve and are simply re-evaluated.
+```lua
+local SQUARES = {}
+for i = 1, 10 do
+  SQUARES[i] = i * i
+end
+
+function square(n)
+  local v = SQUARES[n]
+  if v ~= nil then return v end
+  return -1
+end
+```
+
+- **Declarations.** A `funcdecl`'s and a `constdecl`'s `Name` are **module exports** and
+  **immutable bindings**, in scope **everywhere** — above their declaration too, so functions
+  may call one another and recurse (including mutual recursion). A top-level `local` declares a
+  **module variable**, and `local function` a private function; each is in scope only **from
+  its declaration on** (to the end of the chunk, including inside the functions declared after
+  it), as in Lua. Top-level names must be distinct (`E0305`); a `local` inside one of top-level
+  code's blocks is an ordinary local, and may shadow one.
+- **`Name = exp` at the top level** declares a constant, unless `Name` is a top-level `local`
+  already in scope, in which case it assigns that module variable, as in Lua. A constant's
+  initializer is any expression — names, calls, field reads.
+- **Order.** Top-level code runs statement by statement. A constant or module variable read
+  before the code that sets it has run — by top-level code calling, too early, a function that
+  reads it — is a runtime error. After initialization every one is set, so a call can't hit
+  this.
+- **What top-level code may do.** Anything a function body may, except `return` (`E0309`; the
+  export table is the only top-level `return`) and using host memory (`E0310`): memory is bound
+  to each module instance after it initializes, and freezing a value derived from it would only
+  capture a snapshot. A function that top-level code calls can't use memory either — that is a
+  runtime error. Top-level code may call host functions; what they return is frozen like
+  anything else it builds.
+- **Only top-level code changes module values.** Top-level code may assign a module variable
+  and write through a constant or module variable (`T.x = …`) as it builds them. A function may
+  do neither — assigning a module variable in one is `E0308`, and writing through a module value
+  is `E0307` — since by the time any call runs, the module has initialized and they are frozen.
+  Constants cannot be reassigned at all (`E0302`). Reading is always fine, and writing through
+  **memory** stays fine (§7) — the rule keys on what the assignment target is rooted in, not on
+  its shape.
+- **Freezing.** Once top-level code has run, every table, array, and closure-captured variable
+  reachable from a constant or module variable is immutable. The guarantee holds **however the
+  value was reached**, not just syntactically: binding one to a local first (`local t = C;
+  t.x = …`) gets past `E0307`, which keys on the assignment target's root, and is refused at run
+  time instead — as is a write into a *nested* table or array, and a closure kept in a module
+  value assigning a variable it captured. Reading through an alias stays fine; only writing is
+  refused. A module value is one object for the module's lifetime, so `C == C` holds in and
+  across calls (reference values compare by *identity*, §3.5).
+- **Errors.** A runtime error in top-level code fails the module: every call reports it
+  (`Engine::compile` runs top-level code eagerly, and reports it as a build error). A host
+  function that *panics* in top-level code panics the call that ran it, and top-level code runs
+  again, from the start, on the next (§7.3).
 - If present, the trailing `exportstat` **curates the public surface**: only the names it
-  lists are exported, under the keys given. Without it, *all* top-level declarations are
-  exported under their own names. (There is no `local M = {}` / `return M` idiom — the
-  module table is implicit.) Each entry is `key = Name`, where `Name` is a top-level function
-  or constant; any other value — a literal, an expression, a host function — is an `E0411`
-  error.
+  lists are exported, under the keys given. Without it, every `funcdecl` and `constdecl` is
+  exported under its own name; a top-level `local` or `local function` is private. (There is
+  no `local M = {}` / `return M` idiom — the module table is implicit.) Each entry is
+  `key = Name`, where `Name` is a top-level function, constant, or `local`; any other value — a
+  literal, an expression, a host function — is an `E0411` error.
 - `function M.foo()` style member syntax does **not** exist — all top-level functions are
   already module members.
 
@@ -158,7 +193,10 @@ block      ::= {stat} [retstat]
 retstat    ::= 'return' [explist] [';']
 ```
 
-### 3.3 Statements (function-body only)
+### 3.3 Statements
+
+Statements appear in function bodies and in top-level code (§3.1), where a top-level `local`
+declares a module variable and a top-level `local function` a private top-level function.
 
 ```ebnf
 stat ::= ';'
@@ -181,8 +219,9 @@ varlist    ::= var {',' var}
 explist    ::= exp {',' exp}
 ```
 
-- `local function` is allowed **inside bodies** (it is a local, which is legal here, not
-  at the top level).
+- Inside a body (or a block of top-level code), `local function` declares a local holding a
+  closure, a first-class value. At the top level it declares a private *named* function,
+  which, like a `funcdecl`, can only be called directly (§5.5).
 - `genericfor`'s `iterexpr` is restricted to the builtins `ipairs(arr)` and `pairs(map)`
   _(v1)_ — there are no user-defined iterators (no metatables). A record is not iterable: its
   fields can have different types, so no one loop variable type fits. Iterating anything else
@@ -212,7 +251,7 @@ exp ::= 'nil' | 'true' | 'false'
       | exp binop exp
       | unop exp
 
-functiondef ::= 'function' funcbody          -- anonymous closure (in-call only, §5.5)
+functiondef ::= 'function' funcbody          -- anonymous closure (§5.5)
 
 prefixexp   ::= var
               | functioncall
@@ -272,7 +311,7 @@ Operator typing _(v1)_:
 `nil`, `bool`, `number`, and `string` compare by their value; `array`, `map`/`record`, tuples,
 and function values compare by *which object they are*. So two separately built tables with the
 same contents are **not** equal, and a table is equal to itself however it was reached —
-including through a constant, which §3 memoizes per call precisely so that holds.
+including through a constant, which top-level code builds once (§3.1).
 
 **`and` / `or` operands may differ in type.** The result's type is the one type that covers
 every operand the expression can yield, worked out across a whole chain such as `c and a or b`;
@@ -314,8 +353,22 @@ function can_level_up(xp, level)
 end
 ```
 
-The module above exports `{ MAX_LEVEL, xp_for, can_level_up }`. To expose a curated
-subset under chosen keys, end with an export table:
+The module above exports `{ MAX_LEVEL, xp_for, can_level_up }`. A top-level `local` or
+`local function` stays private:
+
+```lua
+local XP_BASE = 10                     -- private module variable
+
+local function curve(level)           -- private function
+  return level * level
+end
+
+function xp_for(level)
+  return curve(level) * XP_BASE
+end
+```
+
+To expose a curated subset under chosen keys, end with an export table:
 
 ```lua
 return {
@@ -451,16 +504,18 @@ end
   value list (`local a, b = f(), 5`) — is a compile error (`E0415`). *(v1 / "Tier A": there is
   no value-count adjustment and no spreading of a call's results into an argument list; those
   Lua behaviors are intentionally omitted.)*
-- Anonymous `function … end` expressions (closures) are allowed **inside** function
-  bodies; they may capture enclosing locals (their *upvalues*). Captured variables are shared
-  mutable cells: a write through one closure is observed by the enclosing scope and by sibling
-  closures.
+- Anonymous `function … end` expressions (closures) are allowed in function bodies and in
+  top-level code; they may capture enclosing locals (their *upvalues*). Captured variables are
+  shared mutable cells: a write through one closure is observed by the enclosing scope and by
+  sibling closures. A module variable is not captured — every function reads it directly — and
+  a closure kept in a module value is frozen with it: it may read what it captured, but
+  assigning it is a runtime error (§3.1).
 - A closure is a **first-class value**: it may be returned (including across the host
   boundary) and held by the host, which can re-invoke it later — multiple times, observing
   mutations to its upvalues between calls (`Module::call_value`). A returned closure keeps its
   backing code and captured state alive for as long as the host holds it.
-- A **named** top-level or host function is not a value: it may only be called directly,
-  `f(args)`. Binding, returning, storing, or passing it (`local g = f`) is an `E0434` error. To
+- A **named** top-level function (a `function` or top-level `local function`) or host function
+  is not a value: it may only be called directly, `f(args)`. Binding, returning, storing, or passing it (`local g = f`) is an `E0434` error. To
   use one as a value, wrap the call in a closure: `local g = function(x) return f(x) end`.
 - A closure is **bound to the module instance that created it**. Only that instance may invoke
   it; passing it to a different `Module` — even one compiled from the identical source — is a
@@ -485,7 +540,7 @@ end
 EmmyLua `---@` comments (§2.2) may pin types where inference is insufficient (e.g. a
 parameter used only by pass-through, or a record/array parameter whose shape inference can't
 recover) or for documentation. A `---` doc-comment block **immediately preceding** a
-top-level `function` annotates it; the block binds to that function only.
+top-level `function` or `local function` annotates it; the block binds to that function only.
 
 Recognized _(v1)_: `---@param <name> <type>` and `---@return <type>` on top-level functions.
 A single `---@return` pins a single return type; **two or more `---@return` lines** pin a
@@ -559,6 +614,10 @@ end
 The names of injected bindings (`mem`, registered functions) are configured per embedding;
 `mem` is used illustratively. Injected names are reserved within a script — a top-level
 declaration may not shadow them.
+
+Top-level code (§3.1) may call registered functions but not use memory, which a host binds to
+each module instance after the module has initialized: `E0310` in top-level code itself, and a
+runtime error in a function top-level code calls.
 
 A binding that the embedding **declares but never provides** is a runtime error the first time
 a script reads it — never a silent `nil`. The check is lazy: declaring a memory the script
@@ -644,7 +703,8 @@ a host function or method.
   thread's native stack, so without a limit runaway recursion would overflow it and abort the
   host process instead of returning `Err`. The limit counts calls rather than bytes so that every
   backend fails at the same call. Calling a host function or method and reading a constant are
-  not script calls and do not count.
+  not script calls and do not count; nor is running top-level code (§3.1), though the functions
+  it calls are.
 - **A host panic panics the call.** A host function or method that panics is not a runtime
   error: the panic propagates out of the host's call unchanged, in every backend. It stops the
   script where it happened, like an error — nothing after it runs, and effects before it
@@ -657,7 +717,8 @@ These are the semantics every backend implements; they are what the three-oracle
 
 Each produces a targeted, span-pointing error:
 
-- top-level `local` / any top-level statement that isn't a `funcdecl`/`constdecl`/export
+- a function assigning a module variable (`E0308`) or writing through a module value (`E0307`);
+  `return` in top-level code (`E0309`); host memory in top-level code (`E0310`) — §3.1
 - `local M = {} … return M` idiom (use implicit exports)
 - free global read/write; `_G`, `_ENV`
 - `goto` / labels; varargs `...`; `repeat … until` loops
@@ -745,6 +806,14 @@ both read/write persistent memory.
 - **`---@` annotation type-syntax subset** is fixed (§5.6): `@param`/`@return` on top-level
   functions, scalar/optional/array/map/record spellings, `@type` and function/userdata types
   deferred, unknown directives ignored.
+- **Top-level code runs once, then freezes** (§3.1) — Starlark's model, chosen over running it
+  per call (which would leave top-level locals out of reach of the declared functions) and over
+  true Luau (mutable module state, which §1 reserves for host memory). Scoping is Lua's: a
+  `function` or constant is in scope everywhere, a top-level `local` from its declaration on,
+  and a read before the code that sets it has run is a runtime error. Top-level code may call
+  host functions but not use memory. `local` makes a top-level name private. A constant's
+  initializer may be any expression; constants are built once and frozen like any other module
+  value (they used to be literal-only, and rebuilt per call).
 
 ### Open spec items still to settle during implementation
 - `string.format` verb whitelist and `string.find` plain-vs-pattern policy (§6).

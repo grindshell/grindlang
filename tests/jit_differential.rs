@@ -1534,7 +1534,7 @@ fn pairs_directly_over_map_literals() {
 // ---- Loops that create values, which the JIT compacts away at the back edge ----
 //
 // A loop drops what its past iterations interned, keeping only what its reference-typed locals
-// still hold (and constants read since it began), which move. Every case here runs 200
+// still hold, which move. Every case here runs 200
 // iterations, so even the default JIT compacts several times, and `assert_all_return`'s eager
 // JIT compacts at every back edge.
 
@@ -1698,8 +1698,8 @@ fn loops_that_create_values_agree_everywhere() {
     }
 }
 
-/// A constant first read inside a loop stays frozen after the loop compacts: the write after it
-/// fails in every backend.
+/// A constant read inside a loop stays frozen after the loop compacts: the write after it fails
+/// in every backend.
 #[test]
 fn a_constant_read_in_a_compacting_loop_stays_frozen() {
     assert_same(
@@ -1713,6 +1713,6 @@ fn a_constant_read_in_a_compacting_loop_stays_frozen() {
         let e = jit
             .call("write_constant", vec![Value::Number(200.0)])
             .expect_err("a constant is immutable");
-        assert!(e.to_string().contains("constant"), "got {e}");
+        assert!(e.to_string().contains("frozen module value"), "got {e}");
     }
 }

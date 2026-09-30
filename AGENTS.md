@@ -10,7 +10,9 @@ embedding **calculations** and **dialog-tree decisions** into Grindshell.
 
 A Grindlang script is **not** a standalone program. It evaluates to a **module table of
 exported functions and constants**; the host compiles it once and calls its exports many
-times. State persists between calls only through **host-provided memory** (Rust-owned).
+times. Its **top-level code** (top-level statements and constant initializers) runs once, before
+the first call, and what it builds is then frozen. State persists between calls only through
+**host-provided memory** (Rust-owned).
 
 Two authoritative documents sit beside this one — read them before changing behavior:
 
@@ -31,9 +33,10 @@ Phases 0–9 are delivered (front end, resolver, type system, reference interpre
 IR, shared runtime, cranelift JIT, host embedding API; plus Phase 9 hardening: differential +
 fuzz + property tests, criterion benchmarks with a rough Luau baseline, this `CLAUDE.md`, the
 `SPEC.md`, the `embed` example, and the `grindlang` CLI runner). Closures with upvalues,
-calling first-class function values (see `src/capture.rs`), and host-memory method calls
-(`mem:m(args)`, `SPEC.md` §7) have landed since the original Phase 7 cut. See `PLAN.md` §4 for
-per-phase notes and what remains deferred (the full native arena, portable closures).
+calling first-class function values (see `src/capture.rs`), host-memory method calls
+(`mem:m(args)`, `SPEC.md` §7), and top-level code (run once, then frozen — `SPEC.md` §3.1) have
+landed since the original Phase 7 cut. See `PLAN.md` §4 for per-phase notes and what remains
+deferred (the full native arena, portable closures).
 
 ## 3. Tech stack
 
@@ -112,6 +115,14 @@ source (.lua-syntax text)
 `src/capture.rs` is the shared free-variable / closure-capture analysis (the single source of
 truth for upvalue *ordering*) consumed by both `interp` and `ir` lowering so the interpreters
 and the JIT agree on a closure's environment.
+
+**Top-level code** (`SPEC.md` §3.1) runs as one more function, `ir::Program::init`, once per
+module instance before its first call (every backend has an `init()`; `Engine::compile` calls
+it). Constants and top-level `local`s live in **module slots** (`Binding::Module` /
+`Binding::TopConst` → `Op::GlobalGet`/`GlobalSet`), never upvalues, so declared functions stay
+plain functions. After init each backend freezes everything reachable from the slots
+(`Value::collect_reachable`, closure cells included), and its write paths refuse writes into
+that set — keep all three doing the same.
 
 Front-end entry points in `lib.rs` are always available: `parse` (→ AST), `check` (+ resolve),
 `analyze` (+ typecheck → export signature), `compile` (+ lower → verified IR).
