@@ -326,7 +326,8 @@ pub struct ClosureOrigin {
     /// later module that happens to reuse a dropped module's address.
     pub module_id: u64,
     /// Keeps the origin module's native code mapped for as long as any closure it built is
-    /// reachable, so holding a closure past its module's drop stays sound.
+    /// reachable, so holding a closure past its module's drop stays sound. The code is unmapped
+    /// when the last holder lets go.
     pub keepalive: Rc<dyn Any>,
 }
 

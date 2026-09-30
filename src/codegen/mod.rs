@@ -85,13 +85,51 @@ const MAX_DIRECT_ARGS: usize = 8;
 /// happens to occupy a dropped module's address.
 static NEXT_MODULE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A cranelift module whose code and data are unmapped when it is dropped.
+///
+/// Cranelift leaks a module's memory on drop by default, since it can't know whether a function
+/// pointer into it is still in use, so a host that compiled scripts repeatedly would lose a few
+/// pages to every compile. Here that is known: the only paths into the code are a [`JitModule`]
+/// and the [`RtCtx`] a call runs in, both of which hold the [`rt::ClosureOrigin`] that owns this,
+/// so by the time it drops no call is running and none can start.
+struct NativeCode(std::mem::ManuallyDrop<JITModule>);
+
+impl NativeCode {
+    fn new(module: JITModule) -> Self {
+        NativeCode(std::mem::ManuallyDrop::new(module))
+    }
+}
+
+impl std::ops::Deref for NativeCode {
+    type Target = JITModule;
+
+    fn deref(&self) -> &JITModule {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for NativeCode {
+    fn deref_mut(&mut self) -> &mut JITModule {
+        &mut self.0
+    }
+}
+
+impl Drop for NativeCode {
+    fn drop(&mut self) {
+        // SAFETY: nothing runs this module's code any more (see the type docs); a compile that
+        // failed never handed out a pointer into it. `self.0` is not used again.
+        unsafe { std::mem::ManuallyDrop::take(&mut self.0).free_memory() }
+    }
+}
+
 /// A compiled module: native code plus the machinery to call it.
 pub struct JitModule {
     /// This module's identity, stamped into every closure it builds so a closure can only be
-    /// invoked by the module that created it. Also owns the [`Rc<JITModule>`] keeping the
+    /// invoked by the module that created it. Also owns the [`NativeCode`] keeping the
     /// executable memory mapped — shared into any closure that escapes to the host, so holding
-    /// a returned closure after this `JitModule` is dropped stays sound. Cloned into each
-    /// [`RtCtx`] so the runtime makes the same check compiled code does.
+    /// a returned closure after this `JitModule` is dropped stays sound; the code is unmapped
+    /// once this and every closure it built are gone. Cloned into each [`RtCtx`] so the runtime
+    /// makes the same check compiled code does.
     origin: Rc<rt::ClosureOrigin>,
     pools: Rc<Pools>,
     /// export name → its target (function or constant).
@@ -151,7 +189,8 @@ impl JitModule {
         for shim in &shim_table {
             builder.symbol(shim.name, shim.addr);
         }
-        let mut module = JITModule::new(builder);
+        // Wrapped at once, so a failed compile frees what it had emitted as well.
+        let mut module = NativeCode::new(JITModule::new(builder));
 
         // Declare the runtime shims as imports.
         let shims = declare_shims(&mut module, call_conv, &shim_table)?;
@@ -881,6 +920,34 @@ mod tests {
         mem.insert("gold".to_string(), Value::Number(3.0));
         jit.set_memory("mem", Value::table(mem));
         jit
+    }
+
+    /// Dropping a module unmaps its native code, which cranelift on its own leaks: a host that
+    /// recompiled scripts would lose memory to every compile.
+    #[test]
+    fn dropping_a_module_frees_its_code() {
+        let mut jit = module("function f(n) return n + 1 end");
+        jit.call("f", vec![Value::Number(1.0)]).expect("call");
+        let code = Rc::downgrade(&jit.origin.keepalive);
+        assert!(code.upgrade().is_some_and(|c| c.is::<NativeCode>()));
+        drop(jit);
+        assert!(code.upgrade().is_none(), "the code outlived its module");
+    }
+
+    /// A closure returned to the host keeps its module's code mapped after the module is
+    /// dropped, and the code goes with the closure.
+    #[test]
+    fn a_closure_the_host_holds_keeps_its_modules_code() {
+        let mut jit = module("function make(n) return function(x) return x + n end end");
+        let closure = jit.call("make", vec![Value::Number(1.0)]).expect("closure");
+        let code = Rc::downgrade(&jit.origin.keepalive);
+        drop(jit);
+        assert!(
+            code.upgrade().is_some(),
+            "the code was freed under a live closure"
+        );
+        drop(closure);
+        assert!(code.upgrade().is_none(), "the code outlived the closure");
     }
 
     /// Value-table entries the pooled context holds after one `f(n)` call.

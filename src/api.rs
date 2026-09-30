@@ -533,8 +533,9 @@ impl Engine {
     /// closures are installed into the module.
     ///
     /// To recompile on change, simply call `compile` again — each call yields an independent
-    /// `Module` owning its own native code; hosts can cache `Module`s by source as they see
-    /// fit.
+    /// `Module` owning its own native code, which is freed when the `Module` is dropped (or,
+    /// if the host still holds closures it returned, once those are dropped too); hosts can
+    /// cache `Module`s by source as they see fit.
     pub fn compile(&self, src: &str) -> Result<Module, BuildError> {
         let cfg = self.type_config();
         let (module, res, info) = crate::analyze(src, &cfg)?;
