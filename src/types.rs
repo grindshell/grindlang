@@ -32,6 +32,13 @@
 //!   because the function returns a literal `nil` beside a value — a `return` may give a `T` or
 //!   `nil`, checked like an assignment. Decided before the body is checked, so it doesn't depend
 //!   on the order of the `return`s (§5.5).
+//! * **A local initialized to `nil`** is `T?`, with `T` fixed by what is later assigned to it
+//!   (§5.2), or `nil` if nothing else ever is.
+//! * **Uses before the code that types a value**: a field read or write, or a call, on a value
+//!   whose type is still unknown (a `local best = nil` read under a guard above the assignment
+//!   that types it) stands for a fresh variable and is checked once every body has been, so the
+//!   outcome doesn't depend on the order of the code. One whose value never gets a type is
+//!   `E0410`.
 //! * **Flow narrowing**: inside `if <place> ~= nil then`, a `T?` place reads as `T`, where the
 //!   place is a local, an upvalue, a memory root, or a field path over one (§5.3). A write to
 //!   the place or a prefix of it ends the narrowing. Each narrowed read is recorded in
@@ -296,7 +303,11 @@ impl Unifier {
     /// Fully substitute all variables, recursively. Unresolved vars stay [`Type::Var`].
     fn deep(&self, t: &Type) -> Type {
         match self.shallow(t) {
-            Type::Optional(i) => Type::optional(self.deep(&i)),
+            Type::Optional(i) => match self.deep(&i) {
+                // Holds nothing but `nil` (a `local x = nil` that nothing else is assigned to).
+                Type::Nil => Type::Nil,
+                inner => Type::optional(inner),
+            },
             Type::Array(i) => Type::array(self.deep(&i)),
             Type::Map(i) => Type::map(self.deep(&i)),
             Type::Record(fields) => Type::Record(
@@ -406,6 +417,30 @@ struct ValuelessExits {
     falls_off: Option<Span>,
 }
 
+/// A use of a value whose type wasn't known yet when the checker reached it: a field read or
+/// write, or a call, on a value only later code gives a type (`local best = nil`, assigned
+/// further down the loop that reads `best.score`). Checked once every body has been
+/// ([`Checker::check_deferred_uses`]); until then the use stands for a fresh variable.
+struct DeferredUse {
+    /// The used value's type: an unbound variable when the use was reached.
+    base: Type,
+    kind: DeferredKind,
+    /// The used value, where an error about it (rather than a field) is reported.
+    span: Span,
+}
+
+enum DeferredKind {
+    /// `base.name`. A read stands for `ty`; a write assigns a value of type `ty`. Errors about
+    /// the field itself are reported at `name`, as they are when the type is known.
+    Field { name: Ident, ty: Type, write: bool },
+    /// `base(args)`, standing for `result`.
+    Call {
+        args: Vec<(Type, Span)>,
+        result: Type,
+        span: Span,
+    },
+}
+
 /// A **narrowable location**: a bare local/upvalue symbol, a host-memory root, or a field
 /// path rooted at one of those. Keying the narrowing overlay by `Place` (rather than a bare
 /// [`SymbolId`]) is what lets `if p.name ~= nil then … p.name` refine a *field*, not just a
@@ -447,6 +482,10 @@ struct Checker<'a> {
     func_literals: HashMap<Span, FnType>,
     return_stack: Vec<ReturnFrame>,
     valueless_exits: Vec<ValuelessExits>,
+    deferred: Vec<DeferredUse>,
+    /// The `T` of each `local x = nil`'s type `T?`, which is `nil` if nothing else is ever
+    /// assigned to `x` ([`Checker::settle_nil_locals`]).
+    nil_locals: Vec<Type>,
     diags: Diagnostics,
 }
 
@@ -465,6 +504,8 @@ impl<'a> Checker<'a> {
             func_literals: HashMap::new(),
             return_stack: Vec::new(),
             valueless_exits: Vec::new(),
+            deferred: Vec::new(),
+            nil_locals: Vec::new(),
             diags: Diagnostics::new(),
         }
     }
@@ -510,15 +551,18 @@ impl<'a> Checker<'a> {
                 self.check_func_body(&f.body, &sig);
             }
         }
+        self.check_deferred_uses();
         self.check_valueless_exits();
 
         // Pass 4: flag parameters whose type inference couldn't pin.
+        let mut unknown_params = std::collections::HashSet::new();
         for sym in self.res.symbols.iter() {
             if sym.kind == crate::resolve::SymbolKind::Param
                 && let Some(id) = self.res.def(sym.def_span)
             {
                 let t = self.u.deep(&self.sym_types[id as usize]);
-                if matches!(t, Type::Var(_)) {
+                if let Type::Var(var) = t {
+                    unknown_params.insert(var);
                     self.error(
                         "E0410",
                         format!(
@@ -531,6 +575,8 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        self.report_unknown_uses(&unknown_params);
+        self.settle_nil_locals();
 
         self.build_exports(module)
     }
@@ -771,6 +817,149 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Check each [`DeferredUse`] whose value now has a type, as the use would have been had
+    /// the type been known when the checker reached it.
+    ///
+    /// Repeated until nothing more resolves, since checking one use can fix the type of another's
+    /// value: in `best.inner.x`, the type of `best.inner` is only known once `best.inner` is
+    /// checked. A use whose value still has no type is left for [`Self::report_unknown_uses`].
+    fn check_deferred_uses(&mut self) {
+        loop {
+            let pending = std::mem::take(&mut self.deferred);
+            let count = pending.len();
+            for use_ in pending {
+                if matches!(self.u.shallow(&use_.base), Type::Var(_)) {
+                    self.deferred.push(use_);
+                } else {
+                    self.check_deferred_use(use_);
+                }
+            }
+            if self.deferred.len() == count {
+                return;
+            }
+        }
+    }
+
+    fn check_deferred_use(&mut self, use_: DeferredUse) {
+        let base = self.u.shallow(&use_.base);
+        match use_.kind {
+            DeferredKind::Field { name, ty, write } => {
+                let field = match base {
+                    Type::Record(ref fields) => match fields.get(&name.node) {
+                        Some(t) => t.clone(),
+                        None => {
+                            let added = if write {
+                                " (fields cannot be added)"
+                            } else {
+                                ""
+                            };
+                            self.error(
+                                "E0420",
+                                format!(
+                                    "no field `{}` on {}{added}",
+                                    name.node,
+                                    self.u.deep(&base)
+                                ),
+                                name.span,
+                            );
+                            return;
+                        }
+                    },
+                    // A write stores the element; a read may find it missing.
+                    Type::Map(v) if write => *v,
+                    Type::Map(v) => Type::optional(*v),
+                    Type::Error => return,
+                    other => {
+                        self.no_fields(&other, &name.node, name.span);
+                        return;
+                    }
+                };
+                if write {
+                    self.require_assignable(name.span, &ty, &field, "assignment type mismatch");
+                } else if self.u.unify(&field, &ty).is_err() {
+                    self.error(
+                        "E0402",
+                        format!(
+                            "field `{}` has type {}, but is used here as {}",
+                            name.node,
+                            self.u.deep(&field),
+                            self.u.deep(&ty)
+                        ),
+                        name.span,
+                    );
+                }
+            }
+            DeferredKind::Call { args, result, span } => match base {
+                Type::Function(ft) => {
+                    if args.len() != ft.params.len() {
+                        self.error(
+                            "E0430",
+                            format!(
+                                "this function takes {} argument(s) but {} were supplied",
+                                ft.params.len(),
+                                args.len()
+                            ),
+                            span,
+                        );
+                    }
+                    for ((at, arg_span), pt) in args.iter().zip(&ft.params) {
+                        self.require_assignable(*arg_span, at, pt, "argument type mismatch");
+                    }
+                    if self.u.unify(&ft.ret, &result).is_err() {
+                        self.error(
+                            "E0402",
+                            format!(
+                                "this function returns {}, but its result is used here as {}",
+                                self.u.deep(&ft.ret),
+                                self.u.deep(&result)
+                            ),
+                            span,
+                        );
+                    }
+                }
+                Type::Error => {}
+                other => self.error(
+                    "E0431",
+                    format!("type {} is not callable", self.u.deep(&other)),
+                    use_.span,
+                ),
+            },
+        }
+    }
+
+    /// Reject each [`DeferredUse`] whose value never got a type (`E0410`), except where that value
+    /// is a parameter already reported as such.
+    fn report_unknown_uses(&mut self, unknown_params: &std::collections::HashSet<u32>) {
+        for use_ in std::mem::take(&mut self.deferred) {
+            if let Type::Var(var) = self.u.shallow(&use_.base)
+                && unknown_params.contains(&var)
+            {
+                continue;
+            }
+            let msg = match use_.kind {
+                DeferredKind::Field { name, .. } => format!(
+                    "cannot infer the type of this value, so its field `{}` can't be checked",
+                    name.node
+                ),
+                DeferredKind::Call { .. } => {
+                    "cannot infer the type of this value, so calling it can't be checked"
+                        .to_string()
+                }
+            };
+            self.error("E0410", msg, use_.span);
+        }
+    }
+
+    /// Give each `local x = nil` that is never assigned anything but `nil` the type `nil`: its
+    /// type is `T?` with nothing to fix `T`, and [`Unifier::deep`] reads `nil?` as `nil`.
+    fn settle_nil_locals(&mut self) {
+        for inner in std::mem::take(&mut self.nil_locals) {
+            if matches!(self.u.shallow(&inner), Type::Var(_)) {
+                let _ = self.u.unify(&inner, &Type::Nil);
+            }
+        }
+    }
+
     fn check_block(&mut self, block: &Block) {
         for stat in &block.stats {
             self.check_stat(stat);
@@ -802,15 +991,8 @@ impl<'a> Checker<'a> {
             if !widen {
                 self.require(span, &value_ty, &r, "E0413", "return type mismatch");
             } else if !self.is_assignable(&value_ty, &r) {
-                self.error(
-                    "E0413",
-                    format!(
-                        "return type mismatch: expected {}, found {}",
-                        self.u.deep(&r),
-                        self.u.deep(&value_ty)
-                    ),
-                    span,
-                );
+                let msg = self.mismatch("return type mismatch", &value_ty, &r);
+                self.error("E0413", msg, span);
             }
         }
         if let Some(frame) = self.return_stack.last_mut() {
@@ -948,6 +1130,15 @@ impl<'a> Checker<'a> {
         }
         let value_types = self.check_multi_rhs(exprs, names.len(), span);
         for (name, vt) in names.iter().zip(value_types) {
+            // A local that starts out `nil` is optional, holding whatever is later assigned to
+            // it (`SPEC.md` §5.2); it would otherwise be typed `nil`, which nothing else fits.
+            let vt = if matches!(self.u.shallow(&vt), Type::Nil) {
+                let inner = self.u.fresh();
+                self.nil_locals.push(inner.clone());
+                Type::optional(inner)
+            } else {
+                vt
+            };
             if let Some(id) = self.res.def(name.span) {
                 self.sym_types[id as usize] = vt;
             }
@@ -1181,16 +1372,43 @@ impl<'a> Checker<'a> {
                 }
             },
             Type::Map(v) => Type::optional(*v),
-            Type::Error | Type::Var(_) => Type::Error,
+            Type::Var(_) => self.defer_field(bt, name, false, base.span),
+            Type::Error => Type::Error,
             other => {
-                self.error(
-                    "E0421",
-                    format!("type {} has no fields", self.u.deep(&other)),
-                    name.span,
-                );
+                self.no_fields(&other, &name.node, name.span);
                 Type::Error
             }
         }
+    }
+
+    /// Reject using field `name` of a value of type `ty`, which has no fields (`E0421`). An
+    /// optional says what to do instead, which its type may not: a `local x = nil` that nothing
+    /// has been assigned to yet shows as `??`.
+    fn no_fields(&mut self, ty: &Type, name: &str, span: Span) {
+        let msg = match ty {
+            Type::Optional(_) => format!(
+                "this value may be nil; check it with `~= nil` before using its field `{name}`"
+            ),
+            other => format!("type {} has no fields", self.u.deep(other)),
+        };
+        self.error("E0421", msg, span);
+    }
+
+    /// Type a field access on a value whose type isn't known yet as a fresh variable, and check
+    /// it once the value has a type ([`DeferredUse`]). For a write the variable is the assigned
+    /// value's type; for a read, the field's.
+    fn defer_field(&mut self, base: Type, name: &Ident, write: bool, span: Span) -> Type {
+        let ty = self.u.fresh();
+        self.deferred.push(DeferredUse {
+            base,
+            kind: DeferredKind::Field {
+                name: name.clone(),
+                ty: ty.clone(),
+                write,
+            },
+            span,
+        });
+        ty
     }
 
     fn check_index(&mut self, base: &Expr, index: &Expr) -> Type {
@@ -1303,7 +1521,22 @@ impl<'a> Checker<'a> {
                 }
                 (*ft.ret).clone()
             }
-            Type::Error | Type::Var(_) => {
+            // Not known yet: checked against the function's type once it is ([`DeferredUse`]).
+            Type::Var(_) => {
+                let args = args.iter().map(|a| (self.check_expr(a), a.span)).collect();
+                let result = self.u.fresh();
+                self.deferred.push(DeferredUse {
+                    base: ct,
+                    kind: DeferredKind::Call {
+                        args,
+                        result: result.clone(),
+                        span,
+                    },
+                    span: callee.span,
+                });
+                result
+            }
+            Type::Error => {
                 for arg in args {
                     self.check_expr(arg);
                 }
@@ -1746,13 +1979,10 @@ impl<'a> Checker<'a> {
                         }
                     },
                     Type::Map(v) => *v,
-                    Type::Error | Type::Var(_) => Type::Error,
+                    Type::Var(_) => self.defer_field(bt, name, true, base.span),
+                    Type::Error => Type::Error,
                     other => {
-                        self.error(
-                            "E0421",
-                            format!("type {} has no fields", self.u.deep(&other)),
-                            name.span,
-                        );
+                        self.no_fields(&other, &name.node, name.span);
                         Type::Error
                     }
                 }
@@ -1775,7 +2005,25 @@ impl<'a> Checker<'a> {
                         );
                         *v
                     }
-                    Type::Error | Type::Var(_) => Type::Error,
+                    // Not known yet: the index decides, as it does for a read (`check_index`).
+                    Type::Var(_) => {
+                        let it = self.check_expr(index);
+                        let elem = self.u.fresh();
+                        if matches!(self.u.shallow(&it), Type::String) {
+                            let _ = self.u.unify(&bt, &Type::map(elem.clone()));
+                        } else {
+                            self.require(
+                                index.span,
+                                &it,
+                                &Type::Number,
+                                "E0401",
+                                "expected a number",
+                            );
+                            let _ = self.u.unify(&bt, &Type::array(elem.clone()));
+                        }
+                        elem
+                    }
+                    Type::Error => Type::Error,
                     other => {
                         self.error(
                             "E0424",
@@ -1909,16 +2157,23 @@ impl<'a> Checker<'a> {
         ctx: &str,
     ) {
         if self.u.unify(actual, expected).is_err() {
-            self.error(
-                code,
-                format!(
-                    "{ctx}: expected {}, found {}",
-                    self.u.deep(expected),
-                    self.u.deep(actual)
-                ),
-                span,
-            );
+            let msg = self.mismatch(ctx, actual, expected);
+            self.error(code, msg, span);
         }
+    }
+
+    /// `"{ctx}: expected {expected}, found {actual}"`, except that an optional which narrowing
+    /// would fix is described as one. Its type may not say what it is: a `local x = nil` that
+    /// nothing has been assigned to yet shows as `??`.
+    fn mismatch(&self, ctx: &str, actual: &Type, expected: &Type) -> String {
+        let expected = self.u.deep(expected);
+        let found = match self.u.deep(actual) {
+            Type::Optional(inner) if matches!(*inner, Type::Var(_)) || *inner == expected => {
+                "a value that may be nil; check it with `~= nil` first".to_string()
+            }
+            other => other.to_string(),
+        };
+        format!("{ctx}: expected {expected}, found {found}")
     }
 
     /// Like [`Self::require`] but with optional widening (`T`/`nil` assignable to `T?`).
@@ -1926,15 +2181,8 @@ impl<'a> Checker<'a> {
         if self.is_assignable(from, to) {
             return;
         }
-        self.error(
-            "E0402",
-            format!(
-                "{ctx}: expected {}, found {}",
-                self.u.deep(to),
-                self.u.deep(from)
-            ),
-            span,
-        );
+        let msg = self.mismatch(ctx, from, to);
+        self.error("E0402", msg, span);
     }
 
     fn is_assignable(&mut self, from: &Type, to: &Type) -> bool {
@@ -2939,6 +3187,154 @@ mod tests {
             err_code("function f() return 1 end\nreturn { run = (f) }", &empty()),
             "E0411"
         );
+    }
+
+    /// A local that starts out `nil` is optional and holds whatever is assigned to it later
+    /// (`SPEC.md` §5.2), where it used to be typed `nil` and reject every other value.
+    #[test]
+    fn a_local_initialized_to_nil_takes_what_is_assigned_later() {
+        let cases = [
+            (
+                "function f(c) local x = nil if c > 0 then x = c end return x end",
+                "fn(number) -> number?",
+            ),
+            (
+                "function f(c) local x = nil if c > 0 then x = {a = c} end \
+                 if x ~= nil then return x.a end return 0 end",
+                "fn(number) -> number",
+            ),
+            (
+                "function f(c) local x, y = nil, nil y = c + 0 return y end",
+                "fn(number) -> number?",
+            ),
+            // Assigned from a closure, which captures it.
+            (
+                "function f(c) local x = nil local set = function() x = c + 0 end set() \
+                 return x end",
+                "fn(number) -> number?",
+            ),
+            // Nothing else is ever assigned: it is only ever `nil`.
+            ("function f() local x = nil return x end", "fn() -> nil"),
+            (
+                "function f() local x = nil x = nil return x end",
+                "fn() -> nil",
+            ),
+        ];
+        for (src, want) in cases {
+            let info = ok(src, &empty());
+            assert_eq!(info.exports["f"].to_string(), want, "{src}");
+        }
+    }
+
+    /// A value can be used above the assignment that gives it its type, as in a loop that
+    /// remembers the previous iteration's value. The use is checked against that type.
+    #[test]
+    fn a_value_can_be_used_before_the_code_that_types_it() {
+        let cases = [
+            "function f(n) local prev = nil local s = 0 for i = 1, n do \
+             if prev ~= nil then s = s + prev.v end prev = {v = i} end return s end",
+            "function f(n) local prev = nil local s = 0 for i = 1, n do \
+             if prev ~= nil then local d = prev.v s = s + d end prev = {v = i} end return s end",
+            "function f(n) local step = nil local s = 0 for i = 1, n do \
+             if step ~= nil then s = s + step(i) end step = function(k) return k * 2 end end \
+             return s end",
+            "function f(n) local prev = nil for i = 1, n do \
+             if prev ~= nil then prev.v = i end prev = {v = 0} end return 0 end",
+            // A field of a field: the inner read is typed once the outer one is.
+            "function f(n) local prev = nil local s = 0 for i = 1, n do \
+             if prev ~= nil then s = s + prev.inner.v end prev = {inner = {v = i}} end \
+             return s end",
+            // A parameter given its type by a caller checked after it.
+            "function b(p) local y = p.x return y + 1 end\n\
+             function f(c) return b({x = c}) end",
+        ];
+        for src in cases {
+            let info = ok(src, &empty());
+            assert_eq!(
+                info.exports["f"].to_string(),
+                "fn(number) -> number",
+                "{src}"
+            );
+        }
+    }
+
+    /// Such a use is checked as strictly as one whose type was known at the time: it used to be
+    /// typed `<error>` and let through unchecked.
+    #[test]
+    fn a_use_before_the_code_that_types_it_is_still_checked() {
+        let loop_with = |use_: &str, assign: &str| {
+            format!(
+                "function f(n) local prev = nil local s = 0 for i = 1, n do \
+                 if prev ~= nil then {use_} end prev = {assign} end return s end"
+            )
+        };
+        let cases = [
+            (loop_with("prev.v = \"s\"", "{v = i}"), "E0402"),
+            (loop_with("s = s + prev.w", "{v = i}"), "E0420"),
+            (loop_with("prev.w = 1", "{v = i}"), "E0420"),
+            (loop_with("s = s + prev.v", "i"), "E0421"),
+            (loop_with("local d = prev.v .. \"s\"", "{v = i}"), "E0402"),
+            (
+                loop_with("s = s + prev(i, i)", "function(k) return k end"),
+                "E0430",
+            ),
+            (
+                loop_with("s = s + prev(\"x\")", "function(k) return k + 1 end"),
+                "E0402",
+            ),
+            (
+                loop_with("local d = prev(i) .. \"s\"", "function(k) return k end"),
+                "E0402",
+            ),
+            (loop_with("s = s + prev(i)", "i"), "E0431"),
+        ];
+        for (src, code) in cases {
+            assert_eq!(err_code(&src, &empty()), code, "{src}");
+        }
+    }
+
+    /// A value nothing ever gives a type can't have its fields or call checked (`E0410`), where
+    /// the use used to be typed `<error>` and compiled.
+    #[test]
+    fn a_use_of_a_value_that_never_gets_a_type_is_an_error() {
+        let cases = [
+            "function f() local x = nil if x ~= nil then return x.a end return 0 end",
+            "function f() local x = nil if x ~= nil then x.a = 1 end return 0 end",
+            "function f() local x = nil if x ~= nil then return x(1) end return 0 end",
+            "function f() local x return x.a + 1 end",
+        ];
+        for src in cases {
+            assert_eq!(err_code(src, &empty()), "E0410", "{src}");
+        }
+    }
+
+    /// A local that may still be `nil` has to be checked before it is used as its value, and the
+    /// error says so even before anything has been assigned to it to name its type.
+    #[test]
+    fn a_nil_initialized_local_must_be_narrowed_before_use() {
+        let cases = [
+            (
+                "function f(c) local x = nil x = {a = c} return x.a + 0 end",
+                "E0421",
+            ),
+            (
+                "function f(c) local x = nil x = c + 0 return x + 1 end",
+                "E0401",
+            ),
+            (
+                "function f(c) local x = nil local y = x + 1 x = c + 0 return y end",
+                "E0401",
+            ),
+        ];
+        for (src, code) in cases {
+            let diags = analyze(src, &empty()).unwrap_err();
+            assert_eq!(diags.0[0].code, code, "{src}");
+            assert!(
+                diags.0[0].message.contains("may be nil"),
+                "{src}: {}",
+                diags.0[0].message
+            );
+        }
     }
 
     #[test]

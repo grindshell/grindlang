@@ -994,6 +994,127 @@ fn narrowed_bool_drives_branches() {
     }
 }
 
+// ---- a local that starts out `nil` (`SPEC.md` §5.2) -------------------------------------
+//
+// `local x = nil` is optional and holds whatever is assigned to it later. The value is used
+// under a `~= nil` guard, often above the assignment that gives it its type, which the checker
+// used to type `<error>`: the JIT then failed to compile `local d = prev.v` (an `f64` add on a
+// handle).
+
+#[test]
+fn a_nil_local_remembers_the_best_record_so_far() {
+    let src = "---@param items { name: string, score: number }[]\n\
+               function best_name(items)\n\
+                 local best = nil\n\
+                 for _, it in ipairs(items) do\n\
+                   if best ~= nil then\n\
+                     if it.score > best.score then best = it end\n\
+                   else\n\
+                     best = it\n\
+                   end\n\
+                 end\n\
+                 if best ~= nil then return best.name end\n\
+                 return \"none\"\n\
+               end";
+    let item = |name: &str, score: f64| {
+        let mut rec = BTreeMap::new();
+        rec.insert("name".to_string(), Value::string(name));
+        rec.insert("score".to_string(), Value::Number(score));
+        Value::table(rec)
+    };
+    let items = Value::array(vec![item("a", 3.0), item("b", 9.0), item("c", 5.0)]);
+    assert_all_return(src, "best_name", vec![items], "b");
+    assert_all_return(src, "best_name", vec![Value::array(vec![])], "none");
+}
+
+#[test]
+fn a_nil_local_holds_a_number() {
+    let src = "---@param xs number[]\n\
+               function first_over(xs, limit)\n\
+                 local found = nil\n\
+                 for _, x in ipairs(xs) do\n\
+                   if found == nil and x > limit then found = x end\n\
+                 end\n\
+                 if found ~= nil then return found * 2 end\n\
+                 return -1\n\
+               end";
+    let xs = Value::array(vec![
+        Value::Number(1.0),
+        Value::Number(7.0),
+        Value::Number(9.0),
+    ]);
+    for (limit, want) in [(5.0, "14"), (8.0, "18"), (10.0, "-1")] {
+        assert_all_return(
+            src,
+            "first_over",
+            vec![xs.clone(), Value::Number(limit)],
+            want,
+        );
+    }
+}
+
+#[test]
+fn a_nil_local_holds_a_closure() {
+    let src = "function f(k)\n\
+                 local scale = nil\n\
+                 if k > 0 then scale = function(x) return x * k end end\n\
+                 if scale ~= nil then return scale(10) end\n\
+                 return 0\n\
+               end";
+    assert_all_return(src, "f", vec![Value::Number(3.0)], "30");
+    assert_all_return(src, "f", vec![Value::Number(0.0)], "0");
+}
+
+#[test]
+fn a_nil_local_can_stay_nil() {
+    assert_all_return(
+        "function f() local x = nil return x end",
+        "f",
+        vec![],
+        "nil",
+    );
+    assert_all_return(
+        "function f(c) local x = nil if c > 0 then x = c end return x end",
+        "f",
+        vec![Value::Number(0.0)],
+        "nil",
+    );
+}
+
+#[test]
+fn a_value_used_above_the_assignment_that_types_it() {
+    let field = "function f(n)\n\
+                   local prev = nil\n\
+                   local s = 0\n\
+                   for i = 1, n do\n\
+                     if prev ~= nil then\n\
+                       local d = prev.v\n\
+                       s = s + d\n\
+                     end\n\
+                     prev = { v = i }\n\
+                   end\n\
+                   return s\n\
+                 end";
+    assert_all_return(field, "f", vec![Value::Number(4.0)], "6");
+    let call = "function f(n)\n\
+                  local step = nil\n\
+                  local s = 0\n\
+                  for i = 1, n do\n\
+                    if step ~= nil then\n\
+                      local d = step(i)\n\
+                      s = s + d\n\
+                    end\n\
+                    step = function(k) return k * 10 end\n\
+                  end\n\
+                  return s\n\
+                end";
+    assert_all_return(call, "f", vec![Value::Number(3.0)], "50");
+    // A parameter whose type comes from a caller checked after it.
+    let param = "function b(p) local y = p.x return y + 1 end\n\
+                 function f(c) return b({ x = c }) end";
+    assert_all_return(param, "f", vec![Value::Number(4.0)], "5");
+}
+
 // ---- `---@` annotations (`SPEC.md` §5.6) ------------------------------------------------
 //
 // Annotations only *constrain the checker* — they don't change runtime semantics — but they

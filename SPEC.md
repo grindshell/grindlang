@@ -334,7 +334,14 @@ No `any`, no union types (other than `T?`), no user-defined nominal types _(v1)_
 
 Types are **inferred**, not annotated, by default. Inference is bidirectional with
 unification:
-- A `local`'s type comes from its initializer.
+- A `local`'s type comes from its initializer. A `local` initialized to `nil` is optional,
+  `T?`, where `T` is the type of what is later assigned to it (§5.3): `local best = nil` can
+  go on to hold a record, a number, or a closure. One that is only ever assigned `nil` has type
+  `nil`.
+- Inference does not depend on the order of the code: a value may be used above the assignment
+  that gives it its type, as when a loop reads what the previous iteration stored (§5.3), and
+  the use is checked against that type. A field read, field write, or call on a value that
+  nothing ever gives a type is an `E0410` error.
 - A parameter's type is inferred from how it is **used** in the body (operators, calls,
   field/index access). For calc-style code this almost always pins the type
   (`base * mult` ⇒ both `number`).
@@ -359,6 +366,24 @@ function name_or_default(p)        -- p : record{ name: string? }
     return p.name                  -- here p.name : string
   end
   return "unknown"
+end
+```
+
+A local initialized to `nil` is narrowed the same way before its value is used:
+
+```lua
+---@param items { name: string, score: number }[]
+function best_name(items)
+  local best = nil                 -- best : { name: string, score: number }?
+  for _, it in ipairs(items) do
+    if best ~= nil then
+      if it.score > best.score then best = it end
+    else
+      best = it
+    end
+  end
+  if best ~= nil then return best.name end
+  return "none"
 end
 ```
 
@@ -683,6 +708,9 @@ both read/write persistent memory.
   receiver is a host-memory binding named directly; the receiver is passed as an implicit
   `self` to the host method, which resolves to a direct Rust call. `:` on any other receiver
   is a compile error.
+- **A local initialized to `nil` is optional** (§5.2): `local x = nil` is `T?`, with `T`
+  inferred from what is later assigned to it, rather than `nil`, which no other value fits.
+  It is narrowed with `~= nil` like any optional.
 - **`---@` annotation type-syntax subset** is fixed (§5.6): `@param`/`@return` on top-level
   functions, scalar/optional/array/map/record spellings, `@type` and function/userdata types
   deferred, unknown directives ignored.

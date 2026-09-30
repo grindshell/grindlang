@@ -2,7 +2,7 @@
 source: tests/snapshots.rs
 expression: "analyze_diag(\"function f()\\n  local x = nil\\n  return x + 1\\nend\")"
 ---
-error[E0401]: expected a number: expected number, found nil
+error[E0401]: expected a number: expected number, found a value that may be nil; check it with `~= nil` first
   --> 3:10
    |
   3|   return x + 1
