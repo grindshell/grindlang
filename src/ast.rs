@@ -8,6 +8,7 @@
 //! attached by later phases, not here.
 
 use crate::diagnostics::Span;
+use crate::surface::Surface;
 
 /// A value paired with the source span it came from.
 #[derive(Clone, Debug, PartialEq)]
@@ -36,6 +37,8 @@ pub struct Module {
     /// Fields of the trailing `return { ... }`, if present.
     pub export: Option<Spanned<Vec<Field>>>,
     pub span: Span,
+    /// The syntax the module was parsed from, which diagnostics quote code in.
+    pub surface: Surface,
 }
 
 /// A top-level item: a function, a constant, or a statement of top-level code.

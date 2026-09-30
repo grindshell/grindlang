@@ -1,0 +1,90 @@
+//! Test harness shared by the integration suites that hold all three oracles to one program.
+//!
+//! A test file uses it with `mod common;`. Each file is its own crate and uses only part of the
+//! harness, hence the `dead_code` allowance.
+
+#![allow(dead_code)]
+
+use grindlang::codegen::JitModule;
+use grindlang::interp::Interpreter;
+use grindlang::ir::Vm;
+use grindlang::{Module, RunError, TypeConfig, Value};
+
+/// The four executors for one program: AST, IR, JIT, and a JIT that compacts its value table at
+/// every loop back edge. Artifacts are leaked for `'static` — fine for a test harness.
+pub struct Executors {
+    pub interp: Interpreter<'static>,
+    pub vm: Vm<'static>,
+    pub jit: JitModule,
+    pub eager: JitModule,
+}
+
+impl Executors {
+    /// Build the executors for Lua source `src`.
+    pub fn new(src: &str, cfg: &TypeConfig) -> Self {
+        let module =
+            grindlang::parse(src).unwrap_or_else(|d| panic!("parse failed:\n{}", d.render(src)));
+        Self::from_module(module, cfg, src)
+    }
+
+    /// Build the executors for an already parsed `module`, from any surface syntax. `src` is the
+    /// text it was parsed from, used only to render diagnostics if it fails to check.
+    pub fn from_module(module: Module, cfg: &TypeConfig, src: &str) -> Self {
+        let module = Box::leak(Box::new(module));
+        let (res, info) = grindlang::analyze_module(module, cfg)
+            .unwrap_or_else(|d| panic!("analyze failed:\n{}", d.render(src)));
+        let res = Box::leak(Box::new(res));
+        let info = Box::leak(Box::new(info));
+        let program = Box::leak(Box::new(
+            grindlang::ir::lower(module, res, info, cfg).expect("lower"),
+        ));
+        grindlang::ir::verify(program).expect("verify");
+        let mut eager = JitModule::compile(program).expect("jit compile");
+        eager.set_compact_slack(0);
+        Executors {
+            interp: Interpreter::new(module, res).expect("interp"),
+            vm: Vm::new(program),
+            jit: JitModule::compile(program).expect("jit compile"),
+            eager,
+        }
+    }
+
+    /// Call `func` on every executor, labelled.
+    pub fn call(
+        &mut self,
+        func: &str,
+        args: Vec<Value>,
+    ) -> [(&'static str, Result<Value, RunError>); 4] {
+        [
+            ("AST", self.interp.call(func, args.clone())),
+            ("IR", self.vm.call(func, args.clone())),
+            ("JIT", self.jit.call(func, args.clone())),
+            ("eager JIT", self.eager.call(func, args)),
+        ]
+    }
+
+    /// Assert every executor returns `want` (by `Display`) from `func(args)`.
+    #[track_caller]
+    pub fn assert_returns(&mut self, func: &str, args: Vec<Value>, want: &str) {
+        for (oracle, got) in self.call(func, args) {
+            match got {
+                Ok(v) => assert_eq!(v.to_string(), want, "{oracle} result of `{func}`"),
+                Err(e) => panic!("{oracle} failed on `{func}`: {e}"),
+            }
+        }
+    }
+
+    /// Assert every executor fails `func(args)` with an error mentioning `needle`.
+    #[track_caller]
+    pub fn assert_fails(&mut self, func: &str, args: Vec<Value>, needle: &str) {
+        for (oracle, got) in self.call(func, args) {
+            match got {
+                Ok(v) => panic!("{oracle}: `{func}` returned {v}, expected an error"),
+                Err(e) => assert!(
+                    e.to_string().contains(needle),
+                    "{oracle}: `{func}` failed with {e:?}, expected one mentioning {needle:?}"
+                ),
+            }
+        }
+    }
+}

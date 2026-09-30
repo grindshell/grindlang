@@ -26,6 +26,18 @@ fn typed_call_with_host_fn() {
     assert_eq!(out, 41.0);
 }
 
+/// A module parsed ahead of time — as another surface syntax's frontend would hand one over —
+/// compiles against the engine's host functions just as source does.
+#[test]
+fn compiles_an_already_parsed_module() {
+    let mut engine = Engine::new();
+    engine.register_fn("double", |n: f64| n * 2.0);
+    let module = grindlang::parse("function calc(x) return double(x) + 1 end").expect("parse");
+    let mut m = engine.compile_module(&module).expect("compile");
+    let out: f64 = m.call_typed("calc", (20.0,)).expect("call");
+    assert_eq!(out, 41.0);
+}
+
 /// Integer-typed marshaling (numbers are f64 underneath, exact for these magnitudes).
 #[test]
 fn integer_marshaling() {

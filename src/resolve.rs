@@ -36,6 +36,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, Diagnostics, Span};
+use crate::surface::Surface;
 
 /// Builtin value names available in every script (SPEC §6). Namespaces (`math`, `string`)
 /// are accessed via field expressions (`math.floor`); their membership is checked later by
@@ -159,7 +160,7 @@ impl Resolution {
 ///
 /// Returns the [`Resolution`] on success, or every collected diagnostic on failure.
 pub fn resolve(module: &Module, cfg: &ResolveConfig) -> Result<Resolution, Diagnostics> {
-    let mut r = Resolver::new(cfg);
+    let mut r = Resolver::new(cfg, module.surface);
     r.resolve_module(module);
     if r.diags.has_errors() {
         Err(r.diags)
@@ -191,6 +192,8 @@ struct FuncScope {
 
 struct Resolver<'a> {
     cfg: &'a ResolveConfig,
+    /// The syntax diagnostics quote code in.
+    surface: Surface,
     /// The top-level functions in scope: every `function`, plus each `local function` once its
     /// declaration is reached.
     top_funcs: HashMap<String, Span>,
@@ -210,9 +213,10 @@ struct Resolver<'a> {
 }
 
 impl<'a> Resolver<'a> {
-    fn new(cfg: &'a ResolveConfig) -> Self {
+    fn new(cfg: &'a ResolveConfig, surface: Surface) -> Self {
         Resolver {
             cfg,
+            surface,
             top_funcs: HashMap::new(),
             top_consts: HashMap::new(),
             module_scope: HashMap::new(),
@@ -504,10 +508,10 @@ impl<'a> Resolver<'a> {
         }
         if let Some(ret) = &block.ret {
             if self.in_chunk {
+                let why = self.surface.top_level_return();
                 self.error(
                     "E0309",
-                    "top-level code cannot `return`; the only top-level `return` is a \
-                     module's trailing export table",
+                    format!("top-level code cannot `return`; {why}"),
                     ret.span,
                 );
             }

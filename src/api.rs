@@ -542,9 +542,15 @@ impl Engine {
     /// if the host still holds closures it returned, once those are dropped too); hosts can
     /// cache `Module`s by source as they see fit.
     pub fn compile(&self, src: &str) -> Result<Module, BuildError> {
+        self.compile_module(&crate::parse(src)?)
+    }
+
+    /// [`compile`](Engine::compile) an already parsed [`ast::Module`](crate::ast::Module), which
+    /// may come from any surface syntax.
+    pub fn compile_module(&self, module: &crate::ast::Module) -> Result<Module, BuildError> {
         let cfg = self.type_config();
-        let (module, res, info) = crate::analyze(src, &cfg)?;
-        let program = crate::ir::lower(&module, &res, &info, &cfg)?;
+        let (res, info) = crate::analyze_module(module, &cfg)?;
+        let program = crate::ir::lower(module, &res, &info, &cfg)?;
         crate::ir::verify(&program)?;
         let mut jit = JitModule::compile(&program)?;
         for (name, (_sig, native)) in &self.host_fns {

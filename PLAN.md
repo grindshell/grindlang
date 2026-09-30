@@ -4,7 +4,7 @@
 > cranelift JIT, host embedding API); Phase 9 (hardening, tooling, docs) delivered; top-level
 > code (run once, then frozen — §2 decision 1) delivered since. See the per-phase "Delivered"
 > notes below and [`CLAUDE.md`](CLAUDE.md) for the current shape. Phase 10, a Ruby surface
-> ([`SPEC-RUBY.md`](SPEC-RUBY.md), draft), is planned and not started.
+> ([`SPEC-RUBY.md`](SPEC-RUBY.md), draft), is planned; its first step, R0, is done.
 
 ## 1. What Grindlang is
 
@@ -423,7 +423,7 @@ history before the commit that deleted it.
 
 A second syntax for the same language: a strict subset of Ruby's syntax aimed at game logic and
 dialog DSLs. [`SPEC-RUBY.md`](SPEC-RUBY.md) (draft) is its authoring contract; this section is
-why it is built the way it is. Nothing here is implemented yet.
+why it is built the way it is. R0 is done; the rest is not implemented yet.
 
 **Approach: translate into the shared AST.** The backends only see `ir::Program`, and
 everything above the IR sees `ast::Module`. A Ruby frontend that translates into `ast::Module`
@@ -498,12 +498,20 @@ differential cases (AGENTS.md §6).
 - **C4 — `FuncBody::fallthrough`, Error or Nil.** The Lua surface keeps Error (E0480). With
   Nil, reaching `end` in a function that returns a value returns `nil` and makes its return type
   optional, reusing `infer_optional_return`.
-- **C5 — entry points that start from an AST.** `analyze_module` and `compile_module` (today's
-  `analyze` and `compile` take Lua text), `Engine::compile_module`, and an interpreter and test
-  harness built from an `ast::Module`.
-- **C6 — wording that follows the surface.** A `Surface` in `ResolveConfig` and `TypeConfig`;
-  operator symbols (`BinOp::symbol` in three checker messages) and Lua-specific hints (`~= nil`,
-  `local`, `ipairs`) go through one helper. No error code changes.
+- **C5 — entry points that start from an AST.** ✅ Done. `analyze_module` and `compile_module`
+  (`analyze` and `compile` now parse and call them), `Engine::compile_module` (likewise under
+  `Engine::compile`), and the `Executors` harness in `tests/common`, built from source or from an
+  `ast::Module`. The interpreter already took an `ast::Module`.
+- **C6 — wording that follows the surface.** ✅ Done, with Lua wording only. The `Surface`
+  (`src/surface.rs`) is carried on `ast::Module` rather than in `ResolveConfig` and `TypeConfig`
+  as first planned: the parser that built a tree knows its syntax, so the two can't disagree, and
+  the configs, which hosts and tests build as struct literals, don't change. The resolver and
+  checker quote operators (`surface.binop`/`unop`) and every Lua-specific hint a Ruby script can
+  reach (`~= nil`, `ipairs`/`pairs`, the parallel `local`, `cond and a or b`, the wrapping
+  closure, the export-table note of `E0309`) through it. Messages the Ruby translator can't
+  trigger — the export table's `E0411`, `:` calls' `E0417`, a third `for` variable's `E0416`,
+  `ipairs` as a value's `E0301` — keep their Lua wording. Every rewritten message is
+  byte-identical to before.
 - **C7 — dropped.** See the locked decisions: the host already reads constants.
 - **C8 — narrowing on `== nil`.** Narrow `x` in the else-branch of `if x == nil`, including the
   conditions and bodies of later `elseif` arms, and in the else-branch of a C2 conditional.
@@ -519,11 +527,12 @@ differential cases (AGENTS.md §6).
 Each step ends on the green bar plus `cargo check --no-default-features --features ruby`. Line
 counts exclude tests; the total is about 6k.
 
-- **R0 — seams.** C5 and C6, with Lua wording only. No behavior change: every existing test
-  and snapshot passes untouched. (~400 lines)
+- **R0 — seams.** ✅ Done. C5 and C6, with Lua wording only. No behavior change: every existing
+  test and snapshot passes untouched.
 - **R1 — Ruby lexer and parser** to `ruby::ast`: the grammar of SPEC-RUBY.md §2–3, including
-  its rule for calls without parentheses (§3.4), an E05xx rejection for every construct SPEC-RUBY.md §6 lists, and the 200-level nesting
-  limit (the E0209 rule). Tests: parse fixtures, a snapshot per rejection. (~2.3k lines)
+  its rule for calls without parentheses (§3.4), an E05xx rejection for every construct
+  SPEC-RUBY.md §6 lists, and the 200-level nesting limit (the E0209 rule). Tests: parse
+  fixtures, a snapshot per rejection. (~2.3k lines)
 - **R2 — translating the core subset.** C8 and C9 first. Then everything that maps onto
   today's AST: scope analysis, the top level, literals, operators, interpolation, nil tests,
   `if`/`unless`/modifiers, `while`/`until`/`loop`, the iteration forms, memory, the method

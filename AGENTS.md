@@ -126,6 +126,14 @@ that set — keep all three doing the same.
 
 Front-end entry points in `lib.rs` are always available: `parse` (→ AST), `check` (+ resolve),
 `analyze` (+ typecheck → export signature), `compile` (+ lower → verified IR).
+`analyze_module` and `compile_module` (and `Engine::compile_module`) do the same from an
+already parsed `ast::Module`, so another surface syntax can feed the shared pipeline.
+
+**Surfaces.** `ast::Module::surface` records which syntax a module was parsed from
+(`src/surface.rs`; only Lua so far, a Ruby surface is planned in `PLAN.md` Phase 10). It never
+changes what a program means. The resolver and checker quote code in diagnostics through it —
+`surface.binop(op)`, `surface.nil_test()`, … — so write a new message's code snippets that way
+rather than inlining Lua syntax.
 
 ### The three-oracle model
 
@@ -138,7 +146,9 @@ Correctness rests on **three independent executors that must agree** on every pr
 Values are compared by their `Display` form (deterministic: sorted table keys,
 integer-formatted whole numbers). Any divergence is a bug. This is enforced by
 `tests/jit_differential.rs` (curated corpus), `tests/jit_fuzz.rs` (deterministic LCG),
-and `tests/prop_differential.rs` (proptest-generated expressions).
+and `tests/prop_differential.rs` (proptest-generated expressions). `tests/common` holds a shared
+harness, `Executors`, that builds all of them (plus an eagerly compacting JIT) from source or
+from an `ast::Module`; new suites should use it.
 
 ### JIT value model (hybrid)
 

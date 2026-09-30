@@ -24,6 +24,7 @@ use std::collections::HashSet;
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, Diagnostics, Span};
 use crate::lexer::{DocComment, Token, TokenKind};
+use crate::surface::Surface;
 
 /// How many levels of nested expressions and blocks a script may have (`E0209`), and how deeply a
 /// `---@` type annotation may nest. Lua and Luau limit their parsers to the same 200.
@@ -259,6 +260,7 @@ impl Parser {
             decls,
             export,
             span: start.to(end),
+            surface: Surface::Lua,
         })
     }
 

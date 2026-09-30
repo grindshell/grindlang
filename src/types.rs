@@ -64,6 +64,7 @@ use crate::ast::*;
 use crate::diagnostics::{Diagnostic, Diagnostics, Span};
 use crate::resolve::{Binding, Resolution, SymbolId};
 use crate::runtime::builtins;
+use crate::surface::Surface;
 
 /// A Grindlang type (`SPEC.md` §5.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -493,6 +494,8 @@ impl Place {
 struct Checker<'a> {
     res: &'a Resolution,
     cfg: &'a TypeConfig,
+    /// The syntax diagnostics quote code in.
+    surface: Surface,
     u: Unifier,
     /// Type of each symbol, indexed by [`SymbolId`].
     sym_types: Vec<Type>,
@@ -527,10 +530,10 @@ struct Checker<'a> {
 
 impl<'a> Checker<'a> {
     fn new(module: &Module, res: &'a Resolution, cfg: &'a TypeConfig) -> Self {
-        let _ = module;
         Checker {
             res,
             cfg,
+            surface: module.surface,
             u: Unifier::default(),
             sym_types: vec![Type::Error; res.symbols.len()],
             narrowed: BTreeMap::new(),
@@ -1272,7 +1275,11 @@ impl<'a> Checker<'a> {
                     other => {
                         self.error(
                             "E0412",
-                            format!("`ipairs` expects an array, found {}", self.u.deep(&other)),
+                            format!(
+                                "`{}` expects an array, found {}",
+                                self.surface.array_loop(),
+                                self.u.deep(&other)
+                            ),
                             arg.span,
                         );
                         Type::Error
@@ -1295,8 +1302,9 @@ impl<'a> Checker<'a> {
                         self.error(
                             "E0412",
                             format!(
-                                "`pairs` expects a map, found {} (iterating records is not \
-                                 yet supported)",
+                                "`{}` expects a map, found {} (iterating records is not yet \
+                                 supported)",
+                                self.surface.map_loop(),
                                 self.u.deep(&other)
                             ),
                             arg.span,
@@ -1334,10 +1342,13 @@ impl<'a> Checker<'a> {
     fn check_expr(&mut self, expr: &Expr) -> Type {
         let t = self.check_expr_multi(expr);
         if matches!(self.u.shallow(&t), Type::Tuple(_)) {
+            let binding = self.surface.parallel_binding();
             self.error(
                 "E0415",
-                "a multi-value call must be returned directly or bound to a parallel \
-                 `local`/assignment; it can't be used as a single value here",
+                format!(
+                    "a multi-value call must be returned directly or bound to {binding}; it \
+                     can't be used as a single value here"
+                ),
                 expr.span,
             );
             return Type::Error;
@@ -1422,11 +1433,12 @@ impl<'a> Checker<'a> {
             // A direct call types its callee without coming through here (`check_call`), so
             // this is a named function used as a value.
             Binding::TopFunction(name) | Binding::HostFunction(name) => {
+                let closure = self.surface.closure_calling(&name);
                 self.error(
                     "E0434",
                     format!(
                         "`{name}` is a named function and can only be called directly; to pass it \
-                         as a value, wrap the call in a closure (`function(x) return {name}(x) end`)"
+                         as a value, wrap the call in a closure (`{closure}`)"
                     ),
                     expr.span,
                 );
@@ -1498,7 +1510,8 @@ impl<'a> Checker<'a> {
     fn no_fields(&mut self, ty: &Type, name: &str, span: Span) {
         let msg = match ty {
             Type::Optional(_) => format!(
-                "this value may be nil; check it with `~= nil` before using its field `{name}`"
+                "this value may be nil; check it with `{}` before using its field `{name}`",
+                self.surface.nil_test()
             ),
             other => format!("type {} has no fields", self.u.deep(other)),
         };
@@ -1819,13 +1832,8 @@ impl<'a> Checker<'a> {
             }
             UnOp::Not => {
                 let t = self.check_expr(operand);
-                self.require(
-                    operand.span,
-                    &t,
-                    &Type::Bool,
-                    "E0450",
-                    "`not` requires a bool",
-                );
+                let ctx = format!("`{}` requires a bool", self.surface.unop(op));
+                self.require(operand.span, &t, &Type::Bool, "E0450", &ctx);
                 Type::Bool
             }
             UnOp::Len => {
@@ -1836,7 +1844,8 @@ impl<'a> Checker<'a> {
                         self.error(
                             "E0451",
                             format!(
-                                "`#` requires a string or array, found {}",
+                                "`{}` requires a string or array, found {}",
+                                self.surface.unop(op),
                                 self.u.deep(&other)
                             ),
                             span,
@@ -1859,20 +1868,9 @@ impl<'a> Checker<'a> {
             Concat => {
                 let lt = self.check_expr(lhs);
                 let rt = self.check_expr(rhs);
-                self.require(
-                    lhs.span,
-                    &lt,
-                    &Type::String,
-                    "E0452",
-                    "`..` requires strings",
-                );
-                self.require(
-                    rhs.span,
-                    &rt,
-                    &Type::String,
-                    "E0452",
-                    "`..` requires strings",
-                );
+                let ctx = format!("`{}` requires strings", self.surface.binop(op));
+                self.require(lhs.span, &lt, &Type::String, "E0452", &ctx);
+                self.require(rhs.span, &rt, &Type::String, "E0452", &ctx);
                 Type::String
             }
             Lt | Le | Gt | Ge => {
@@ -1951,9 +1949,10 @@ impl<'a> Checker<'a> {
                         "E0455",
                         format!(
                             "this `{}` can yield {falsy} or a {}, which are not one type; to pick \
-                             one of two values, write `cond and a or b`",
-                            op.symbol(),
-                            self.u.deep(&t)
+                             one of two values, write `{}`",
+                            self.surface.binop(*op),
+                            self.u.deep(&t),
+                            self.surface.choice()
                         ),
                         expr.span,
                     );
@@ -1986,16 +1985,19 @@ impl<'a> Checker<'a> {
             && let Some(t) = &l.truthy
         {
             let consequence = if op == BinOp::Or {
-                "the right operand is never used"
+                "the right operand is never used".to_string()
             } else {
-                "`and` always yields its right operand"
+                format!(
+                    "`{}` always yields its right operand",
+                    self.surface.binop(op)
+                )
             };
             self.error(
                 "E0456",
                 format!(
                     "the left operand of `{0}` has type {1}, which is never `nil` or `false`, so \
                      {consequence}; `{0}` needs a bool or an optional on its left",
-                    op.symbol(),
+                    self.surface.binop(op),
                     self.u.deep(t)
                 ),
                 lhs.span,
@@ -2070,7 +2072,7 @@ impl<'a> Checker<'a> {
                 let msg = format!(
                     "`{}` can yield a {} or a {}, which are not one type; its operands must have \
                      the same type, apart from being optional",
-                    op.symbol(),
+                    self.surface.binop(op),
                     self.u.deep(&a),
                     self.u.deep(&b)
                 );
@@ -2108,11 +2110,18 @@ impl<'a> Checker<'a> {
     fn check_logic_optionals(&mut self) {
         for (inner, span) in std::mem::take(&mut self.logic_optionals) {
             if self.u.deep(&inner) == Type::Bool {
+                let (and, or) = (
+                    self.surface.binop(BinOp::And),
+                    self.surface.binop(BinOp::Or),
+                );
                 self.error(
                     "E0455",
-                    "`and`/`or` here took this value to be `nil` whenever it isn't truthy, but \
-                     code further on makes it a `bool?`, which can also be `false`; give it its \
-                     type before this point (for a local, initialize it to `false`, not `nil`)",
+                    format!(
+                        "`{and}`/`{or}` here took this value to be `nil` whenever it isn't \
+                         truthy, but code further on makes it a `bool?`, which can also be \
+                         `false`; give it its type before this point (for a local, initialize it \
+                         to `false`, not `nil`)"
+                    ),
                     span,
                 );
             }
@@ -2460,7 +2469,10 @@ impl<'a> Checker<'a> {
         let expected = self.u.deep(expected);
         let found = match self.u.deep(actual) {
             Type::Optional(inner) if matches!(*inner, Type::Var(_)) || *inner == expected => {
-                "a value that may be nil; check it with `~= nil` first".to_string()
+                format!(
+                    "a value that may be nil; check it with `{}` first",
+                    self.surface.nil_test()
+                )
             }
             other => other.to_string(),
         };

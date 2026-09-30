@@ -34,6 +34,10 @@
 //! parse, resolve, and type-check — against a [`types::TypeConfig`], returning the module,
 //! its [`resolve::Resolution`], and its [`types::TypeInfo`] (the export signature). All
 //! surface a batch of [`Diagnostics`] on failure.
+//!
+//! [`analyze_module`] and [`compile_module`] start from an [`ast::Module`] instead of Lua
+//! source, so a module parsed from another surface syntax ([`Surface`]) goes through the same
+//! resolver, checker, and lowering.
 
 pub mod annotations;
 pub mod ast;
@@ -44,6 +48,7 @@ pub mod lexer;
 pub mod parser;
 pub mod resolve;
 pub mod runtime;
+pub mod surface;
 pub mod types;
 pub mod value;
 
@@ -61,6 +66,7 @@ pub use diagnostics::{Diagnostic, Diagnostics, Severity, Span};
 pub use ir::{LowerError, Program};
 pub use resolve::{Binding, Resolution, ResolveConfig};
 pub use runtime::Repr;
+pub use surface::Surface;
 pub use types::{FnType, Type, TypeConfig, TypeInfo};
 pub use value::{RunError, Value};
 
@@ -124,9 +130,28 @@ pub fn check(src: &str, cfg: &ResolveConfig) -> Result<(Module, Resolution), Dia
 /// ```
 pub fn analyze(src: &str, cfg: &TypeConfig) -> Result<(Module, Resolution, TypeInfo), Diagnostics> {
     let module = parse(src)?;
-    let resolution = resolve::resolve(&module, &cfg.to_resolve_config())?;
-    let info = types::typecheck(&module, &resolution, cfg)?;
+    let (resolution, info) = analyze_module(&module, cfg)?;
     Ok((module, resolution, info))
+}
+
+/// Resolve and type-check an already parsed [`ast::Module`] against host configuration `cfg`.
+///
+/// [`analyze`] without the parse: the module may come from any surface syntax. Returns its
+/// [`resolve::Resolution`] and [`types::TypeInfo`], or every collected diagnostic on failure.
+///
+/// ```
+/// use grindlang::TypeConfig;
+/// let module = grindlang::parse("function double(x) return x * 2 end").unwrap();
+/// let (_res, info) = grindlang::analyze_module(&module, &TypeConfig::default()).unwrap();
+/// assert_eq!(info.exports["double"].to_string(), "fn(number) -> number");
+/// ```
+pub fn analyze_module(
+    module: &Module,
+    cfg: &TypeConfig,
+) -> Result<(Resolution, TypeInfo), Diagnostics> {
+    let resolution = resolve::resolve(module, &cfg.to_resolve_config())?;
+    let info = types::typecheck(module, &resolution, cfg)?;
+    Ok((resolution, info))
 }
 
 /// An error from the full compile pipeline: either front-end [`Diagnostics`] or an IR
@@ -151,8 +176,22 @@ pub enum CompileError {
 /// assert!(program.functions.contains_key("double"));
 /// ```
 pub fn compile(src: &str, cfg: &TypeConfig) -> Result<Program, CompileError> {
-    let (module, resolution, info) = analyze(src, cfg)?;
-    let program = ir::lower(&module, &resolution, &info, cfg)?;
+    compile_module(&parse(src)?, cfg)
+}
+
+/// Resolve, type-check, and lower an already parsed [`ast::Module`] to verified IR.
+///
+/// [`compile`] without the parse: the module may come from any surface syntax.
+///
+/// ```
+/// use grindlang::TypeConfig;
+/// let module = grindlang::parse("function double(x) return x * 2 end").unwrap();
+/// let program = grindlang::compile_module(&module, &TypeConfig::default()).unwrap();
+/// assert!(program.functions.contains_key("double"));
+/// ```
+pub fn compile_module(module: &Module, cfg: &TypeConfig) -> Result<Program, CompileError> {
+    let (resolution, info) = analyze_module(module, cfg)?;
+    let program = ir::lower(module, &resolution, &info, cfg)?;
     ir::verify(&program)?;
     Ok(program)
 }

@@ -13,81 +13,11 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use grindlang::codegen::JitModule;
-use grindlang::interp::Interpreter;
-use grindlang::ir::Vm;
+mod common;
+
+use common::Executors;
 use grindlang::types::FnType;
 use grindlang::{RunError, Type, TypeConfig, Value};
-
-/// The four executors for one program: AST, IR, JIT, and a JIT that compacts its value table at
-/// every loop back edge. Artifacts are leaked for `'static` — fine for a test harness.
-struct Executors {
-    interp: Interpreter<'static>,
-    vm: Vm<'static>,
-    jit: JitModule,
-    eager: JitModule,
-}
-
-impl Executors {
-    fn new(src: &str, cfg: &TypeConfig) -> Self {
-        let (module, res, info) = grindlang::analyze(src, cfg)
-            .unwrap_or_else(|d| panic!("analyze failed:\n{}", d.render(src)));
-        let module = Box::leak(Box::new(module));
-        let res = Box::leak(Box::new(res));
-        let info = Box::leak(Box::new(info));
-        let program = Box::leak(Box::new(
-            grindlang::ir::lower(module, res, info, cfg).expect("lower"),
-        ));
-        grindlang::ir::verify(program).expect("verify");
-        let mut eager = JitModule::compile(program).expect("jit compile");
-        eager.set_compact_slack(0);
-        Executors {
-            interp: Interpreter::new(module, res).expect("interp"),
-            vm: Vm::new(program),
-            jit: JitModule::compile(program).expect("jit compile"),
-            eager,
-        }
-    }
-
-    /// Call `func` on every executor, labelled.
-    fn call(
-        &mut self,
-        func: &str,
-        args: Vec<Value>,
-    ) -> [(&'static str, Result<Value, RunError>); 4] {
-        [
-            ("AST", self.interp.call(func, args.clone())),
-            ("IR", self.vm.call(func, args.clone())),
-            ("JIT", self.jit.call(func, args.clone())),
-            ("eager JIT", self.eager.call(func, args)),
-        ]
-    }
-
-    /// Assert every executor returns `want` (by `Display`) from `func(args)`.
-    #[track_caller]
-    fn assert_returns(&mut self, func: &str, args: Vec<Value>, want: &str) {
-        for (oracle, got) in self.call(func, args) {
-            match got {
-                Ok(v) => assert_eq!(v.to_string(), want, "{oracle} result of `{func}`"),
-                Err(e) => panic!("{oracle} failed on `{func}`: {e}"),
-            }
-        }
-    }
-
-    /// Assert every executor fails `func(args)` with an error mentioning `needle`.
-    #[track_caller]
-    fn assert_fails(&mut self, func: &str, args: Vec<Value>, needle: &str) {
-        for (oracle, got) in self.call(func, args) {
-            match got {
-                Ok(v) => panic!("{oracle}: `{func}` returned {v}, expected an error"),
-                Err(e) => assert!(
-                    e.to_string().contains(needle),
-                    "{oracle}: `{func}` failed with {e:?}, expected one mentioning {needle:?}"
-                ),
-            }
-        }
-    }
-}
 
 fn num(n: f64) -> Value {
     Value::Number(n)
