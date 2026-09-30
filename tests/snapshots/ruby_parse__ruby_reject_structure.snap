@@ -1,0 +1,117 @@
+---
+source: tests/ruby_parse.rs
+expression: rendered
+---
+error[E0513]: unexpected `end` at the top level; it does not close anything
+  --> 1:1
+   |
+  1| end
+   | ^^^
+
+error[E0515]: a `def` must be at the top level of a script; for a local function, assign a lambda: `name = ->(x) { … }`
+  --> 2:3
+   |
+  2|   def g
+   |   ^^^
+
+error[E0515]: `private` is only allowed at the top level of a script
+  --> 2:3
+   |
+  2|   private
+   |   ^^^^^^^
+
+error[E0515]: write `private def name …`, or `private` on a line of its own to apply it to the `def`s below it
+  --> 1:9
+   |
+  1| private :helper
+   |         ^^^^^^^
+
+error[E0516]: method names ending in `?` are not supported yet; rename `alive?`, for example to `is_alive`
+  --> 1:5
+   |
+  1| def alive?
+   |     ^^^^^^
+
+error[E0516]: method names ending in `!` are not supported yet; rename `reset!`, for example to `reset`
+  --> 1:5
+   |
+  1| def reset!
+   |     ^^^^^^
+
+error[E0517]: `next` takes no value in Grindlang
+  --> 2:8
+   |
+  2|   next x
+   |        ^
+
+error[E0517]: `break` takes no value in Grindlang
+  --> 2:9
+   |
+  2|   break 1
+   |         ^
+
+error[E0512]: chained assignment (`a = b = …`) is not supported in Grindlang; assign each on a line of its own
+  --> 1:7
+   |
+  1| a = b = 0
+   |       ^
+
+error[E0512]: an assignment can't be used as a value in Grindlang; assign on a line of its own
+  --> 1:7
+   |
+  1| if (x = f()) then end
+   |       ^
+
+error[E0512]: cannot assign to this expression; assign to a name, a constant, `@name`, `x.name`, or `x[i]`
+  --> 1:1
+   |
+  1| f() = 1
+   | ^^^
+
+error[E0528]: `or` binds more loosely than `=` in Ruby, so the assignment would happen before the `or`; write `||`, or put the right side in parentheses
+  --> 1:7
+   |
+  1| x = a or b
+   |       ^^
+
+error[E0528]: `and` binds more loosely than `=` in Ruby, so the assignment would happen before the `and`; write `&&`, or put the right side in parentheses
+  --> 1:7
+   |
+  1| x = a and b
+   |       ^^^
+
+error[E0528]: `or` after a call without parentheses would apply to the whole call in Ruby; put the arguments in parentheses: `say(…)`
+  --> 1:7
+   |
+  1| say a or b
+   |       ^^
+
+error[E0511]: `not` can't be used here; write `!`, or put the expression in parentheses
+  --> 1:5
+   |
+  1| x = not a
+   |     ^^^
+
+error[E0510]: a `{` right after a call opens a block, not a hash; pass a hash in parentheses: `foo({ key: value })`
+  --> 1:5
+   |
+  1| foo { hp: 1 }
+   |     ^
+
+error[E0510]: expected `(` or a line break after `def f`, found `x`
+  --> 1:7
+   |
+  1| def f x
+   |       ^
+
+error[E0510]: expected `{` or `do` to start the lambda's body, found `x`; put its parameters in parentheses: `->(x) { … }`
+  --> 1:7
+   |
+  1| f = ->x { x }
+   |       ^
+
+error[E0510]: `unless` can't have an `elsif`; use `if`
+  --> 2:1
+   |
+  2| elsif b
+   | ^^^^^

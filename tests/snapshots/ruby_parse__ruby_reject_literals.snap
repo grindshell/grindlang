@@ -1,0 +1,111 @@
+---
+source: tests/ruby_parse.rs
+expression: rendered
+---
+error[E0525]: heredocs are not supported in Grindlang; write a string, with `\n` for line breaks
+  --> 1:5
+   |
+  1| s = <<~EOS
+   |     ^^^^^^
+
+error[E0525]: `%w[…]` arrays are not supported in Grindlang; write `["a", "b"]`
+  --> 1:6
+   |
+  1| xs = %w[a b c]
+   |      ^^^^^^^^^
+
+error[E0525]: `%i[…]` arrays are not supported in Grindlang; write `[:a, :b]`
+  --> 1:6
+   |
+  1| xs = %i[a b]
+   |      ^^^^^^^
+
+error[E0525]: `%q(…)` strings are not supported in Grindlang; write a quoted string
+  --> 1:5
+   |
+  1| s = %q(text)
+   |     ^^^^^^^^
+
+error[E0525]: `%Q(…)` strings are not supported in Grindlang; write a quoted string
+  --> 1:5
+   |
+  1| s = %Q(text)
+   |     ^^^^^^^^
+
+error[E0525]: character literals like `?a` are not supported in Grindlang; write a string, `'a'`
+  --> 1:5
+   |
+  1| c = ?a
+   |     ^^
+
+error[E0525]: regular expressions are not supported in Grindlang
+  --> 1:6
+   |
+  1| ok = /ab+/
+   |      ^^^^^
+
+error[E0525]: backtick commands are not supported in Grindlang
+  --> 1:7
+   |
+  1| out = `ls`
+   |       ^^^^
+
+error[E0525]: binary literals like `0b1010` are not supported in Grindlang; write the number in decimal, or in hex (`0x…`)
+  --> 1:5
+   |
+  1| n = 0b1010
+   |     ^^^^^^
+
+error[E0525]: octal literals like `0o17` are not supported in Grindlang; write the number in decimal, or in hex (`0x…`)
+  --> 1:5
+   |
+  1| n = 0o17
+   |     ^^^^
+
+error[E0525]: octal literals like `017` are not supported in Grindlang; write the number in decimal, or in hex (`0x…`)
+  --> 1:5
+   |
+  1| n = 017
+   |     ^^^
+
+error[E0525]: rational and imaginary literals like `3r` are not supported in Grindlang: every number is an `f64`
+  --> 1:5
+   |
+  1| n = 3r
+   |     ^^
+
+error[E0525]: rational and imaginary literals like `2i` are not supported in Grindlang: every number is an `f64`
+  --> 1:5
+   |
+  1| n = 2i
+   |     ^^
+
+error[E0525]: quoted symbols like `:"name"` are not supported in Grindlang; write `:name`, or a string
+  --> 1:5
+   |
+  1| s = :"hit points"
+   |     ^^^^^^^^^^^^^
+
+error[E0525]: quoted symbol keys like `"key": value` are not supported in Grindlang; write `key: value`, or `"key" => value`
+  --> 1:7
+   |
+  1| h = { "hp": 1 }
+   |       ^^^^^
+
+error[E0525]: `#@hp` in a string is Ruby's shorthand for `#{@hp}`, which is not supported in Grindlang; write `#{@hp}`
+  --> 1:10
+   |
+  1| s = "hp: #@hp"
+   |          ^^^^
+
+error[E0525]: negative indices are not supported in Grindlang; for the last element, write `xs.last`
+  --> 1:8
+   |
+  1| x = xs[-1]
+   |        ^^
+
+error[E0525]: negative indices are not supported in Grindlang; for the last element, write `xs.last`
+  --> 1:4
+   |
+  1| xs[-2] = 0
+   |    ^^

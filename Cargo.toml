@@ -32,6 +32,10 @@ jit = [
 # runner's `--cache`). `serde_json` is the on-disk format.
 serde = ["dep:serde", "dep:serde_json"]
 
+# The Ruby surface (SPEC-RUBY.md, PLAN.md Phase 10): a second syntax, a strict subset of Ruby's,
+# for the same language. Front end only, so it needs no backend feature.
+ruby = []
+
 [dependencies]
 thiserror = "2"
 serde = { version = "1", features = ["derive"], optional = true }

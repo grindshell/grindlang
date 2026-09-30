@@ -1,0 +1,15 @@
+---
+source: tests/ruby_parse.rs
+expression: rendered
+---
+error[E0524]: global variables like `$score` are not supported in Grindlang; use a constant, or host memory (`@name`)
+  --> 1:1
+   |
+  1| $score = 1
+   | ^^^^^^
+
+error[E0524]: class variables like `@@count` are not supported in Grindlang; use a constant, or host memory (`@name`)
+  --> 1:1
+   |
+  1| @@count = 0
+   | ^^^^^^^

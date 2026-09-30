@@ -1,0 +1,39 @@
+---
+source: tests/ruby_parse.rs
+expression: rendered
+---
+error[E0523]: default parameter values are not supported in Grindlang
+  --> 1:9
+   |
+  1| def f(a = 1)
+   |         ^
+
+error[E0523]: `*args` parameters are not supported in Grindlang: a function takes a fixed number of arguments
+  --> 1:7
+   |
+  1| def f(*args)
+   |       ^
+
+error[E0523]: `**opts` parameters are not supported in Grindlang: a function takes a fixed number of arguments
+  --> 1:7
+   |
+  1| def f(**opts)
+   |       ^^
+
+error[E0523]: keyword parameters like `a:` are not supported in Grindlang; take plain parameters
+  --> 1:7
+   |
+  1| def f(a:, b: 2)
+   |       ^^
+
+error[E0523]: destructuring parameters like `(a, b)` are not supported in Grindlang
+  --> 1:12
+   |
+  1| xs.each { |(a, b)| a }
+   |            ^
+
+error[E0523]: splat arguments (`*xs`, `**opts`) are not supported in Grindlang
+  --> 1:3
+   |
+  1| f(*xs)
+   |   ^

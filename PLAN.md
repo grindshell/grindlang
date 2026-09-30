@@ -423,7 +423,7 @@ history before the commit that deleted it.
 
 A second syntax for the same language: a strict subset of Ruby's syntax aimed at game logic and
 dialog DSLs. [`SPEC-RUBY.md`](SPEC-RUBY.md) (draft) is its authoring contract; this section is
-why it is built the way it is. R0 is done; the rest is not implemented yet.
+why it is built the way it is. R0 and R1 are done; the rest is not implemented yet.
 
 **Approach: translate into the shared AST.** The backends only see `ir::Program`, and
 everything above the IR sees `ast::Module`. A Ruby frontend that translates into `ast::Module`
@@ -529,10 +529,21 @@ counts exclude tests; the total is about 6k.
 
 - **R0 — seams.** ✅ Done. C5 and C6, with Lua wording only. No behavior change: every existing
   test and snapshot passes untouched.
-- **R1 — Ruby lexer and parser** to `ruby::ast`: the grammar of SPEC-RUBY.md §2–3, including
-  its rule for calls without parentheses (§3.4), an E05xx rejection for every construct
-  SPEC-RUBY.md §6 lists, and the 200-level nesting limit (the E0209 rule). Tests: parse
-  fixtures, a snapshot per rejection. (~2.3k lines)
+- **R1 — Ruby lexer and parser** to `ruby::ast`. ✅ Done. `grindlang::ruby::parse` (feature
+  `ruby`) builds a Ruby-shaped `Program`: names stay names, and whether `x` is a local or a
+  call, or `r.name` a field or a method, is left to R2. What the grammar needed settling is
+  recorded in SPEC-RUBY.md §2–3: Ruby's two expression levels (`not`/`and`/`or` only in
+  conditions and statements, so `x = a or b` is `E0528` rather than Ruby's `(x = a) or b`),
+  where a `do` block attaches, negative literals (`-2.abs`), and rejecting, never guessing at,
+  the forms Ruby reads by spacing (`foo -1`, `say /x/`; `E0527`). Line breaks are tokens,
+  dropped where a line plainly continues. Every syntax-level construct of §6 has a code
+  (`E0520`–`E0526` by group); the four that need scope, config, or types wait for the
+  translator. `E0209` is shared with the Lua parser (`parser::too_deeply_nested`); an `if`
+  counts once as an expression and once for its branch, so about 100 can nest. Tests:
+  lexer and parser unit tests, `tests/ruby_parse.rs` over four fixtures (§5, §7, and a grammar
+  tour), a table of every rejection with its code, and one snapshot per §6 group pinning each
+  rendered diagnostic. (~3.6k lines without tests, over the ~2.3k estimated: most of the
+  difference is diagnostic text and one-token-per-line enums.)
 - **R2 — translating the core subset.** C8 and C9 first. Then everything that maps onto
   today's AST: scope analysis, the top level, literals, operators, interpolation, nil tests,
   `if`/`unless`/modifiers, `while`/`until`/`loop`, the iteration forms, memory, the method

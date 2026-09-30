@@ -1,0 +1,51 @@
+---
+source: tests/ruby_parse.rs
+expression: rendered
+---
+error[E0521]: `yield` is not supported in Grindlang; take a lambda as a parameter and call it with `f.call(x)`
+  --> 2:3
+   |
+  2|   yield 1
+   |   ^^^^^
+
+error[E0521]: `&block` parameters are not supported in Grindlang; take a lambda as a plain parameter and call it with `f.call(x)`
+  --> 1:10
+   |
+  1| def each(&block)
+   |          ^
+
+error[E0521]: passing a block with `&` is not supported in Grindlang
+  --> 1:9
+   |
+  1| xs.each(&blk)
+   |         ^
+
+error[E0521]: passing a block with `&` is not supported in Grindlang
+  --> 1:8
+   |
+  1| xs.map &:to_s
+   |        ^
+
+error[E0521]: `block_given?` is not supported in Grindlang: a `def` takes no block
+  --> 2:3
+   |
+  2|   block_given?
+   |   ^^^^^^^^^^^^
+
+error[E0521]: `proc` is not supported in Grindlang; write a lambda, `->(x) { … }`
+  --> 1:5
+   |
+  1| p = proc { |x| x }
+   |     ^^^^
+
+error[E0521]: `Proc` is not supported in Grindlang; write a lambda, `->(x) { … }`
+  --> 1:5
+   |
+  1| p = Proc.new { |x| x }
+   |     ^^^^
+
+error[E0521]: block-local variables (`|x; y|`) are not supported in Grindlang
+  --> 1:13
+   |
+  1| xs.each { |x; y| y = x }
+   |             ^

@@ -73,4 +73,5 @@ jobs:
       # Each backend builds on its own (AGENTS.md, "Respect the feature gating").
       - run: cargo check --locked --no-default-features
       - run: cargo check --locked --no-default-features --features interp
+      - run: cargo check --locked --no-default-features --features ruby
       - run: cargo check --locked

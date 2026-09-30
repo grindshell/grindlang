@@ -5,9 +5,11 @@
 > Ruby forms are accepted and which SPEC.md construct each one becomes. Where this document is
 > silent, SPEC.md governs.
 >
-> Status: **draft, not implemented.** The decisions below were confirmed with the stakeholder
-> on 2026-09-30; details marked _(open)_ are still to settle. Items that depend on a core
-> change name it (C2–C9, PLAN.md Phase 10).
+> Status: **draft, partly implemented.** The lexer and parser (§2, §3, and the syntax
+> rejections of §6) are built, behind the `ruby` feature (`grindlang::ruby::parse`); the
+> translation of §4–§5 is not yet. The decisions below were confirmed with the stakeholder on
+> 2026-09-30; details marked _(open)_ are still to settle. Items that depend on a core change
+> name it (C2–C9, PLAN.md Phase 10).
 
 ## 1. What a Ruby-surface script is
 
@@ -76,20 +78,35 @@ and    break  case   def    do     else   elsif  end    false  if
 loop   next   nil    not    or     private public return then  true
 unless until  when   while
 ```
-`loop`, `private`, and `public` are methods in Ruby; here they are fixed forms.
+`loop`, `private`, and `public` are methods in Ruby; here they are fixed forms. After a `.`, a
+keyword is an ordinary method name (`x.then`), and directly followed by `:` where a hash key or
+named argument can start, a label (`if: cond`).
 Reserved and rejected wherever they appear: `class`, `module`, `self`, `super`, `yield`,
 `begin`, `rescue`, `ensure`, `retry`, `redo`, `raise`, `alias`, `undef`, `defined?`, `for`
-(use `.each`), `BEGIN`, `END`, `__method__`.
+(use `.each`), `in`, `BEGIN`, `END`, `__method__`, `__FILE__`, `__LINE__`, `__ENCODING__`,
+`__END__`.
 
 ### 2.5 Numbers
 All numeric literals are `f64`: `3`, `3.0`, `0.5`, `1e3`, `2.5e-4`, `0xFF`, with `_` allowed
-between digits (`1_000`). Rejected: `0b`/`0o` literals, rationals (`3r`), imaginaries (`2i`).
+between digits (`1_000`). As in Ruby, a `.` belongs to a number only when a digit follows it, so
+`3.times` is a method call, and there is no `.5` or `3.`. A `-` written directly before a number
+makes a negative literal, so `-2.abs` is `(-2).abs`, except that `-2 ** 2` is `-(2 ** 2)`.
+Rejected: `0b`, `0o`, and `0d` literals, octal `017`, rationals (`3r`), imaginaries (`2i`).
 
 ### 2.6 Strings
 - `'…'`: raw, with only `\\` and `\'` escapes, as in Ruby.
-- `"…"`: the escapes of SPEC.md §2.6, plus interpolation `#{expr}` (§4.6).
+- `"…"`: Ruby's escapes `\n \t \r \s \e \a \b \f \v \\ \" \' \#`, octal `\0`–`\377`, `\xNN`,
+  `\uNNNN`, and `\u{N…}`, and a `\` at the end of a line joining it to the next; any other
+  escape is an error. Interpolation `#{expr}` (§4.6); Ruby's shorthand `"#@hp"` is rejected,
+  since it would silently read as text.
+- A string may span lines.
 - Rejected: heredocs, `%w[]`, `%i[]`, `%q`, `%Q`, `?a` character literals, backticks, regex
   literals.
+
+A `/`, `%`, `?`, `<<`, or `:` where an operand is expected would start a regex, a `%` literal, a
+character literal, a heredoc, or a symbol. After a name, Ruby also reads a `/`, `%`, or `<<`
+with a space before it and none after (`say /hi/`, `xs <<x`) as the start of a literal
+argument; that is rejected, with a hint to space the operator on both sides.
 
 ### 2.7 Operators
 ```
@@ -110,13 +127,15 @@ Notation as in SPEC.md §3. `sep` is a newline or `;`.
 ### 3.1 Top level
 ```ebnf
 program   ::= {topitem sep}
-topitem   ::= ['private'] def
+topitem   ::= ['private' | 'public'] def
             | 'private' | 'public'          -- switch the visibility of later defs
             | stat
 def       ::= 'def' Name ['(' [params] ')'] body 'end'
 params    ::= Name {',' Name}
 body      ::= {stat sep}
 ```
+A `def`, `private`, or `public` anywhere but the top level is an error; a local function is a
+lambda assigned to a local. Without parentheses, a `def`'s name must end its line.
 
 ### 3.2 Statements
 ```ebnf
@@ -125,80 +144,108 @@ stat ::= expr [modifier]
        | command [modifier]
        | 'if' expr ['then'] body {'elsif' expr ['then'] body} ['else' body] 'end'
        | 'unless' expr ['then'] body ['else' body] 'end'
-       | 'case' expr {'when' expr {',' expr} ['then'] body} ['else' body] 'end'
+       | 'case' expr {'when' arg {',' arg} ['then'] body} ['else' body] 'end'
        | 'while' expr ['do'] body 'end'
        | 'until' expr ['do'] body 'end'
        | 'loop' block
        | 'break' | 'next'
-       | 'return' [expr {',' expr}]
+       | 'return' [arg {',' arg}]
 
 modifier ::= ('if' | 'unless' | 'while' | 'until') expr
-assign   ::= target {',' target} '=' expr {',' expr}
-           | target opassign expr
-target   ::= Name | Const | Ivar | primary '[' expr ']' | primary '.' Name
+assign   ::= target {',' target} '=' arg {',' arg}
+           | target opassign arg
+target   ::= Name | Const | Ivar | primary '[' arg ']' | primary '.' Name
 opassign ::= '+=' | '-=' | '*=' | '/=' | '%=' | '**=' | '||=' | '&&='
 ```
+`break` and `next` take no value. An assignment is a statement, never a value: chained
+assignment (`a = b = 0`) and assignment inside a condition are errors.
 
 ### 3.3 Expressions
+As in Ruby's own grammar, expressions come in two levels. An `expr` may use `not`, `and`, and
+`or`; it is what conditions, modifiers, expression statements, parentheses, and interpolations
+hold. Everywhere else — the right side of `=`, `return` values, arguments, elements, indices,
+and ternary branches — takes an `arg`, which may not. Ruby reads `x = a or b` as
+`(x = a) or b`, so it is rejected rather than read either way; write `x = a || b` or
+`x = (a or b)`.
+
 ```ebnf
-expr     ::= expr binop expr | unop expr
-           | expr '?' expr ':' expr
+expr     ::= expr ('and' | 'or') expr | 'not' expr | arg
+arg      ::= arg binop arg | unop arg
+           | arg '?' arg ':' arg
+           | arg ('..' | '...') arg              -- a range (§4.5)
            | primary
 
 primary  ::= 'nil' | 'true' | 'false' | Number | String | Symbol
            | Name | Const | Ivar
            | '(' expr ')'
-           | array | hash | lambda | range
+           | array | hash | lambda
            | call
-           | primary '[' expr ']'
+           | primary '[' arg ']'
            | primary '.' Name                     -- field read or method (§4.11)
            | 'if' … 'end' | 'unless' … 'end' | 'case' … 'end'   -- as values (§4.4)
 
 call     ::= Name '(' [args] ')' [block]
+           | Name block
            | primary '.' Name '(' [args] ')' [block]
            | primary '.' Name block
            | primary '.' '(' [args] ')'           -- calling a closure: f.(x)
-args     ::= expr {',' expr}
+args     ::= callarg {',' callarg}
+callarg  ::= arg | Name ':' arg                   -- `key: value` only for DSL keywords (§5)
 block    ::= 'do' ['|' params '|'] body 'end'
            | '{' ['|' params '|'] body '}'
 lambda   ::= '->' ['(' [params] ')'] ('{' body '}' | 'do' body 'end')
            | 'lambda' block
-array    ::= '[' [expr {',' expr} [',']] ']'
+array    ::= '[' [arg {',' arg} [',']] ']'
 hash     ::= '{' [pair {',' pair} [',']] '}'
-pair     ::= Name ':' expr | expr '=>' expr
-range    ::= '(' expr ('..' | '...') expr ')'   -- only as an iteration receiver (§4.5)
+pair     ::= Name ':' arg | arg '=>' arg
 ```
+A range is accepted only as an iteration receiver, `(a..b).each`, and as a `when` value; the
+translator rejects it elsewhere. Line breaks may appear inside `( )`, `[ ]`, and `{ }` after
+an element and before the closing bracket.
 
 ### 3.4 Calls without parentheses
 ```ebnf
-command  ::= Name cmdarg {',' cmdarg} [block]
-cmdarg   ::= expr | Name ':' expr               -- `key: value` only for DSL keywords (§5)
+command  ::= Name callarg {',' callarg} [block]
 ```
 A call may omit its parentheses **only at the start of a statement** (`say "Hi"`,
-`on :hit do … end`), and its first argument may not begin with `-`, `[`, `(`, `*`, `&`, or
-`{`; write `foo(-1)`, not `foo -1`. A `{` directly after a call always opens a **block**, so a
-hash argument needs parentheses: `foo({ a: 1 })`. These rules remove Ruby's
-whitespace-dependent parses. A bare name with no arguments (`reset`) is a zero-argument call
-unless a local of that name is in scope (§4.3).
+`on :hit do … end`) and only when it starts with a plain name: `mem.add_item(:sword)` needs
+them. Its first argument may not begin with `-`, `[`, `(`, `*`, `&`, or `{`: after a name
+those are an operator, an index, the call's own parentheses, or its block, so `foo [1]`
+indexes and `foo { … }` passes a block. A hash argument therefore needs parentheses,
+`foo({ a: 1 })`. Where Ruby would decide by spacing — `foo -1`, `foo *xs`, `foo [1]`, and
+`foo (1)`, with a space before the operator and none after — the parser rejects the form and
+asks for `foo(-1)` or `foo - 1`. A name followed by an argument anywhere else (`x = foo 1`) is
+an error too. A bare name with no arguments (`reset`) is a zero-argument call unless a local
+of that name is in scope (§4.3).
+
+A `do` block belongs to a statement's call without parentheses when there is one
+(`on :hit do … end`, `say xs.first do … end` gives the block to `say`), and a `while` or
+`until` condition never takes one (`while xs.any? do` is the loop's `do`). Otherwise a block
+belongs to the call just before it.
 
 ### 3.5 Precedence (lowest → highest)
 ```
-not                       -- keyword form
+modifiers                 -- x if c, x unless c, x while c, x until c
 and  or                   -- equal precedence, left-associative, as in Ruby
+not                       -- keyword form
+=  op=                    -- a statement (§3.2), never inside an expression
 ?  :                      -- right-associative
+..  ...
 ||
 &&
 ==  !=
 <  <=  >  >=
+<<                        -- array append
 +  -
 *  /  %
 -                         -- unary minus
-**                        -- right-associative; binds tighter than unary minus: -2 ** 2 == -4
+**                        -- right-associative; binds tighter than unary minus: -x ** 2 == -(x ** 2)
 !                         -- unary
 ```
-Modifiers (`x if c`) and assignment bind looser than every operator. The translator builds
-the tree by these rules, so Ruby's `a or b and c` is `(a or b) and c` even though SPEC.md's
-Lua spelling ranks `and` above `or`.
+The translator builds the tree by these rules, so Ruby's `a or b and c` is `(a or b) and c`
+even though SPEC.md's Lua spelling ranks `and` above `or`, and `not a and b` is
+`(not a) and b`. Postfix forms — `.name`, calls, `[i]` — bind tighter than any operator:
+`-x.abs` is `-(x.abs)`, and `!x.nil?` is `!(x.nil?)`.
 
 ## 4. How Ruby maps onto Grindlang
 
@@ -501,28 +548,43 @@ let module = engine.compile_ruby(src, &ruby)?;
 ## 6. Rejected constructs
 
 Each produces a targeted, span-pointing diagnostic. Ruby-only diagnostics use **E05xx**
-(lexing and parsing) and **E06xx** (translation and DSL keywords); numbers are assigned as
-they are implemented. SPEC.md §8's diagnostics apply unchanged, worded in Ruby syntax where
-they quote code.
+(lexing and parsing) and **E06xx** (translation and DSL keywords). SPEC.md §8's diagnostics
+apply unchanged, worded in Ruby syntax where they quote code; a tree nested more than 200
+levels deep is SPEC.md's `E0209`, with an `if` or `case` counting once as an expression and
+once for its branches.
 
-- **Object model:** `class`, `module`, `self`, `super`, `Struct`, `.new`, `attr_*`,
+- **Object model** (`E0520`): `class`, `module`, `self`, `super`, `Struct`, `.new`, `attr_*`,
   `define_method`, `method_missing`, `send`, `public_send`, `instance_variable_get`, `eval`,
   `instance_eval`.
-- **Blocks and procs:** `yield`, `&block` parameters, `block_given?`, a block passed to a
-  user `def`, `proc`, `Proc.new`, `f[x]` as a call.
-- **Exceptions:** `begin`/`rescue`/`ensure`/`retry`, `raise`, the `rescue` modifier.
-- **Parameters:** default values, `*args`, `**opts`, keyword parameters.
-- **Variables:** `$globals`, `@@class_vars`, `@ivar` with no memory designated for `@`, and a
-  `def` reading a top-level lowercase local.
-- **Literals:** heredocs, `%w`/`%i`/`%q`/`%Q`, `?a`, regex literals, backticks, `0b`/`0o`,
-  rationals, imaginaries, quoted symbols, literal negative indices.
-- **Syntax:** `for … in`, `=begin`/`=end`, `__END__`, `BEGIN`/`END`, `alias`, `undef`,
-  `defined?`, `&.`, `<=>`, `===`, `=~`, bitwise operators, `begin … end while`, a call without
-  parentheses anywhere but the start of a statement, or with a first argument beginning with
-  `-`, `[`, `(`, `*`, `&`, or `{`.
-- **Semantics:** `+` with a string-literal operand; a collection method (§4.12) outside an
-  assignment or `return`; an `if` or `case` value with multi-statement branches outside an
-  assignment or `return`.
+- **Blocks and procs** (`E0521`): `yield`, `&block` parameters, passing a block with `&`,
+  `block_given?`, `proc`, `Proc.new`, block-local variables `|x; y|`. _Translation:_ a block
+  passed to a user `def`, `f[x]` as a call.
+- **Exceptions** (`E0522`): `begin`/`rescue`/`ensure`/`retry`, `raise`, the `rescue` modifier,
+  and with `begin`, `begin … end while`.
+- **Parameters** (`E0523`): default values, `*args`, `**opts`, keyword parameters,
+  destructuring `(a, b)`, splat arguments.
+- **Variables** (`E0524`): `$globals`, `@@class_vars`. _Translation:_ `@ivar` with no memory
+  designated for `@`, and a `def` reading a top-level lowercase local.
+- **Literals** (`E0525`): heredocs, `%w`/`%i`/`%q`/`%Q`, `?a`, regex literals, backticks,
+  `0b`/`0o`/`017`, rationals, imaginaries, quoted symbols and `"key":` keys, `"#@x"`, literal
+  negative indices.
+- **Syntax** (`E0526`): `for … in`, `case … in`, `=begin`/`=end`, `__END__`, `BEGIN`/`END`,
+  `alias`, `undef`, `redo`, `defined?`, `&.`, `::`, `<=>`, `===`, `=~`, `!~`, bitwise operators
+  and their assignments.
+- **Calls without parentheses** (`E0527`): anywhere but the start of a statement, and the
+  spacing-dependent forms of §3.4 (`foo -1`, `foo *xs`, `foo [1]`, `foo (1)`).
+- **Loose `and`/`or`** (`E0528`): after an assignment or a call without parentheses, which
+  Ruby would apply to the whole statement.
+- **Statement structure:** a stray `end` at the top level (`E0513`); a `def`, `private`, or
+  `public` below the top level, or `private` with arguments (`E0515`); a method name ending in
+  `?` or `!` (`E0516`, see Open items); `break` or `next` with a value (`E0517`); chained
+  assignment, assignment as a value, or an unassignable target (`E0512`).
+- **Everything else** is a plain syntax error: `E0500`–`E0503` from the lexer (a stray
+  character, an unterminated string, a bad escape, a malformed number), `E0510` for an
+  unexpected token, and `E0511` where an expression was expected.
+- **Semantics** (E06xx, translation): `+` with a string-literal operand; a collection method
+  (§4.12) outside an assignment or `return`; an `if` or `case` value with multi-statement
+  branches outside an assignment or `return`.
 
 ## 7. Worked example
 

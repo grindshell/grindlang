@@ -1,0 +1,57 @@
+---
+source: tests/ruby_parse.rs
+expression: rendered
+---
+error[E0527]: a call without parentheses is only allowed at the start of a statement; write `foo(…)`
+  --> 1:9
+   |
+  1| x = foo 1
+   |         ^
+
+error[E0527]: a call without parentheses is only allowed at the start of a statement; write `format(…)`
+  --> 1:12
+   |
+  1| say format "%d", 1
+   |            ^^^^
+
+error[E0527]: a call without parentheses is only allowed at the start of a statement; write `mem.add_item(…)`
+  --> 1:14
+   |
+  1| mem.add_item :sword
+   |              ^^^^^^
+
+error[E0527]: `foo -…` is ambiguous: write `foo(-…)` to pass a negative number, or `foo - …` to subtract
+  --> 1:5
+   |
+  1| foo -1
+   |     ^
+
+error[E0527]: `foo [` is ambiguous: write `foo[…]` to index, or `foo([…])` to pass an array
+  --> 1:5
+   |
+  1| foo [1, 2]
+   |     ^
+
+error[E0527]: put no space between `foo` and `(`; `foo (…)` means something else in Ruby
+  --> 1:5
+   |
+  1| foo (1)
+   |     ^
+
+error[E0527]: `foo *…` is ambiguous: splat arguments are not supported, so for the operator write `foo * …`
+  --> 1:5
+   |
+  1| foo *xs
+   |     ^
+
+error[E0521]: passing a block with `&` is not supported in Grindlang
+  --> 1:5
+   |
+  1| foo &blk
+   |     ^
+
+error[E0527]: `a :b` reads as a call without parentheses; in `cond ? a : b`, put a space after the `:`
+  --> 1:11
+   |
+  1| x = c ? a :b
+   |           ^^

@@ -65,6 +65,8 @@ other feature required.
   can be cached to / loaded from disk. Pulls in `serde_json` as the on-disk format. The
   `grindlang` CLI **requires** this feature (`required-features = ["jit", "serde"]`) because its
   pyc-style IR cache is default-on; the library itself keeps `serde` optional.
+- `ruby` — the Ruby surface (`src/ruby/`, `SPEC-RUBY.md`, `PLAN.md` Phase 10): so far its lexer
+  and parser, `ruby::parse`, to a Ruby-shaped tree. Front end only; needs no backend feature.
 
 **Gating rule:** items needed by *any* execution backend (the runtime `Value` reference
 variants `Cell`/`Closure`, `NativeFn`, `ClosureObj`, and the builtin reference impls in
@@ -181,7 +183,8 @@ the `codegen` and `runtime` module rustdoc for the ABI contract.
   rest of the crate is insulated from cranelift churn. Pin cranelift versions.
 - **Respect the feature gating** (see §3). Shared-runtime items → `any(interp, jit)`;
   interpreter-only items → `interp`. Verify changes with `cargo check --no-default-features`,
-  `--no-default-features --features interp`, and default before committing.
+  `--no-default-features --features interp`, `--no-default-features --features ruby`, and
+  default before committing.
 - **Diagnostics carry codes + spans.** Every user-facing error is a `Diagnostic` with a stable
   `code` (e.g. `E0001`) and a `Span`; tests match on codes, snapshots on the rendered output.
   Reject unsupported Lua constructs with a clear "not supported in Grindlang" diagnostic, never

@@ -1,0 +1,39 @@
+---
+source: tests/ruby_parse.rs
+expression: rendered
+---
+error[E0522]: `begin` is not supported in Grindlang: there are no exceptions, and a loop that tests at the end is written `loop do … break unless cond end`
+  --> 1:1
+   |
+  1| begin
+   | ^^^^^
+
+error[E0522]: `rescue` is not supported in Grindlang: there are no exceptions
+  --> 3:1
+   |
+  3| rescue
+   | ^^^^^^
+
+error[E0522]: `ensure` is not supported in Grindlang: there are no exceptions
+  --> 3:1
+   |
+  3| ensure
+   | ^^^^^^
+
+error[E0522]: `retry` is not supported in Grindlang: there are no exceptions
+  --> 1:1
+   |
+  1| retry
+   | ^^^^^
+
+error[E0522]: `raise` is not supported in Grindlang: there are no exceptions
+  --> 1:1
+   |
+  1| raise "boom"
+   | ^^^^^
+
+error[E0522]: the `rescue` modifier is not supported in Grindlang: there are no exceptions
+  --> 1:9
+   |
+  1| x = f() rescue 0
+   |         ^^^^^^

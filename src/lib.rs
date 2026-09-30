@@ -37,7 +37,8 @@
 //!
 //! [`analyze_module`] and [`compile_module`] start from an [`ast::Module`] instead of Lua
 //! source, so a module parsed from another surface syntax ([`Surface`]) goes through the same
-//! resolver, checker, and lowering.
+//! resolver, checker, and lowering. The Ruby surface (`ruby` feature, `PLAN.md` Phase 10) is
+//! the first such syntax; so far its `ruby` module parses Ruby source into a Ruby-shaped tree.
 
 pub mod annotations;
 pub mod ast;
@@ -54,6 +55,9 @@ pub mod value;
 
 #[cfg(feature = "interp")]
 pub mod interp;
+
+#[cfg(feature = "ruby")]
+pub mod ruby;
 
 #[cfg(feature = "jit")]
 pub mod codegen;

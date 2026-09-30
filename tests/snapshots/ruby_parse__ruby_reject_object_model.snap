@@ -1,0 +1,87 @@
+---
+source: tests/ruby_parse.rs
+expression: rendered
+---
+error[E0520]: `class` is not supported in Grindlang: a script is one module of functions and constants
+  --> 1:1
+   |
+  1| class Hero
+   | ^^^^^
+
+error[E0520]: `module` is not supported in Grindlang: a script is one module of functions and constants
+  --> 1:1
+   |
+  1| module Stats
+   | ^^^^^^
+
+error[E0520]: `self` is not supported in Grindlang: there are no objects
+  --> 1:5
+   |
+  1| x = self
+   |     ^^^^
+
+error[E0520]: `super` is not supported in Grindlang: there are no classes
+  --> 2:3
+   |
+  2|   super
+   |   ^^^^^
+
+error[E0520]: `Struct` is not supported in Grindlang: there are no classes; build a hash, `{ name: …, hp: … }`
+  --> 1:9
+   |
+  1| Point = Struct.new(:x, :y)
+   |         ^^^^^^
+
+error[E0520]: `.new` is not supported in Grindlang: there are no classes; build a hash, `{ name: …, hp: … }`
+  --> 1:10
+   |
+  1| h = Hero.new
+   |          ^^^
+
+error[E0520]: `attr_accessor` is not supported in Grindlang: there are no objects; keep fields in a hash, or in host memory (`@name`)
+  --> 1:1
+   |
+  1| attr_accessor :hp
+   | ^^^^^^^^^^^^^
+
+error[E0520]: `define_method` is not supported in Grindlang: there are no objects or reflection
+  --> 1:1
+   |
+  1| define_method(:f) { 1 }
+   | ^^^^^^^^^^^^^
+
+error[E0520]: `method_missing` is not supported in Grindlang: there are no objects or reflection
+  --> 1:5
+   |
+  1| def method_missing(name)
+   |     ^^^^^^^^^^^^^^
+
+error[E0520]: `.send` is not supported in Grindlang: there are no objects or reflection
+  --> 1:3
+   |
+  1| x.send(:hp)
+   |   ^^^^
+
+error[E0520]: `.public_send` is not supported in Grindlang: there are no objects or reflection
+  --> 1:3
+   |
+  1| x.public_send(:hp)
+   |   ^^^^^^^^^^^
+
+error[E0520]: `instance_variable_get` is not supported in Grindlang: there are no objects or reflection
+  --> 1:5
+   |
+  1| v = instance_variable_get(:@hp)
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+error[E0520]: `eval` is not supported in Grindlang: code can't be evaluated at run time
+  --> 1:1
+   |
+  1| eval("1 + 1")
+   | ^^^^
+
+error[E0520]: `.instance_eval` is not supported in Grindlang: code can't be evaluated at run time
+  --> 1:3
+   |
+  1| x.instance_eval { 1 }
+   |   ^^^^^^^^^^^^^

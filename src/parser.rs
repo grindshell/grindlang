@@ -37,6 +37,19 @@ use crate::surface::Surface;
 /// functions.
 pub(crate) const MAX_NESTING: u32 = 200;
 
+/// The `E0209` error for a tree nested more than [`MAX_NESTING`] levels deep, which every
+/// surface's parser reports the same way.
+pub(crate) fn too_deeply_nested(span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E0209",
+        format!(
+            "this is nested too deeply (more than {MAX_NESTING} levels of expressions and \
+             blocks); split it up, e.g. by moving parts into local variables"
+        ),
+        span,
+    )
+}
+
 /// Parse a token stream plus the `---` doc comments (as produced by [`crate::lexer::lex`])
 /// into a [`Module`]. Doc comments are associated with the `function` they precede and their
 /// `@param`/`@return` directives attached as [`FnAnnotations`].
@@ -148,14 +161,8 @@ impl Parser {
     /// Record that the tree under construction reaches `level`, failing past [`MAX_NESTING`].
     fn note_level(&mut self, level: u32) -> PResult<()> {
         if level > MAX_NESTING {
-            return self.err(
-                "E0209",
-                format!(
-                    "this is nested too deeply (more than {MAX_NESTING} levels of expressions \
-                     and blocks); split it up, e.g. by moving parts into local variables"
-                ),
-                self.peek_span(),
-            );
+            self.diags.push(too_deeply_nested(self.peek_span()));
+            return Err(Aborted);
         }
         self.reached = self.reached.max(level);
         Ok(())
