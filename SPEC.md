@@ -339,7 +339,8 @@ unification:
   field/index access). For calc-style code this almost always pins the type
   (`base * mult` ⇒ both `number`).
 - A function's return type is the unified type of its `return` expressions (or `()` if
-  none).
+  none). When one `return` gives the literal `nil` and another a value of type `T`, it is `T?`
+  (§5.5).
 - Table literal shape is inferred: all `Name = exp` ⇒ `record`; all positional `exp`
   with one element type ⇒ `array<T>`; `[exp]=exp` with `string` keys and one value type ⇒
   `map<string, T>`. Mixing record and array forms in one literal is a type error.
@@ -379,6 +380,12 @@ end
   may do either, and the call then returns `nil`. The check follows the structure of the code:
   an `if` returns on every path only when it has an `else` and every branch returns, a
   `while true` loop with no `break` never finishes, and any other loop may run zero times.
+- A function whose return type is optional (`T?`) may `return` a `T` or `nil` on any path, as
+  an assignment to a `T?` slot may. The type is optional either because `---@return T?` declares
+  it (for a tuple return, per element) or because the function returns the literal `nil` on one
+  path and a value on another, which infers `T?`. Otherwise the returns must agree exactly: one
+  returning a `number?` and another a `number` is an `E0413` mismatch until `---@return number?`
+  says which is meant.
 - Functions may return multiple values as a **tuple**. A `return e1, …, en` with `n ≥ 2`
   builds a tuple of `n` single-valued elements (a nested multi-value call in the list is **not**
   flattened — `E0415`). The tuple type is written `(T1, …, Tn)` and is inferred from the

@@ -1174,6 +1174,64 @@ end
     );
 }
 
+// ---- An optional return accepts a value and nil ---------------------------
+//
+// `return 1` in a function declared `---@return number?` was an E0413 mismatch, and so was
+// `return 1` beside `return nil`, so a function could only produce "a number or nil" by falling
+// off its end. Both now type-check; the JIT has to box the scalar into the optional's handle on
+// the way out, which is what these pin across the backends.
+
+#[test]
+fn optional_returns_agree_everywhere() {
+    let src = "\
+function maybe(x)
+  if x > 0 then return x * 2 elseif x < 0 then return nil end
+end
+function flag(x) if x > 0 then return true end return nil end
+---@param x number
+---@return number?
+function declared(x) if x > 0 then return x end return nil end
+function use(x)
+  local m = maybe(x)
+  if m ~= nil then return m + 1 end
+  return 0
+end
+";
+    let mut all = triple(src, &TypeConfig::default());
+    for (name, n, want) in [
+        ("maybe", 3.0, "6"),
+        ("maybe", -1.0, "nil"),
+        ("maybe", 0.0, "nil"),
+        ("flag", 1.0, "true"),
+        ("flag", -1.0, "nil"),
+        ("declared", 4.0, "4"),
+        ("declared", -4.0, "nil"),
+        ("use", 3.0, "7"),
+        ("use", -1.0, "0"),
+    ] {
+        let got = call_all(&mut all, name, n).unwrap_or_else(|e| panic!("{name}({n}): {e}"));
+        assert_eq!(got.to_string(), want, "{name}({n})");
+    }
+}
+
+#[test]
+fn an_optional_tuple_element_agrees_everywhere() {
+    let src = "\
+---@param x number
+---@return number?
+---@return string
+function pair(x) if x > 0 then return x, \"pos\" end return nil, \"neg\" end
+function use(x)
+  local n, s = pair(x)
+  if n ~= nil then return s .. tostring(n) end
+  return s
+end
+";
+    let mut all = triple(src, &TypeConfig::default());
+    assert_eq!(call_all(&mut all, "use", 2.0).unwrap().to_string(), "pos2");
+    assert_eq!(call_all(&mut all, "use", -1.0).unwrap().to_string(), "neg");
+}
+
 // ---- Deep source must not overflow any later phase ------------------------
 
 /// Source nested just inside the parser's limit (`E0209`) must survive every recursive phase —

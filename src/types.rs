@@ -28,6 +28,10 @@
 //! * **Every path returns a value** in a function whose return type isn't optional: a bare
 //!   `return`, or control reaching the closing `end`, is `E0480` (§5.5). Checked after every
 //!   body, once return types are settled.
+//! * **Optional returns**: where the return type is `T?` — declared by `---@return`, or inferred
+//!   because the function returns a literal `nil` beside a value — a `return` may give a `T` or
+//!   `nil`, checked like an assignment. Decided before the body is checked, so it doesn't depend
+//!   on the order of the `return`s (§5.5).
 //! * **Flow narrowing**: inside `if <place> ~= nil then`, a `T?` place reads as `T`, where the
 //!   place is a local, an upvalue, a memory root, or a field path over one (§5.3). A write to
 //!   the place or a prefix of it ends the narrowing. Each narrowed read is recorded in
@@ -384,6 +388,10 @@ impl Unifier {
 
 struct ReturnFrame {
     ret: Type,
+    /// Whether each `return` is checked like an assignment to the return slot, so a `T` or
+    /// `nil` may be returned where the return type is `T?` — decided once, before the body is
+    /// checked, so the outcome can't depend on which `return` comes first (§5.5).
+    widen: bool,
     saw_value: bool,
     /// Each bare `return` in the function, which returns no value.
     bare_returns: Vec<Span>,
@@ -485,6 +493,11 @@ impl<'a> Checker<'a> {
                 let sig = self.make_sig(&f.body.params);
                 if !f.annotations.is_empty() {
                     self.apply_fn_annotations(f, &sig);
+                }
+                // A declared return type is the author's to give; `nil` against a non-optional
+                // one is then reported at the `return`.
+                if f.annotations.ret.is_empty() {
+                    self.infer_optional_return(&f.body, &sig);
                 }
                 self.func_sigs.insert(f.name.node.clone(), sig);
             }
@@ -685,8 +698,16 @@ impl<'a> Checker<'a> {
     }
 
     fn check_func_body(&mut self, body: &FuncBody, sig: &FnType) {
+        let widen = match self.u.shallow(&sig.ret) {
+            Type::Optional(_) => true,
+            Type::Tuple(elems) => elems
+                .iter()
+                .any(|e| matches!(self.u.shallow(e), Type::Optional(_))),
+            _ => false,
+        };
         self.return_stack.push(ReturnFrame {
             ret: (*sig.ret).clone(),
+            widen,
             saw_value: false,
             bare_returns: Vec::new(),
         });
@@ -760,7 +781,7 @@ impl<'a> Checker<'a> {
     }
 
     fn check_return(&mut self, ret: &RetStat) {
-        let frame_ret = self.return_stack.last().map(|f| f.ret.clone());
+        let frame_ret = self.return_stack.last().map(|f| (f.ret.clone(), f.widen));
         // 0 exprs → value-less; 1 → a single value (which may itself be a tuple-returning call,
         // i.e. a pass-through); ≥ 2 → a tuple built from single-valued elements (no flattening).
         let (value_ty, span) = if ret.exprs.is_empty() {
@@ -777,11 +798,45 @@ impl<'a> Checker<'a> {
             let elems = ret.exprs.iter().map(|e| self.check_expr(e)).collect();
             (Type::Tuple(elems), ret.span)
         };
-        if let Some(r) = frame_ret {
-            self.require(span, &value_ty, &r, "E0413", "return type mismatch");
+        if let Some((r, widen)) = frame_ret {
+            if !widen {
+                self.require(span, &value_ty, &r, "E0413", "return type mismatch");
+            } else if !self.is_assignable(&value_ty, &r) {
+                self.error(
+                    "E0413",
+                    format!(
+                        "return type mismatch: expected {}, found {}",
+                        self.u.deep(&r),
+                        self.u.deep(&value_ty)
+                    ),
+                    span,
+                );
+            }
         }
         if let Some(frame) = self.return_stack.last_mut() {
             frame.saw_value = true;
+        }
+    }
+
+    /// Make `sig`'s return type optional up front when `body` returns a literal `nil` on some
+    /// paths and a value on others (`SPEC.md` §5.5), so that every `return` is then checked
+    /// against `T?` whichever comes first. Without it the first `return` would fix the type:
+    /// `return 1` makes it `number` and a later `return nil` a mismatch, while the same two
+    /// returns the other way round would infer `nil` and reject the `1`.
+    fn infer_optional_return(&mut self, body: &FuncBody, sig: &FnType) {
+        let (mut returns_nil, mut returns_value) = (false, false);
+        visit_returns(&body.block, &mut |ret| {
+            if let [e] = ret.exprs.as_slice() {
+                if is_literal_nil(e) {
+                    returns_nil = true;
+                } else {
+                    returns_value = true;
+                }
+            }
+        });
+        if returns_nil && returns_value {
+            let inner = self.u.fresh();
+            let _ = self.u.unify(&sig.ret, &Type::optional(inner));
         }
     }
 
@@ -793,6 +848,7 @@ impl<'a> Checker<'a> {
             StatKind::Local { names, exprs } => self.check_local(names, exprs, stat.span),
             StatKind::LocalFunction { name, body } => {
                 let sig = self.make_sig(&body.params);
+                self.infer_optional_return(body, &sig);
                 if let Some(id) = self.res.def(name.span) {
                     self.sym_types[id as usize] = Type::Function(sig.clone());
                 }
@@ -1034,6 +1090,7 @@ impl<'a> Checker<'a> {
             ExprKind::Name(_) => self.check_name(expr),
             ExprKind::Function(body) => {
                 let sig = self.make_sig(&body.params);
+                self.infer_optional_return(body, &sig);
                 self.func_literals.insert(body.span, sig.clone());
                 self.check_func_body(body, &sig);
                 Type::Function(sig)
@@ -1896,6 +1953,14 @@ impl<'a> Checker<'a> {
             }
             return self.is_assignable(&f, inner);
         }
+        // A multi-value `return` into a tuple return type, element by element (§5.5).
+        if let (Type::Tuple(from_elems), Type::Tuple(to_elems)) = (&f, &t) {
+            return from_elems.len() == to_elems.len()
+                && from_elems
+                    .iter()
+                    .zip(to_elems)
+                    .all(|(fe, te)| self.is_assignable(fe, te));
+        }
         self.u.unify(&f, &t).is_ok()
     }
 }
@@ -1943,6 +2008,39 @@ fn is_literal_true(e: &Expr) -> bool {
         ExprKind::Bool(b) => *b,
         ExprKind::Paren(inner) => is_literal_true(inner),
         _ => false,
+    }
+}
+
+fn is_literal_nil(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Nil => true,
+        ExprKind::Paren(inner) => is_literal_nil(inner),
+        _ => false,
+    }
+}
+
+/// Call `f` on every `return` in `block` and the blocks nested in it, but not on those in the
+/// bodies of functions defined inside it: those return from a different function.
+fn visit_returns(block: &Block, f: &mut impl FnMut(&RetStat)) {
+    for stat in &block.stats {
+        match &stat.kind {
+            StatKind::Do(body)
+            | StatKind::While { body, .. }
+            | StatKind::NumericFor { body, .. }
+            | StatKind::GenericFor { body, .. } => visit_returns(body, f),
+            StatKind::If { arms, else_block } => {
+                for (_, body) in arms {
+                    visit_returns(body, f);
+                }
+                if let Some(body) = else_block {
+                    visit_returns(body, f);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(ret) = &block.ret {
+        f(ret);
     }
 }
 
@@ -2561,6 +2659,112 @@ mod tests {
     fn a_value_less_function_may_return_early() {
         let info = ok("function f(x) if x > 0 then return end x = 1 end", &empty());
         assert_eq!(info.exports["f"].to_string(), "fn(number) -> ()");
+    }
+
+    // ---- optional returns ----
+
+    #[test]
+    fn a_declared_optional_return_accepts_a_value_and_nil() {
+        let info = ok(
+            "---@param x number\n\
+             ---@return number?\n\
+             function f(x) if x > 0 then return 1 end return nil end",
+            &empty(),
+        );
+        assert_eq!(info.exports["f"].to_string(), "fn(number) -> number?");
+    }
+
+    #[test]
+    fn nil_and_a_value_infer_an_optional_in_either_order() {
+        for src in [
+            "function f(x) if x > 0 then return 1 end return nil end",
+            "function f(x) if x > 0 then return nil end return 1 end",
+            "function f(x) if x > 0 then return (nil) end return 1 end",
+        ] {
+            let info = ok(src, &empty());
+            assert_eq!(
+                info.exports["f"].to_string(),
+                "fn(number) -> number?",
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn nil_and_an_optional_value_infer_a_single_optional() {
+        let info = ok(
+            "function f(s) if s == \"\" then return nil end return tonumber(s) end",
+            &empty(),
+        );
+        assert_eq!(info.exports["f"].to_string(), "fn(string) -> number?");
+    }
+
+    #[test]
+    fn only_nil_returns_still_infer_nil() {
+        let info = ok("function f() return nil end", &empty());
+        assert_eq!(info.exports["f"].to_string(), "fn() -> nil");
+    }
+
+    #[test]
+    fn an_inferred_optional_function_may_end_without_a_value() {
+        let info = ok(
+            "function f(x) if x > 0 then return 1 elseif x < 0 then return nil end end",
+            &empty(),
+        );
+        assert_eq!(info.exports["f"].to_string(), "fn(number) -> number?");
+    }
+
+    #[test]
+    fn closures_and_bools_infer_optionals_too() {
+        let info = ok(
+            "function f(x)\n\
+               local g = function(y) if y > 0 then return y end return nil end\n\
+               return g(x)\n\
+             end\n\
+             function h(b) if b then return true end return nil end",
+            &empty(),
+        );
+        assert_eq!(info.exports["f"].to_string(), "fn(number) -> number?");
+        assert_eq!(info.exports["h"].to_string(), "fn(bool) -> bool?");
+    }
+
+    #[test]
+    fn a_declared_optional_tuple_element_accepts_a_value_and_nil() {
+        let info = ok(
+            "---@param x number\n\
+             ---@return number?\n\
+             ---@return string\n\
+             function f(x) if x > 0 then return 1, \"a\" end return nil, \"b\" end",
+            &empty(),
+        );
+        assert_eq!(
+            info.exports["f"].to_string(),
+            "fn(number) -> (number?, string)"
+        );
+    }
+
+    #[test]
+    fn a_declared_non_optional_return_still_rejects_nil() {
+        assert_eq!(
+            err_code(
+                "---@return number\n\
+                 function f(x) if x > 0 then return 1 end return nil end",
+                &empty()
+            ),
+            "E0413"
+        );
+    }
+
+    #[test]
+    fn a_caller_must_narrow_an_optional_result() {
+        assert_eq!(
+            err_code(
+                "function f(x) if x > 0 then return 1 end return nil end\n\
+                 function g(x) return f(x) + 1 end",
+                &empty()
+            ),
+            "E0401"
+        );
     }
 
     #[test]
