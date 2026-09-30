@@ -130,6 +130,16 @@ pub struct Pools {
     /// value is a reference are interned: a scalar has no identity to keep stable, so it is
     /// re-evaluated rather than cached (see [`RtCtx::const_cache`]).
     pub consts: Vec<String>,
+    /// The function types indirect calls involve — each lifted closure's own, and the type each
+    /// indirect call site calls its callee as — displayed for error messages. Parallel to
+    /// [`fn_abis`](Self::fn_abis).
+    pub fn_types: Vec<String>,
+    /// The native signature each of [`fn_types`](Self::fn_types) lowers to, as an index into
+    /// `abis`. A closure can be called as a function type only if both have the same one.
+    pub fn_abis: Vec<u32>,
+    /// Each distinct native signature: the parameter reprs, a closure's env excluded, then the
+    /// return repr.
+    abis: Vec<(Vec<Repr>, Repr)>,
 }
 
 impl Pools {
@@ -182,6 +192,38 @@ impl Pools {
     pub fn intern_const(&mut self, name: &str) -> u32 {
         Self::intern(&mut self.consts, name)
     }
+
+    /// Intern a function type an indirect call involves, as `shown`, with the native signature
+    /// it lowers to: its parameter reprs (a closure's env excluded) and its return repr.
+    pub fn intern_fn_type(&mut self, shown: String, params: Vec<Repr>, ret: Repr) -> u32 {
+        let abi = match self
+            .abis
+            .iter()
+            .position(|(p, r)| *p == params && *r == ret)
+        {
+            Some(i) => i as u32,
+            None => {
+                self.abis.push((params, ret));
+                (self.abis.len() - 1) as u32
+            }
+        };
+        let mut existing = self.fn_types.iter().zip(&self.fn_abis);
+        if let Some(i) = existing.position(|(t, &a)| *t == shown && a == abi) {
+            return i as u32;
+        }
+        self.fn_types.push(shown);
+        self.fn_abis.push(abi);
+        (self.fn_types.len() - 1) as u32
+    }
+}
+
+/// A lifted closure's compiled body, as an indirect call finds it.
+#[derive(Clone, Copy, Debug)]
+pub struct ClosureCode {
+    /// The body's finalized native address.
+    pub addr: u64,
+    /// The closure's function type, a [`Pools::fn_types`] id.
+    pub fn_type: u32,
 }
 
 /// One invocation's runtime state. Created fresh per top-level call (this *is* the per-call
@@ -221,9 +263,10 @@ pub struct RtCtx {
     /// A binding the host explicitly set *to* `nil` is `Some(Value::Nil)` and stays legal —
     /// the same distinction the interpreters draw by map presence.
     memory: Vec<Option<Value>>,
-    /// Finalized native address of every compiled function, by name. Used to resolve the
-    /// callee of an indirect closure call ([`rt_closure_code_addr`]).
-    code_addrs: Arc<HashMap<String, u64>>,
+    /// Every lifted closure body this module compiled, by name: the callees an indirect call
+    /// can resolve to ([`rt_closure_code_addr`]). Top-level functions are absent, since they are
+    /// never values.
+    closures: Arc<HashMap<String, ClosureCode>>,
     /// Reference-valued constants already evaluated during this invocation, by constant id
     /// (parallel to [`Pools::consts`]).
     ///
@@ -353,7 +396,7 @@ impl RtCtx {
         host: Vec<Option<NativeFn>>,
         methods: Vec<Option<NativeFn>>,
         memory: Vec<Option<Value>>,
-        code_addrs: Arc<HashMap<String, u64>>,
+        closures: Arc<HashMap<String, ClosureCode>>,
         origin: Rc<ClosureOrigin>,
     ) -> Self {
         RtCtx {
@@ -367,7 +410,7 @@ impl RtCtx {
             host,
             methods,
             memory,
-            code_addrs,
+            closures,
             origin,
             error: None,
             panic: None,
@@ -1080,36 +1123,51 @@ define_shims! {
         }
     }
 
-    /// Resolve the native code address of a closure's lifted function, for an indirect call.
+    /// Resolve the native code address of a closure's lifted function, for an indirect call that
+    /// calls it as the function type `want` (a [`Pools::fn_types`] id).
     ///
     /// Only a closure this module built may be called: its `code` name means nothing in another
     /// module's address table, and its body would index this module's pools by ids baked in
     /// elsewhere. A foreign closure is rejected rather than silently dispatched (see
     /// [`ClosureOrigin`]).
-    fn rt_closure_code_addr(ctx, clo: Handle) -> i64 {
-        let (foreign, addr) = match ctx.get(clo) {
-            Value::Closure(c) => {
-                if closure_module_id(c) == Some(ctx.origin.module_id) {
-                    (false, ctx.code_addrs.get(&c.code).copied())
-                } else {
-                    (true, None)
-                }
-            }
-            _ => (false, None),
-        };
-        match addr {
-            Some(a) => a as i64,
-            None if foreign => {
+    ///
+    /// Its body must also lower to the native signature the call site was compiled for. The call
+    /// passes arguments, and reads the result, where that signature puts them, so a body expecting
+    /// another would read registers nothing wrote: undefined behavior. The checker gives a
+    /// closure and its calls one type, but a closure the host hands a script — a host function's
+    /// result, a memory field — has only the host's word for its type, and a closure the host
+    /// assembled itself can name any function at all.
+    fn rt_closure_code_addr(ctx, clo: Handle, want: u32) -> i64 {
+        let code = match ctx.get(clo) {
+            Value::Closure(c) if closure_module_id(c) != Some(ctx.origin.module_id) => {
                 ctx.fail(RunError::Runtime(FOREIGN_CLOSURE.into()));
-                0
+                return 0;
             }
-            None => {
-                ctx.fail(RunError::Internal(
-                    "indirect call to an unknown closure".into(),
-                ));
-                0
+            Value::Closure(c) => match ctx.closures.get(&c.code) {
+                Some(&code) => code,
+                None => {
+                    let e = format!("`{}` is not a closure this module compiled", c.code);
+                    ctx.fail(RunError::Runtime(e));
+                    return 0;
+                }
+            },
+            other => {
+                let e = format!("indirect call to a {} value", other.type_name());
+                ctx.fail(RunError::Internal(e));
+                return 0;
             }
+        };
+        let (have, want) = (code.fn_type as usize, want as usize);
+        let pools = &ctx.pools;
+        if pools.fn_abis[have] != pools.fn_abis[want] {
+            let e = format!(
+                "a closure of type `{}` cannot be called as `{}`",
+                pools.fn_types[have], pools.fn_types[want]
+            );
+            ctx.fail(RunError::Runtime(e));
+            return 0;
         }
+        code.addr as i64
     }
 }
 
@@ -1208,7 +1266,7 @@ shim_table! {
     rt_cell_set(*mut RtCtx, Handle, u64, u32);
     rt_closure_new(*mut RtCtx, u32, *const Handle, u32) -> Handle;
     rt_closure_env_get(*mut RtCtx, Handle, u32) -> Handle;
-    rt_closure_code_addr(*mut RtCtx, Handle) -> i64;
+    rt_closure_code_addr(*mut RtCtx, Handle, u32) -> i64;
 }
 
 #[cfg(test)]

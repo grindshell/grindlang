@@ -377,6 +377,162 @@ end
     );
 }
 
+// ---- A script calls a closure only through the signature it was compiled with -
+//
+// The JIT calls a closure value through a native signature fixed at the call site, from the
+// callee's static type. The checker keeps that type and the closure's own in step, but a closure
+// that comes from the host has only the host's word for its type: one taken from another export
+// could have any signature. Calling it through the wrong one passed arguments where the function
+// didn't read them and read a result where it hadn't written one — undefined behavior, which in
+// practice returned garbage. The JIT now checks, and fails the call.
+//
+// JIT-only, like `trampoline_call_rejects_mistyped_arguments`: the interpreters have no native
+// signature to get wrong, and call a closure with whatever they are given.
+
+const CLOSURES: &str = "\
+function make_add(n) return function(x) return x + n end end
+function make_shout() return function(s) return s .. \"!\" end end
+function make_show() return function(x) return tostring(x + 0) end end
+function make_flag() return function(b) if b then return 1 end return 0 end end
+function via_host(x)
+  local f = borrow()
+  return f(x) + 1
+end
+function via_memory(x)
+  local f = mem.f
+  return f(x) + 1
+end
+function helper(s, x)
+  if s == \"a\" then return 0 end
+  return x * 100
+end
+";
+
+/// [`CLOSURES`] compiled for the JIT. `borrow()` and `mem.f` are both declared
+/// `fn(number) -> number`, and both hand out whatever closure is lent to them.
+struct Closures {
+    jit: JitModule,
+    lent: Rc<RefCell<Value>>,
+}
+
+impl Closures {
+    fn new() -> Self {
+        let fn_type = Type::Function(FnType {
+            params: vec![Type::Number],
+            ret: Box::new(Type::Number),
+        });
+        let mut cfg = TypeConfig::default();
+        cfg.host_functions.insert(
+            "borrow".to_string(),
+            FnType {
+                params: vec![],
+                ret: Box::new(fn_type.clone()),
+            },
+        );
+        let mut rec = BTreeMap::new();
+        rec.insert("f".to_string(), fn_type);
+        cfg.memory.insert("mem".to_string(), Type::Record(rec));
+
+        let mut jit = jit_only(CLOSURES, &cfg);
+        let lent = Rc::new(RefCell::new(Value::Nil));
+        let from = lent.clone();
+        jit.set_host_function("borrow", move |_: &[Value]| Ok(from.borrow().clone()));
+        Closures { jit, lent }
+    }
+
+    /// Call a script that expects a `fn(number) -> number` with `closure`, by each route the host
+    /// can hand it one: a host function's result, and a memory field.
+    fn apply(&mut self, closure: Value) -> [Result<Value, RunError>; 2] {
+        *self.lent.borrow_mut() = closure.clone();
+        self.jit
+            .set_memory("mem", Value::table([("f".to_string(), closure)].into()));
+        let x = || vec![Value::Number(2.0)];
+        [
+            self.jit.call("via_host", x()),
+            self.jit.call("via_memory", x()),
+        ]
+    }
+}
+
+/// A parameter of another type (`string`, `bool`), and a result of another type (`string`).
+#[test]
+fn a_closure_of_another_signature_is_not_called() {
+    let mut c = Closures::new();
+    for make in ["make_shout", "make_flag", "make_show"] {
+        let closure = c.jit.call(make, vec![]).expect(make);
+        for r in c.apply(closure) {
+            let e = r.expect_err(make);
+            assert!(
+                e.to_string()
+                    .contains("cannot be called as `fn(number) -> number`"),
+                "{make}: got {e}"
+            );
+        }
+    }
+}
+
+/// The check compares signatures, not identities: another closure compiled for the same one is
+/// still called.
+#[test]
+fn a_closure_of_the_expected_signature_is_called() {
+    let mut c = Closures::new();
+    let closure = c
+        .jit
+        .call("make_add", vec![Value::Number(3.0)])
+        .expect("make_add");
+    for r in c.apply(closure) {
+        assert_eq!(r.expect("a matching closure runs").to_string(), "6");
+    }
+}
+
+/// The check must never fire on a closure the script made itself, whatever its signature: the
+/// checker gives the closure and every call of it the same type.
+#[test]
+fn script_closures_of_every_signature_are_called() {
+    let src = "\
+function run(n)
+  local flag = function(b) if b then return 1 end return 0 end
+  local shout = function(s) return s .. \"!\" end
+  local maybe = function(x) if x > 0 then return x end return nil end
+  local pair = function(x) return x, x * 2 end
+  local make = function(k) return function(x) return x + k end end
+  local t = {above = function(x) return x > 1 end}
+  local a, b = pair(n)
+  local s = flag(true) + a + b + make(1)(n)
+  local m = maybe(n)
+  if m ~= nil then s = s + m end
+  if t.above(n) then s = s + 1 end
+  return shout(tostring(s))
+end
+";
+    let mut all = triple(src, &TypeConfig::default());
+    assert_eq!(call_all(&mut all, "run", 2.0).unwrap().to_string(), "13!");
+}
+
+/// A closure the host assembles itself, naming a top-level function rather than a closure's
+/// lifted body. `helper(s, x)` even has the native signature a `fn(number) -> number` closure
+/// lowers to (the env, then a number), so only the name gives it away — and running it would pass
+/// the closure itself as `s`.
+#[test]
+fn a_forged_closure_naming_a_top_level_function_is_not_called() {
+    let mut c = Closures::new();
+    let real = c
+        .jit
+        .call("make_add", vec![Value::Number(3.0)])
+        .expect("make_add");
+    let Value::Closure(real) = real else {
+        panic!("make_add returns a closure")
+    };
+    let forged = Value::Closure(Rc::new(grindlang::value::ClosureObj {
+        code: "helper".to_string(),
+        env: vec![],
+        origin: real.origin.clone(),
+    }));
+    for r in c.apply(forged) {
+        assert!(r.is_err(), "ran a top-level function as a closure: {r:?}");
+    }
+}
+
 // ---- Finding 3: a missing memory binding must be an error, not nil ---------
 
 /// Reading a declared-but-unbound memory must fail on every backend. The JIT used to resolve a

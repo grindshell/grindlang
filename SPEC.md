@@ -420,6 +420,13 @@ end
   inside its own module, alongside that module's constants and host bindings. Holding one after
   its module is dropped stays safe (the code stays mapped) but it can no longer be invoked, so
   a host that intends to call a closure must keep its `Module` alive.
+- A closure the host hands a script — as a host function's result, say — must have the function
+  type the script expects of it. The JIT calls a closure through a native signature fixed by
+  that type, so calling one whose parameters or result are represented differently (a different
+  number of parameters, or a `number` or `bool` on one side and any other type on the other) is
+  a runtime error at the call, not a call that passes arguments the closure can't read. The
+  interpreters check nothing at the call, and fail later, if at all, where a value contradicts
+  its type.
 - A closure still **cannot be persisted** into host memory or serialized — that would require
   capturing native-code identity and live captured state; closures are confined to the
   in-process value graph.

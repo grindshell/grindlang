@@ -38,6 +38,7 @@ use cranelift_module::{FuncId, Linkage, Module};
 
 use crate::ir::{ExportTarget, Program};
 use crate::runtime::repr::Repr;
+use crate::types::{FnType, Type};
 use crate::value::{NativeFn, RunError, Value};
 
 use rt::Pools;
@@ -108,8 +109,10 @@ pub struct JitModule {
     const_rets: HashMap<String, Repr>,
     /// lifted-closure name → (source-param reprs excluding the env, return repr).
     closure_sigs: HashMap<String, (Vec<Repr>, Repr)>,
-    /// function name → finalized native address (resolves indirect closure calls).
-    code_addrs: Arc<HashMap<String, u64>>,
+    /// function name → finalized native address (the direct-call fast path).
+    code_addrs: HashMap<String, u64>,
+    /// lifted-closure name → its compiled body, which an indirect call resolves a closure to.
+    closures: Arc<HashMap<String, rt::ClosureCode>>,
     /// Registered host functions and memory, by name.
     host: HashMap<String, NativeFn>,
     /// Registered host-memory methods, keyed by their `"mem:method"` symbol (`SPEC.md` §7).
@@ -207,6 +210,17 @@ impl JitModule {
 
         // Translate every body, interning constants/names into the shared pools.
         let mut pools = Pools::default();
+        // Each closure's function type, which an indirect call checks it against.
+        let mut closure_types: HashMap<String, u32> = HashMap::new();
+        for (name, f) in program.functions.iter().filter(|(_, f)| f.is_closure) {
+            let ty = Type::Function(FnType {
+                params: f.params[1..].iter().map(|p| f.locals[p].clone()).collect(),
+                ret: Box::new(f.ret.clone()),
+            });
+            let (params, ret) = &closure_sigs[name];
+            let id = pools.intern_fn_type(ty.to_string(), params.clone(), *ret);
+            closure_types.insert(name.clone(), id);
+        }
         let cx = Context {
             call_conv,
             shims: &shims,
@@ -299,13 +313,20 @@ impl JitModule {
             closure_tramps.insert(name.clone(), f);
         }
 
-        // Native address of every typed function, by name — the target table for indirect
-        // closure calls (`rt_closure_code_addr`).
+        // Native address of every typed function, by name, and of each closure body with its
+        // type — the target table for indirect closure calls (`rt_closure_code_addr`).
         let mut code_addrs = HashMap::new();
         for (name, &id) in &typed_ids {
             let ptr = module.get_finalized_function(id);
             code_addrs.insert(name.clone(), ptr as u64);
         }
+        let closures = closure_types
+            .into_iter()
+            .map(|(name, fn_type)| {
+                let addr = code_addrs[&name];
+                (name, rt::ClosureCode { addr, fn_type })
+            })
+            .collect();
 
         let module = Rc::new(module);
         let origin = Rc::new(rt::ClosureOrigin {
@@ -323,7 +344,8 @@ impl JitModule {
             fn_sigs,
             const_rets,
             closure_sigs,
-            code_addrs: Arc::new(code_addrs),
+            code_addrs,
+            closures: Arc::new(closures),
             host: HashMap::new(),
             methods: HashMap::new(),
             memory: HashMap::new(),
@@ -623,7 +645,7 @@ impl JitModule {
             self.resolve_host(),
             self.resolve_methods(),
             self.resolve_memory(),
-            self.code_addrs.clone(),
+            self.closures.clone(),
             self.origin.clone(),
         )
     }

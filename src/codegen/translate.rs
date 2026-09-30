@@ -731,15 +731,10 @@ impl<'a, 'b> Translator<'a, 'b> {
     /// real arguments. Mirrors [`Self::translate_call_script`]'s typed ABI.
     fn translate_call_value(&mut self, callee: ValueId, args: &[ValueId]) -> Option<ClifValue> {
         let clo = self.val(callee);
-        let addr = self
-            .call_shim("rt_closure_code_addr", &[self.ctx_val, clo])
-            .unwrap();
-        // An unresolvable closure latches an error and yields address 0; calling through it
-        // would jump to null, so take the error-exit before the `call_indirect` below.
-        let unresolved = self.builder.ins().icmp_imm(IntCC::Equal, addr, 0);
-        self.guard(unresolved);
-        // The lifted function's typed signature: the closure (env) first, then the real params.
-        let (param_reprs, ret_repr) = match self.func.value_type(callee).clone() {
+        // The lifted function's typed signature, from the callee's static type: the closure (env)
+        // first, then the real params.
+        let callee_ty = self.func.value_type(callee).clone();
+        let (param_reprs, ret_repr) = match &callee_ty {
             Type::Function(ft) => (
                 std::iter::once(Repr::Ptr)
                     .chain(ft.params.iter().map(repr_of))
@@ -748,6 +743,19 @@ impl<'a, 'b> Translator<'a, 'b> {
             ),
             _ => (vec![Repr::Ptr], Repr::Ptr),
         };
+        // The runtime refuses a closure whose body was compiled for another signature, which the
+        // `call_indirect` below would otherwise call through this one.
+        let want =
+            self.pools
+                .intern_fn_type(callee_ty.to_string(), param_reprs[1..].to_vec(), ret_repr);
+        let want = self.iconst32(want);
+        let addr = self
+            .call_shim("rt_closure_code_addr", &[self.ctx_val, clo, want])
+            .unwrap();
+        // An unresolvable or mismatched closure latches an error and yields address 0; calling
+        // through it would jump to null, so take the error-exit before the `call_indirect`.
+        let unresolved = self.builder.ins().icmp_imm(IntCC::Equal, addr, 0);
+        self.guard(unresolved);
         let sig = typed_signature(self.cx.call_conv, &param_reprs, ret_repr);
         let sigref = self.builder.import_signature(sig);
         let mut call_args = vec![self.ctx_val, self.depth_val, clo];
