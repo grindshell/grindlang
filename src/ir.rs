@@ -943,11 +943,18 @@ impl<'a> FnLowerer<'a> {
                 self.emit_stmt(Op::FieldSet(b, name.node.clone(), v));
                 Ok(())
             }
-            ExprKind::Index { base, index } => {
+            ExprKind::Index {
+                base,
+                index,
+                zero_based,
+            } => {
                 let b = self.lower_expr(base)?;
                 let idx = self.lower_expr(index)?;
                 match self.values[b as usize].clone() {
-                    Type::Array(_) => self.emit_stmt(Op::ArraySet(b, idx, v)),
+                    Type::Array(_) => {
+                        let idx = self.array_index(idx, *zero_based);
+                        self.emit_stmt(Op::ArraySet(b, idx, v))
+                    }
                     Type::Map(_) => self.emit_stmt(Op::MapSet(b, idx, v)),
                     other => {
                         return Err(LowerError::Internal(format!(
@@ -1285,7 +1292,11 @@ impl<'a> FnLowerer<'a> {
             ExprKind::Name(_) => self.lower_name(expr),
             ExprKind::Function(body) => self.lower_closure_literal(body),
             ExprKind::Field { base, name } => self.lower_field(base, name, expr.span),
-            ExprKind::Index { base, index } => self.lower_index(base, index),
+            ExprKind::Index {
+                base,
+                index,
+                zero_based,
+            } => self.lower_index(base, index, *zero_based),
             ExprKind::Call { callee, args } => self.lower_call(callee, args),
             ExprKind::MethodCall {
                 receiver,
@@ -1362,11 +1373,29 @@ impl<'a> FnLowerer<'a> {
         Ok(self.narrow(span, v))
     }
 
-    fn lower_index(&mut self, base: &Expr, index: &Expr) -> Result<ValueId, LowerError> {
+    /// An array index as the IR takes it, counting from 1: a zero-based index (the Ruby
+    /// surface's, `ast::ExprKind::Index`) gets 1 added, as `idx + 1` would in Lua.
+    fn array_index(&mut self, idx: ValueId, zero_based: bool) -> ValueId {
+        if !zero_based {
+            return idx;
+        }
+        let one = self.emit_value(Op::ConstNumber(1.0), Type::Number);
+        self.emit_value(Op::Binary(BinOp::Add, idx, one), Type::Number)
+    }
+
+    fn lower_index(
+        &mut self,
+        base: &Expr,
+        index: &Expr,
+        zero_based: bool,
+    ) -> Result<ValueId, LowerError> {
         let b = self.lower_expr(base)?;
         let idx = self.lower_expr(index)?;
         match self.values[b as usize].clone() {
-            Type::Array(e) => Ok(self.emit_value(Op::ArrayGet(b, idx), Type::optional(*e))),
+            Type::Array(e) => {
+                let idx = self.array_index(idx, zero_based);
+                Ok(self.emit_value(Op::ArrayGet(b, idx), Type::optional(*e)))
+            }
             Type::Map(v) => Ok(self.emit_value(Op::MapGet(b, idx), Type::optional(*v))),
             Type::Record(fields) => {
                 // A record indexed by a string literal — read the field.

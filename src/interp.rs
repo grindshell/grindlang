@@ -812,12 +812,16 @@ impl<'a> Interpreter<'a> {
                     ))),
                 }
             }
-            ExprKind::Index { base, index } => {
+            ExprKind::Index {
+                base,
+                index,
+                zero_based,
+            } => {
                 let base_v = self.eval_expr(base)?;
                 self.reject_frozen(&base_v)?;
                 match base_v {
                     Value::Array(a) => {
-                        let idx = self.eval_number(index)?;
+                        let idx = self.eval_array_index(index, *zero_based)?;
                         ops::array_set(&a, idx, value)
                     }
                     Value::Table(t) => {
@@ -877,7 +881,11 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Function(Rc::new(func)))
             }
             ExprKind::Field { base, name } => self.eval_field(base, name),
-            ExprKind::Index { base, index } => self.eval_index(base, index),
+            ExprKind::Index {
+                base,
+                index,
+                zero_based,
+            } => self.eval_index(base, index, *zero_based),
             ExprKind::Call { callee, args } => self.eval_call(callee, args),
             ExprKind::MethodCall {
                 receiver,
@@ -963,11 +971,23 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    fn eval_index(&mut self, base: &Expr, index: &Expr) -> Result<Value, RunError> {
+    /// An array index as `ops` takes it, counting from 1: a zero-based index (the Ruby
+    /// surface's, `ast::ExprKind::Index`) gets 1 added.
+    fn eval_array_index(&mut self, index: &Expr, zero_based: bool) -> Result<f64, RunError> {
+        let idx = self.eval_number(index)?;
+        Ok(if zero_based { idx + 1.0 } else { idx })
+    }
+
+    fn eval_index(
+        &mut self,
+        base: &Expr,
+        index: &Expr,
+        zero_based: bool,
+    ) -> Result<Value, RunError> {
         let base_v = self.eval_expr(base)?;
         match base_v {
             Value::Array(a) => {
-                let idx = self.eval_number(index)?;
+                let idx = self.eval_array_index(index, zero_based)?;
                 Ok(ops::array_get(&a, idx))
             }
             Value::Table(t) => {

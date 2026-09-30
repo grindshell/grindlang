@@ -886,6 +886,7 @@ impl Parser {
                         kind: ExprKind::Index {
                             base: Box::new(e),
                             index: Box::new(index),
+                            zero_based: false,
                         },
                         span,
                     };

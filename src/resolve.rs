@@ -668,7 +668,7 @@ impl<'a> Resolver<'a> {
                 self.reject_const_write(expr);
                 self.resolve_expr(base)
             }
-            ExprKind::Index { base, index } => {
+            ExprKind::Index { base, index, .. } => {
                 self.reject_const_write(expr);
                 self.resolve_expr(base);
                 self.resolve_expr(index);
@@ -716,7 +716,7 @@ impl<'a> Resolver<'a> {
         match &expr.kind {
             ExprKind::Nil | ExprKind::Bool(_) | ExprKind::Number(_) | ExprKind::Str(_) => {}
             ExprKind::Name(n) => self.resolve_name(n, expr.span),
-            ExprKind::Index { base, index } => {
+            ExprKind::Index { base, index, .. } => {
                 self.resolve_expr(base);
                 self.resolve_expr(index);
             }

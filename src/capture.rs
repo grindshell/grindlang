@@ -170,7 +170,7 @@ fn visit_expr_literals<F: FnMut(&FuncBody)>(expr: &Expr, f: &mut F) {
         | ExprKind::Name(_) => {}
         // An immediate function literal: report it, don't descend into it.
         ExprKind::Function(body) => f(body),
-        ExprKind::Index { base, index } => {
+        ExprKind::Index { base, index, .. } => {
             visit_expr_literals(base, f);
             visit_expr_literals(index, f);
         }
@@ -288,7 +288,7 @@ fn collect_target_ids(res: &Resolution, expr: &Expr, out: &mut HashSet<SymbolId>
     match &expr.kind {
         ExprKind::Name(_) => collect_name_id(res, expr, out),
         ExprKind::Field { base, .. } => collect_expr_ids(res, base, out),
-        ExprKind::Index { base, index } => {
+        ExprKind::Index { base, index, .. } => {
             collect_expr_ids(res, base, out);
             collect_expr_ids(res, index, out);
         }
@@ -303,7 +303,7 @@ fn collect_expr_ids(res: &Resolution, expr: &Expr, out: &mut HashSet<SymbolId>) 
         // Recurse into nested functions: their upvalues are this closure's responsibility to
         // carry, so they must be captured here too.
         ExprKind::Function(body) => collect_block_ids(res, &body.block, out),
-        ExprKind::Index { base, index } => {
+        ExprKind::Index { base, index, .. } => {
             collect_expr_ids(res, base, out);
             collect_expr_ids(res, index, out);
         }

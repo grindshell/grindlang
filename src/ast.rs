@@ -209,6 +209,10 @@ pub enum ExprKind {
     Index {
         base: Box<Expr>,
         index: Box<Expr>,
+        /// Whether an array index counts from 0, as the Ruby surface's does: lowering and the
+        /// interpreter then add 1 before the element access. A map or record key is used as
+        /// written either way. The Lua parser never sets it.
+        zero_based: bool,
     },
     /// `base.name`.
     Field {

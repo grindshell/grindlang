@@ -443,16 +443,19 @@ function name_or_default(p)        -- p : record{ name: string? }
 end
 ```
 
-A local initialized to `nil` is narrowed the same way before its value is used:
+`== nil` narrows the other way: after `if x == nil then`, `x` is narrowed in the `else` branch
+and in the conditions and bodies of the `elseif` arms that follow. `nil` may be on either side
+of the comparison, and `not` swaps the branches, so `if not (x == nil) then` narrows the
+`then` branch. A local initialized to `nil` is narrowed the same way before its value is used:
 
 ```lua
 ---@param items { name: string, score: number }[]
 function best_name(items)
   local best = nil                 -- best : { name: string, score: number }?
   for _, it in ipairs(items) do
-    if best ~= nil then
-      if it.score > best.score then best = it end
-    else
+    if best == nil then
+      best = it
+    elseif it.score > best.score then   -- best narrowed here
       best = it
     end
   end
@@ -460,6 +463,12 @@ function best_name(items)
   return "none"
 end
 ```
+
+A narrowing lasts to the end of its branch, or until the place, or a record it is a field of,
+is assigned. After the whole `if`, a place an enclosing guard narrowed stays narrowed only if
+no branch assigned it. Narrowing is syntactic: a condition narrows only when it is one of the
+comparisons above, not an operand of `and`/`or`, and an early `return` narrows nothing after
+it.
 
 `or` gives an optional a default without narrowing it: `p.name or "unknown"` is a `string`
 (§3.5).
@@ -816,7 +825,7 @@ both read/write persistent memory.
   is a compile error.
 - **A local initialized to `nil` is optional** (§5.2): `local x = nil` is `T?`, with `T`
   inferred from what is later assigned to it, rather than `nil`, which no other value fits.
-  It is narrowed with `~= nil` like any optional. An uninitialized `local x` is the same, since
+  It is narrowed with `~= nil` or `== nil` like any optional. An uninitialized `local x` is the same, since
   it holds `nil` until assigned; there is no definite-assignment analysis to exempt a local
   that every path assigns before reading.
 - **`---@` annotation type-syntax subset** is fixed (§5.6): `@param`/`@return` on top-level

@@ -513,14 +513,21 @@ differential cases (AGENTS.md §6).
   `ipairs` as a value's `E0301` — keep their Lua wording. Every rewritten message is
   byte-identical to before.
 - **C7 — dropped.** See the locked decisions: the host already reads constants.
-- **C8 — narrowing on `== nil`.** Narrow `x` in the else-branch of `if x == nil`, including the
-  conditions and bodies of later `elseif` arms, and in the else-branch of a C2 conditional.
-  Today only the then-branch of `x ~= nil` narrows (`types.rs` `narrowing_from`), so Ruby's
-  usual `if x.nil? … else … end` would leave `x` optional. It helps Lua authors equally.
-- **C9 — zero-based indexing.** `ExprKind::Index` gains a flag the Lua parser never sets. When
-  it is set and the base is an array, lowering and the interpreter add 1 to the index before the
-  element read or write; a map or record key is used as written. No IR op, runtime, or backend
-  change.
+- **C8 — narrowing on `== nil`.** ✅ Done, for `if` statements; the else-branch of a C2
+  conditional comes with C2. `x == nil` narrows `x` in the else-branch and in the conditions
+  and bodies of later `elseif` arms; `nil` may be on either side, and `not` and parentheses are
+  seen through (`types.rs` `narrowing_from`). Each arm starts from what was narrowed before the
+  `if` plus what the earlier conditions being false imply, and after the `if` a place stays
+  narrowed only if no branch assigned it. Two holes in the existing narrowing closed with it:
+  a write to a narrowed local was checked against the narrowed type (so `x = nil` was
+  rejected), and a loop kept a narrowing from outside it that a write later in its body undoes
+  on the next pass (every backend then failed at run time); a loop now ends the narrowing of
+  every place its body assigns. SPEC.md §5.3 records the rules.
+- **C9 — zero-based indexing.** ✅ Done. `ExprKind::Index::zero_based`, which the Lua parser
+  never sets. When it is set and the base is an array, lowering (`idx + 1`, the IR a Lua
+  `a[i + 1]` gives) and the interpreter add 1 before the element read or write; a map or record
+  key is used as written. No IR op, runtime, or backend change. `tests/core_changes.rs` holds
+  both changes to all three oracles, C9 through Lua marked zero-based.
 
 #### Steps
 

@@ -47,15 +47,16 @@
 //!   that types it) stands for a fresh variable and is checked once every body has been, so the
 //!   outcome doesn't depend on the order of the code. One whose value never gets a type is
 //!   `E0410`.
-//! * **Flow narrowing**: inside `if <place> ~= nil then`, a `T?` place reads as `T`, where the
-//!   place is a local, an upvalue, a memory root, or a field path over one (§5.3). A write to
-//!   the place or a prefix of it ends the narrowing. Each narrowed read is recorded in
+//! * **Flow narrowing**: inside `if <place> ~= nil then`, and in the `else` branch and later
+//!   `elseif` arms of `if <place> == nil then`, a `T?` place reads as `T`, where the place is a
+//!   local, an upvalue, a memory root, or a field path over one (§5.3). A write to the place or
+//!   a prefix of it ends the narrowing. Each narrowed read is recorded in
 //!   [`TypeInfo::narrowed`] so lowering unwraps it.
 //!
 //! ## Deliberately deferred (documented gaps)
 //!
 //! * `---@type` annotations on locals.
-//! * Narrowing from `== nil`, an `else` branch, or an early return.
+//! * Narrowing from an early return, or from either operand of `and`/`or`.
 //! * Iterating a record with `pairs` (its fields don't share a type).
 
 use std::collections::{BTreeMap, HashMap};
@@ -489,6 +490,13 @@ impl Place {
             _ => false,
         }
     }
+}
+
+/// The refinements an `if` condition implies: one for where it holds, one for where it
+/// doesn't (`Checker::narrowing_from`).
+struct Narrowing {
+    then: Option<(Place, Type)>,
+    els: Option<(Place, Type)>,
 }
 
 struct Checker<'a> {
@@ -1126,6 +1134,7 @@ impl<'a> Checker<'a> {
             }
             StatKind::Do(block) => self.check_block(block),
             StatKind::While { cond, body } => {
+                self.forget_loop_writes(body);
                 self.check_condition(cond);
                 self.check_block(body);
             }
@@ -1145,6 +1154,7 @@ impl<'a> Checker<'a> {
                 if let Some(id) = self.res.def(var.span) {
                     self.sym_types[id as usize] = Type::Number;
                 }
+                self.forget_loop_writes(body);
                 self.check_block(body);
             }
             StatKind::GenericFor { names, iter, body } => self.check_generic_for(names, iter, body),
@@ -1238,24 +1248,75 @@ impl<'a> Checker<'a> {
         // (matching the trust model; scripts are trusted dev code).
         for target in targets {
             if let Some(place) = self.place_of(target) {
-                self.narrowed
-                    .retain(|k, _| *k != place && !k.has_ancestor(&place));
+                self.end_narrowing(&place);
+            }
+        }
+    }
+
+    /// Drop the narrowing of `place` and of every field path under it.
+    fn end_narrowing(&mut self, place: &Place) {
+        self.narrowed
+            .retain(|k, _| k != place && !k.has_ancestor(place));
+    }
+
+    /// Before a loop's condition and body: end the narrowing of every place the body assigns.
+    /// A write late in one iteration runs before the next iteration reads, which the guard
+    /// outside the loop can't account for.
+    fn forget_loop_writes(&mut self, body: &Block) {
+        let mut places = Vec::new();
+        self.assigned_places(body, &mut places);
+        for place in &places {
+            self.end_narrowing(place);
+        }
+    }
+
+    /// Every place `block` assigns, in it or in a block nested in it (not in a function
+    /// literal, which is a closure writing an upvalue; see `check_assign`).
+    fn assigned_places(&self, block: &Block, out: &mut Vec<Place>) {
+        for stat in &block.stats {
+            match &stat.kind {
+                StatKind::Assign { targets, .. } => {
+                    out.extend(targets.iter().filter_map(|t| self.place_of(t)))
+                }
+                StatKind::Do(body)
+                | StatKind::While { body, .. }
+                | StatKind::NumericFor { body, .. }
+                | StatKind::GenericFor { body, .. } => self.assigned_places(body, out),
+                StatKind::If { arms, else_block } => {
+                    for (_, body) in arms {
+                        self.assigned_places(body, out);
+                    }
+                    if let Some(body) = else_block {
+                        self.assigned_places(body, out);
+                    }
+                }
+                _ => {}
             }
         }
     }
 
     fn check_if(&mut self, arms: &[(Expr, Block)], else_block: &Option<Block>) {
+        // What is narrowed on entering each arm: what was before the `if`, plus what each
+        // earlier condition being false implies (`x == nil` false narrows `x`). Branches are
+        // separate paths, so a write in one doesn't end a narrowing in the next; but after the
+        // `if`, a place stays narrowed only if no branch wrote to it.
+        let mut entry = self.narrowed.clone();
+        let mut after = self.narrowed.clone();
         for (cond, block) in arms {
+            self.narrowed = entry.clone();
             self.check_condition(cond);
-            // Limited narrowing: `if <name> ~= nil` refines `<name>` inside the branch.
-            let narrowing = self.narrowing_from(cond);
-            let saved = self.apply_narrowing(narrowing);
+            let Narrowing { then, els } = self.narrowing_from(cond);
+            self.narrowed.extend(then);
             self.check_block(block);
-            self.restore_narrowing(saved);
+            after.retain(|place, _| self.narrowed.contains_key(place));
+            entry.extend(els);
         }
+        self.narrowed = entry;
         if let Some(block) = else_block {
             self.check_block(block);
         }
+        after.retain(|place, _| self.narrowed.contains_key(place));
+        self.narrowed = after;
     }
 
     fn check_generic_for(&mut self, names: &[Ident], iter: &IterExpr, body: &Block) {
@@ -1328,6 +1389,7 @@ impl<'a> Checker<'a> {
                 self.sym_types[id as usize] = assign.get(i).cloned().unwrap_or(Type::Error);
             }
         }
+        self.forget_loop_writes(body);
         self.check_block(body);
     }
 
@@ -1405,7 +1467,7 @@ impl<'a> Checker<'a> {
                 Type::Function(sig)
             }
             ExprKind::Field { base, name } => self.check_field(base, name, expr.span),
-            ExprKind::Index { base, index } => self.check_index(base, index),
+            ExprKind::Index { base, index, .. } => self.check_index(base, index),
             ExprKind::Call { callee, args } => self.check_call(callee, args, expr.span),
             ExprKind::MethodCall {
                 receiver,
@@ -2255,7 +2317,14 @@ impl<'a> Checker<'a> {
     /// The type of an assignable l-value (used as the *write* target type).
     fn place_type(&mut self, target: &Expr) -> Type {
         match &target.kind {
-            ExprKind::Name(_) => self.check_name(target),
+            // A write takes the variable's declared type, not a narrowing of it: `x = nil` is
+            // fine where a guard narrowed an optional `x`, and ends that narrowing.
+            ExprKind::Name(_) => match self.res.binding(target.span) {
+                Some(Binding::Local(id) | Binding::Upvalue(id) | Binding::Module(id)) => {
+                    self.sym_types[*id as usize].clone()
+                }
+                _ => self.check_name(target),
+            },
             ExprKind::Field { base, name } => {
                 let bt = self.check_expr(base);
                 match self.u.shallow(&bt) {
@@ -2283,7 +2352,7 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            ExprKind::Index { base, index } => {
+            ExprKind::Index { base, index, .. } => {
                 let bt = self.check_expr(base);
                 match self.u.shallow(&bt) {
                     Type::Array(e) => {
@@ -2382,49 +2451,56 @@ impl<'a> Checker<'a> {
         Some(t)
     }
 
-    /// Extract a narrowing fact from an `if` condition. Supports `<place> ~= nil` (refine in
-    /// the then-branch), where `<place>` is a bare name **or** a field path (`p.name`).
-    /// Returns the place and its narrowed (non-optional) type.
-    fn narrowing_from(&self, cond: &Expr) -> Option<(Place, Type)> {
-        let ExprKind::Binary {
-            op: BinOp::Ne,
-            lhs,
-            rhs,
-        } = &cond.kind
-        else {
-            return None;
+    /// What an `if` condition says about a place: `<place> ~= nil` refines it in the
+    /// then-branch, and `<place> == nil` in the else-branch and the `elseif` arms after it,
+    /// where `<place>` is a bare name **or** a field path (`p.name`). `nil` may be on either
+    /// side, and `not` swaps the two branches. Each refinement is the place with its narrowed
+    /// (non-optional) type.
+    fn narrowing_from(&self, cond: &Expr) -> Narrowing {
+        let none = Narrowing {
+            then: None,
+            els: None,
         };
-        // Match `<place> ~= nil` or `nil ~= <place>`.
+        let (eq, lhs, rhs) = match &cond.kind {
+            ExprKind::Paren(inner) => return self.narrowing_from(inner),
+            ExprKind::Unary {
+                op: UnOp::Not,
+                operand,
+            } => {
+                let Narrowing { then, els } = self.narrowing_from(operand);
+                return Narrowing {
+                    then: els,
+                    els: then,
+                };
+            }
+            ExprKind::Binary {
+                op: op @ (BinOp::Eq | BinOp::Ne),
+                lhs,
+                rhs,
+            } => (*op == BinOp::Eq, lhs, rhs),
+            _ => return none,
+        };
         let place_expr = match (&lhs.kind, &rhs.kind) {
             (_, ExprKind::Nil) => lhs,
             (ExprKind::Nil, _) => rhs,
-            _ => return None,
+            _ => return none,
         };
-        let place = self.place_of(place_expr)?;
-        match self.u.shallow(&self.place_current_type(&place)?) {
-            Type::Optional(inner) => Some((place, *inner)),
+        let Some(place) = self.place_of(place_expr) else {
+            return none;
+        };
+        let refined = match self.place_current_type(&place).map(|t| self.u.shallow(&t)) {
+            Some(Type::Optional(inner)) => Some((place, *inner)),
             _ => None,
-        }
-    }
-
-    fn apply_narrowing(
-        &mut self,
-        narrowing: Option<(Place, Type)>,
-    ) -> Option<(Place, Option<Type>)> {
-        let (place, t) = narrowing?;
-        let prev = self.narrowed.insert(place.clone(), t);
-        Some((place, prev))
-    }
-
-    fn restore_narrowing(&mut self, saved: Option<(Place, Option<Type>)>) {
-        if let Some((place, prev)) = saved {
-            match prev {
-                Some(t) => {
-                    self.narrowed.insert(place, t);
-                }
-                None => {
-                    self.narrowed.remove(&place);
-                }
+        };
+        if eq {
+            Narrowing {
+                then: None,
+                els: refined,
+            }
+        } else {
+            Narrowing {
+                then: refined,
+                els: None,
             }
         }
     }
@@ -2938,6 +3014,200 @@ mod tests {
                 &empty(),
             ),
             "E0413",
+        );
+    }
+
+    #[test]
+    fn eq_nil_narrows_the_else_branch_and_later_arms() {
+        // `SPEC.md` §5.3: where `x == nil` is false, `x` reads as `number`, in the `else`
+        // branch and in the conditions and bodies of later `elseif` arms.
+        let info = ok(
+            "function f(s, c)\n\
+               local x = tonumber(s)\n\
+               if x == nil then\n\
+                 return 0\n\
+               elseif x > 10 then\n\
+                 return x - 10\n\
+               elseif c then\n\
+                 return x * 2\n\
+               else\n\
+                 return x\n\
+               end\n\
+             end",
+            &empty(),
+        );
+        assert_eq!(info.exports["f"].to_string(), "fn(string, bool) -> number");
+        // `nil` on the left, `not`, and parentheses read the same way.
+        for cond in [
+            "nil == x",
+            "(x == nil)",
+            "not (x ~= nil)",
+            "not not (x == nil)",
+        ] {
+            ok(
+                &format!(
+                    "function f(s)\n\
+                       local x = tonumber(s)\n\
+                       if {cond} then return 0 else return x end\n\
+                     end"
+                ),
+                &empty(),
+            );
+        }
+    }
+
+    #[test]
+    fn eq_nil_does_not_narrow_the_then_branch() {
+        assert_eq!(
+            err_code(
+                "function f(s)\n\
+                   local x = tonumber(s)\n\
+                   if x == nil then return x + 1 end\n\
+                   return 0\n\
+                 end",
+                &empty(),
+            ),
+            "E0401",
+        );
+    }
+
+    #[test]
+    fn a_write_in_one_branch_leaves_the_next_narrowed() {
+        // Branches are separate paths: `x = nil` in the first `elseif` body doesn't reach the
+        // second, which only runs when `x == nil` was false.
+        ok(
+            "function f(s, c)\n\
+               local x = tonumber(s)\n\
+               if x == nil then\n\
+                 return 0\n\
+               elseif c then\n\
+                 x = nil\n\
+                 return 1\n\
+               else\n\
+                 return x\n\
+               end\n\
+             end",
+            &empty(),
+        );
+    }
+
+    #[test]
+    fn a_write_in_any_branch_ends_an_outer_narrowing() {
+        // After an inner `if`, `x` is narrowed only if no branch of it wrote `x`, whichever
+        // branch wrote it.
+        for body in [
+            "if c then x = nil end",
+            "if c then else x = nil end",
+            "if c then elseif not c then x = nil end",
+        ] {
+            assert_eq!(
+                err_code(
+                    &format!(
+                        "function f(s, c)\n\
+                           local x = tonumber(s)\n\
+                           if x ~= nil then\n\
+                             {body}\n\
+                             return x + 1\n\
+                           end\n\
+                           return 0\n\
+                         end"
+                    ),
+                    &empty(),
+                ),
+                "E0401",
+                "{body}",
+            );
+        }
+        // And one no branch writes stays narrowed.
+        ok(
+            "function f(s, c)\n\
+               local x = tonumber(s)\n\
+               if x ~= nil then\n\
+                 if c then local y = 1 else local z = 2 end\n\
+                 return x + 1\n\
+               end\n\
+               return 0\n\
+             end",
+            &empty(),
+        );
+    }
+
+    #[test]
+    fn a_write_later_in_a_loop_ends_a_narrowing_from_outside_it() {
+        // The write runs before the next iteration's read, so no read in the loop, nor its
+        // condition, sees `x` narrowed.
+        for (lp, code) in [
+            ("while i < 2 do", "E0401"),
+            ("for j = 1, 2 do", "E0401"),
+            ("for _, v in ipairs({ 1, 2 }) do", "E0401"),
+            // The condition too: an ordering comparison of an optional.
+            ("while i < x do", "E0453"),
+        ] {
+            assert_eq!(
+                err_code(
+                    &format!(
+                        "function f(s)\n\
+                           local x = tonumber(s)\n\
+                           local n, i = 0, 0\n\
+                           if x ~= nil then\n\
+                             {lp}\n\
+                               n = n + x\n\
+                               if n > 5 then x = nil end\n\
+                               i = i + 1\n\
+                             end\n\
+                           end\n\
+                           return n\n\
+                         end"
+                    ),
+                    &empty(),
+                ),
+                code,
+                "{lp}",
+            );
+        }
+        // A loop that doesn't write `x` keeps it narrowed.
+        ok(
+            "function f(s)\n\
+               local x = tonumber(s)\n\
+               local n = 0\n\
+               if x ~= nil then\n\
+                 for j = 1, 2 do n = n + x end\n\
+               end\n\
+               return n\n\
+             end",
+            &empty(),
+        );
+    }
+
+    #[test]
+    fn a_narrowed_local_can_be_set_to_nil() {
+        // A write is checked against the declared `number?`, not the narrowed `number`.
+        ok(
+            "function f(s)\n\
+               local x = tonumber(s)\n\
+               if x ~= nil then\n\
+                 local y = x + 1\n\
+                 x = nil\n\
+                 return y\n\
+               end\n\
+               return 0\n\
+             end",
+            &empty(),
+        );
+    }
+
+    #[test]
+    fn eq_nil_narrowing_ends_with_the_if() {
+        assert_eq!(
+            err_code(
+                "function f(s)\n\
+                   local x = tonumber(s)\n\
+                   if x == nil then local y = 1 else local z = 2 end\n\
+                   return x + 1\n\
+                 end",
+                &empty(),
+            ),
+            "E0401",
         );
     }
 
