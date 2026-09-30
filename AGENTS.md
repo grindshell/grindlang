@@ -152,7 +152,10 @@ the `codegen` and `runtime` module rustdoc for the ABI contract.
   array indexing) likewise live once in `runtime::ops`; a backend calls them rather than
   re-implementing them (the JIT's native arithmetic must match `ops::arith`).
 - **Declare shims once.** A new `rt_*` shim gets one entry in `codegen::rt`'s `shim_table!`,
-  written as its Rust signature; the cranelift declaration is derived from it.
+  written as its Rust signature; the cranelift declaration is derived from it. Define the shim
+  itself inside `define_shims!`, which stops a panic at the shim (one that crosses the
+  `extern "C"` boundary ends the process), and guard every call to it in `translate`: any shim
+  can fail by panicking.
 - **Isolate cranelift.** All cranelift API usage stays in `src/codegen/` behind `jit`, so the
   rest of the crate is insulated from cranelift churn. Pin cranelift versions.
 - **Respect the feature gating** (see §3). Shared-runtime items → `any(interp, jit)`;

@@ -14,6 +14,11 @@
 //!
 //! Per-function translation lives in [`translate`]; the runtime context and `extern "C"`
 //! shims in [`rt`].
+//!
+//! A host function or memory method that panics panics the call, as it does in the
+//! interpreters: the shim that called it catches the panic, the compiled code exits as it would
+//! on an error, and [`JitModule::call`] resumes the panic (the `rt` module docs have the
+//! details).
 
 mod rt;
 mod translate;
@@ -382,8 +387,7 @@ impl JitModule {
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RunError> {
         let mut ctx = self.take_ctx();
         let result = self.dispatch(&mut ctx, name, args);
-        self.store_ctx(ctx);
-        result
+        self.finish(ctx, result)
     }
 
     /// Resolve `name`'s trampoline + ABI signature and invoke it against `ctx`. Split out so
@@ -538,8 +542,7 @@ impl JitModule {
         };
         let mut ctx = self.take_ctx();
         let result = self.dispatch_value(&mut ctx, &code, callee, args);
-        self.store_ctx(ctx);
-        result
+        self.finish(ctx, result)
     }
 
     /// Resolve a lifted closure's env-trampoline + ABI signature and invoke it against `ctx`,
@@ -627,7 +630,7 @@ impl JitModule {
 
     /// Obtain a ready-to-use context for one invocation: reuse the pooled one (rebuilding its
     /// host/memory bindings only if they changed since last call), or build a fresh one. The
-    /// caller must return it via [`Self::store_ctx`] after the call so the next call can reuse
+    /// caller must return it via [`Self::finish`] after the call so the next call can reuse
     /// it. Taking it out means a reentrant call gets its own fresh context.
     fn take_ctx(&mut self) -> RtCtx {
         let mut ctx = match self.cached_ctx.take() {
@@ -648,9 +651,21 @@ impl JitModule {
         ctx
     }
 
-    /// Return a context to the pool for reuse by the next call.
-    fn store_ctx(&mut self, ctx: RtCtx) {
+    /// End an invocation: return its context to the pool for the next call, then hand back the
+    /// call's `result` — or, if a shim caught a panic, resume it. The compiled code has returned
+    /// by now, so the panic unwinds through Rust frames only, out to the host (see [`rt`]'s
+    /// module docs); the error latched to stop the compiled code goes with it.
+    fn finish(
+        &mut self,
+        mut ctx: RtCtx,
+        result: Result<Value, RunError>,
+    ) -> Result<Value, RunError> {
+        let panic = ctx.take_panic();
         self.cached_ctx = Some(ctx);
+        if let Some(payload) = panic {
+            std::panic::resume_unwind(payload);
+        }
+        result
     }
 }
 

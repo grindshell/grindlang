@@ -21,12 +21,17 @@
 //! How a failure is signalled depends on what the callee can carry:
 //!
 //! - a shim returning a handle → the [`ERR`](super::rt::ERR) sentinel;
-//! - a shim returning a scalar word → the `errored` byte, since a NaN can carry any bit
-//!   pattern, `ERR`'s included;
+//! - a shim returning a scalar word, or nothing → the `errored` byte, since a NaN can carry any
+//!   bit pattern, `ERR`'s included;
 //! - a NaN comparison → detected natively, raised on the failing edge only;
 //! - `rt_closure_code_addr` → address `0` (jumping there would fault);
 //! - a script / const / indirect call → nothing, so the caller loads the context's `errored`
 //!   byte directly (see [`ERRORED_OFFSET`](super::rt::ERRORED_OFFSET)).
+//!
+//! Every shim call is guarded, even one whose op can't fail, because any shim can panic: the
+//! panic stops at the shim and comes back as a failure (see [`super::rt`]'s module docs). The
+//! only unguarded calls are to `rt_pow`, which has no context to report through and nothing that
+//! can panic, and to the `rt_raise_*` shims, which lead straight to the error-exit.
 //!
 //! ## Call depth
 //!
@@ -340,10 +345,20 @@ impl<'a, 'b> Translator<'a, 'b> {
         r
     }
 
+    /// Call a shim without guarding it. Every caller guards the call itself, by whichever means
+    /// the shim's result allows (see the module docs).
     fn call_shim(&mut self, name: &'static str, args: &[ClifValue]) -> Option<ClifValue> {
         let r = self.shim_ref(name);
         let call = self.builder.ins().call(r, args);
         self.builder.inst_results(call).first().copied()
+    }
+
+    /// Call a shim whose result, if any, can't carry the [`ERR`] sentinel, then guard on the
+    /// errored flag.
+    fn call_checked_shim(&mut self, name: &'static str, args: &[ClifValue]) -> Option<ClifValue> {
+        let result = self.call_shim(name, args);
+        self.guard_errored();
+        result
     }
 
     /// Divert to the function's error-exit when `failed` (an `i8` flag) is nonzero, and
@@ -445,14 +460,8 @@ impl<'a, 'b> Translator<'a, 'b> {
     /// A scalar result has no spare bit pattern for a sentinel, so it is guarded on the errored
     /// flag — which also catches a value whose runtime shape contradicts its static scalar type
     /// (an off-schema memory binding, a host function returning the wrong shape). A handle
-    /// result from a `fallible` shim is guarded on [`ERR`].
-    fn call_read_shim(
-        &mut self,
-        name: &'static str,
-        args: &[ClifValue],
-        repr: Repr,
-        fallible: bool,
-    ) -> ClifValue {
+    /// result is guarded on [`ERR`].
+    fn call_read_shim(&mut self, name: &'static str, args: &[ClifValue], repr: Repr) -> ClifValue {
         let mut call_args = args.to_vec();
         call_args.push(self.iconst32(repr_tag(repr)));
         let word = self
@@ -464,10 +473,8 @@ impl<'a, 'b> Translator<'a, 'b> {
                 decode_word(&mut self.builder, repr, word).expect("a scalar repr has a value")
             }
             Repr::Ptr | Repr::Unit => {
-                if fallible {
-                    let failed = self.builder.ins().icmp_imm(IntCC::Equal, word, ERR as i64);
-                    self.guard(failed);
-                }
+                let failed = self.builder.ins().icmp_imm(IntCC::Equal, word, ERR as i64);
+                self.guard(failed);
                 word
             }
         }
@@ -481,20 +488,12 @@ impl<'a, 'b> Translator<'a, 'b> {
     /// and returns a default, so guard before the default can be used.
     fn unbox_handle(&mut self, handle: ClifValue, repr: Repr) -> ClifValue {
         match repr {
-            Repr::Number => {
-                let v = self
-                    .call_shim("rt_unbox_number", &[self.ctx_val, handle])
-                    .unwrap();
-                self.guard_errored();
-                v
-            }
-            Repr::Bool => {
-                let v = self
-                    .call_shim("rt_unbox_bool", &[self.ctx_val, handle])
-                    .unwrap();
-                self.guard_errored();
-                v
-            }
+            Repr::Number => self
+                .call_checked_shim("rt_unbox_number", &[self.ctx_val, handle])
+                .unwrap(),
+            Repr::Bool => self
+                .call_checked_shim("rt_unbox_bool", &[self.ctx_val, handle])
+                .unwrap(),
             Repr::Ptr => handle,
             Repr::Unit => self.builder.ins().iconst(types::I64, 0),
         }
@@ -509,10 +508,10 @@ impl<'a, 'b> Translator<'a, 'b> {
             return val;
         }
         match (from, to) {
-            (Repr::Number, Repr::Ptr) => self
-                .call_shim("rt_box_number", &[self.ctx_val, val])
-                .unwrap(),
-            (Repr::Bool, Repr::Ptr) => self.call_shim("rt_box_bool", &[self.ctx_val, val]).unwrap(),
+            (Repr::Number, Repr::Ptr) => {
+                self.call_fallible_shim("rt_box_number", &[self.ctx_val, val])
+            }
+            (Repr::Bool, Repr::Ptr) => self.call_fallible_shim("rt_box_bool", &[self.ctx_val, val]),
             (Repr::Ptr, Repr::Number) => self.unbox_handle(val, Repr::Number),
             (Repr::Ptr, Repr::Bool) => self.unbox_handle(val, Repr::Bool),
             // Unit or scalar↔scalar (shouldn't arise post-typecheck): pass through.
@@ -581,7 +580,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             Op::ConstString(s) => {
                 let idx = self.pools.intern_string(s);
                 let i = self.iconst32(idx);
-                self.call_shim("rt_const_string", &[self.ctx_val, i])
+                Some(self.call_fallible_shim("rt_const_string", &[self.ctx_val, i]))
             }
             Op::LocalGet(id) => {
                 let var = *self.vars.get(id).expect("get of undeclared local");
@@ -616,13 +615,13 @@ impl<'a, 'b> Translator<'a, 'b> {
                 let t = self.val(*tup);
                 let i = self.iconst32(*idx);
                 let repr = self.dest_repr(dest);
-                Some(self.call_read_shim("rt_tuple_get", &[self.ctx_val, t, i], repr, false))
+                Some(self.call_read_shim("rt_tuple_get", &[self.ctx_val, t, i], repr))
             }
             Op::ArrayGet(base, idx) => {
                 let b = self.val(*base);
                 let i = self.val(*idx);
                 let repr = self.dest_repr(dest);
-                Some(self.call_read_shim("rt_array_get", &[self.ctx_val, b, i], repr, false))
+                Some(self.call_read_shim("rt_array_get", &[self.ctx_val, b, i], repr))
             }
             Op::ArraySet(base, idx, v) => {
                 let b = self.val(*base);
@@ -635,7 +634,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 let b = self.val(*base);
                 let k = self.val(*key);
                 let repr = self.dest_repr(dest);
-                Some(self.call_read_shim("rt_map_get", &[self.ctx_val, b, k], repr, false))
+                Some(self.call_read_shim("rt_map_get", &[self.ctx_val, b, k], repr))
             }
             Op::MapSet(base, key, v) => {
                 let b = self.val(*base);
@@ -649,7 +648,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 let idx = self.pools.intern_name(name);
                 let i = self.iconst32(idx);
                 let repr = self.dest_repr(dest);
-                Some(self.call_read_shim("rt_field_get", &[self.ctx_val, b, i], repr, false))
+                Some(self.call_read_shim("rt_field_get", &[self.ctx_val, b, i], repr))
             }
             Op::FieldSet(base, name, v) => {
                 let b = self.val(*base);
@@ -661,7 +660,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             }
             Op::MapKeys(base) => {
                 let b = self.val(*base);
-                self.call_shim("rt_map_keys", &[self.ctx_val, b])
+                Some(self.call_fallible_shim("rt_map_keys", &[self.ctx_val, b]))
             }
             Op::CallScript(name, args) => self.translate_call_script(name, args),
             Op::CallHost(name, args) => {
@@ -685,34 +684,34 @@ impl<'a, 'b> Translator<'a, 'b> {
                 let idx = self.pools.intern_memory(name);
                 let i = self.iconst32(idx);
                 let repr = self.dest_repr(dest);
-                Some(self.call_read_shim("rt_memory_ref", &[self.ctx_val, i], repr, true))
+                Some(self.call_read_shim("rt_memory_ref", &[self.ctx_val, i], repr))
             }
             Op::NamespaceField(ns, field) => {
                 let idx = self.pools.intern_namespace_field(ns, field);
                 let i = self.iconst32(idx);
                 let repr = self.dest_repr(dest);
-                Some(self.call_read_shim("rt_namespace_field", &[self.ctx_val, i], repr, true))
+                Some(self.call_read_shim("rt_namespace_field", &[self.ctx_val, i], repr))
             }
             Op::MakeCell(v) => {
                 let [word, tag] = self.operand_args(*v);
-                self.call_shim("rt_cell_new", &[self.ctx_val, word, tag])
+                Some(self.call_fallible_shim("rt_cell_new", &[self.ctx_val, word, tag]))
             }
             Op::CellGet(cell) => {
                 let c = self.val(*cell);
                 let repr = self.dest_repr(dest);
-                Some(self.call_read_shim("rt_cell_get", &[self.ctx_val, c], repr, false))
+                Some(self.call_read_shim("rt_cell_get", &[self.ctx_val, c], repr))
             }
             Op::CellSet(cell, v) => {
                 let c = self.val(*cell);
                 let [word, tag] = self.operand_args(*v);
-                self.call_shim("rt_cell_set", &[self.ctx_val, c, word, tag]);
+                self.call_checked_shim("rt_cell_set", &[self.ctx_val, c, word, tag]);
                 None
             }
             Op::ClosureEnvGet(clo, i) => {
                 let c = self.val(*clo);
                 let idx = self.iconst32(*i);
                 // The result is a cell handle (a `Ptr`); never unbox it.
-                self.call_shim("rt_closure_env_get", &[self.ctx_val, c, idx])
+                Some(self.call_fallible_shim("rt_closure_env_get", &[self.ctx_val, c, idx]))
             }
             Op::MakeClosure(name, cells) => Some(self.translate_make_closure(name, cells)),
             Op::CallValue(callee, args) => self.translate_call_value(*callee, args),
@@ -724,8 +723,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         let idc = self.iconst32(id);
         let handles: Vec<ClifValue> = cells.iter().map(|&c| self.val(c)).collect();
         let (base, argc) = self.arg_array(&handles);
-        self.call_shim("rt_closure_new", &[self.ctx_val, idc, base, argc])
-            .unwrap()
+        self.call_fallible_shim("rt_closure_new", &[self.ctx_val, idc, base, argc])
     }
 
     /// Call a closure value indirectly: resolve its lifted function's native address, then
@@ -767,7 +765,9 @@ impl<'a, 'b> Translator<'a, 'b> {
         match op {
             UnOp::Neg => self.builder.ins().fneg(operand),
             UnOp::Not => self.builder.ins().icmp_imm(IntCC::Equal, operand, 0),
-            UnOp::Len => self.call_shim("rt_len", &[self.ctx_val, operand]).unwrap(),
+            UnOp::Len => self
+                .call_checked_shim("rt_len", &[self.ctx_val, operand])
+                .unwrap(),
         }
     }
 
@@ -801,7 +801,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             Concat => {
                 let a = self.val(l);
                 let b = self.val(r);
-                self.call_shim("rt_concat", &[self.ctx_val, a, b]).unwrap()
+                self.call_fallible_shim("rt_concat", &[self.ctx_val, a, b])
             }
             Lt | Le | Gt | Ge => self.translate_compare(op, l, r),
             Eq | Ne => self.translate_equality(op, l, r),
@@ -831,7 +831,9 @@ impl<'a, 'b> Translator<'a, 'b> {
             result
         } else {
             // String ordering via the runtime: rt_str_cmp -> {-1,0,1}.
-            let ord = self.call_shim("rt_str_cmp", &[self.ctx_val, a, b]).unwrap();
+            let ord = self
+                .call_checked_shim("rt_str_cmp", &[self.ctx_val, a, b])
+                .unwrap();
             let cc = match op {
                 BinOp::Lt => IntCC::SignedLessThan,
                 BinOp::Le => IntCC::SignedLessThanOrEqual,
@@ -850,7 +852,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             Repr::Number => self.builder.ins().fcmp(FloatCC::Equal, a, b),
             Repr::Bool => self.builder.ins().icmp(IntCC::Equal, a, b),
             _ => self
-                .call_shim("rt_value_eq", &[self.ctx_val, a, b])
+                .call_checked_shim("rt_value_eq", &[self.ctx_val, a, b])
                 .unwrap(),
         };
         match op {
@@ -866,43 +868,40 @@ impl<'a, 'b> Translator<'a, 'b> {
             Repr::Number => self.builder.ins().iconst(types::I8, 1),
             _ => {
                 let h = self.val(v);
-                self.call_shim("rt_truthy", &[self.ctx_val, h]).unwrap()
+                self.call_checked_shim("rt_truthy", &[self.ctx_val, h])
+                    .unwrap()
             }
         }
     }
 
     fn translate_make_array(&mut self, elems: &[ValueId]) -> ClifValue {
         let cap = self.iconst32(elems.len() as u32);
-        let arr = self
-            .call_shim("rt_array_new", &[self.ctx_val, cap])
-            .unwrap();
+        let arr = self.call_fallible_shim("rt_array_new", &[self.ctx_val, cap]);
         for &e in elems {
             let [word, tag] = self.operand_args(e);
-            self.call_shim("rt_array_push", &[self.ctx_val, arr, word, tag]);
+            self.call_checked_shim("rt_array_push", &[self.ctx_val, arr, word, tag]);
         }
         arr
     }
 
     fn translate_make_tuple(&mut self, elems: &[ValueId]) -> ClifValue {
         let cap = self.iconst32(elems.len() as u32);
-        let tup = self
-            .call_shim("rt_tuple_new", &[self.ctx_val, cap])
-            .unwrap();
+        let tup = self.call_fallible_shim("rt_tuple_new", &[self.ctx_val, cap]);
         for &e in elems {
             let [word, tag] = self.operand_args(e);
-            self.call_shim("rt_tuple_push", &[self.ctx_val, tup, word, tag]);
+            self.call_checked_shim("rt_tuple_push", &[self.ctx_val, tup, word, tag]);
         }
         tup
     }
 
     fn translate_make_table(&mut self, pairs: &[(String, ValueId)]) -> ClifValue {
-        let tbl = self.call_shim("rt_table_new", &[self.ctx_val]).unwrap();
+        let tbl = self.call_fallible_shim("rt_table_new", &[self.ctx_val]);
         for (k, v) in pairs {
             let idx = self.pools.intern_name(k);
             let i = self.iconst32(idx);
             let [word, tag] = self.operand_args(*v);
             // Building the literal, not assigning through it — no immutability check needed.
-            self.call_shim("rt_field_init", &[self.ctx_val, tbl, i, word, tag]);
+            self.call_checked_shim("rt_field_init", &[self.ctx_val, tbl, i, word, tag]);
         }
         tbl
     }
@@ -940,10 +939,11 @@ impl<'a, 'b> Translator<'a, 'b> {
             let id = self.pools.intern_const(name);
             self.iconst32(id)
         };
+        // `ERR` marks a miss: `nil` is a legal constant value, so the null handle can't. That makes
+        // the sentinel no use for spotting a failure here, so the call is guarded on the flag.
         let cached = self
-            .call_shim("rt_const_cached", &[self.ctx_val, idc])
+            .call_checked_shim("rt_const_cached", &[self.ctx_val, idc])
             .unwrap();
-        // `ERR` marks a miss: `nil` is a legal constant value, so the null handle can't.
         let miss = self
             .builder
             .ins()
@@ -960,7 +960,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         let fresh = self
             .call_const_body(name)
             .expect("a reference-valued constant returns a handle");
-        self.call_shim("rt_const_store", &[self.ctx_val, idc, fresh]);
+        self.call_checked_shim("rt_const_store", &[self.ctx_val, idc, fresh]);
         self.builder.ins().jump(done, &[fresh.into()]);
 
         self.builder.switch_to_block(done);
@@ -985,7 +985,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         let id = self.pools.intern_host(name);
         let (base, argc) = self.operand_array(args);
         let idc = self.iconst32(id);
-        self.call_read_shim("rt_call_host", &[self.ctx_val, idc, base, argc], ret, true)
+        self.call_read_shim("rt_call_host", &[self.ctx_val, idc, base, argc], ret)
     }
 
     /// Lower a host-memory method call (`mem:method(args)`, `SPEC.md` §7). Mirrors
@@ -1004,12 +1004,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             .collect();
         let (base, argc) = self.operand_array(&operands);
         let idc = self.iconst32(id);
-        self.call_read_shim(
-            "rt_call_method",
-            &[self.ctx_val, idc, base, argc],
-            ret,
-            true,
-        )
+        self.call_read_shim("rt_call_method", &[self.ctx_val, idc, base, argc], ret)
     }
 
     fn translate_call_builtin_value(&mut self, ns: &str, args: &[ValueId], ret: Repr) -> ClifValue {
@@ -1020,7 +1015,6 @@ impl<'a, 'b> Translator<'a, 'b> {
             "rt_call_builtin_value",
             &[self.ctx_val, idc, base, argc],
             ret,
-            true,
         )
     }
 
@@ -1057,7 +1051,6 @@ impl<'a, 'b> Translator<'a, 'b> {
             "rt_call_builtin_member",
             &[self.ctx_val, idc, base, argc],
             ret,
-            true,
         )
     }
 

@@ -1667,10 +1667,19 @@ mod vm {
             self.memory.get(name).cloned()
         }
 
-        /// Call an exported function by name.
-        pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RunError> {
+        /// Start a top-level invocation: drop the previous call's memoized constants, and start
+        /// with no calls active. A call normally leaves none behind, but one a host function
+        /// panicked out of never unwound its depth count, and the host may have caught that
+        /// panic and kept using this VM.
+        fn begin_call(&mut self) {
             self.const_cache.clear();
             self.frozen.clear();
+            self.depth = 0;
+        }
+
+        /// Call an exported function by name.
+        pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RunError> {
+            self.begin_call();
             let target = self
                 .program
                 .exports
@@ -1693,8 +1702,7 @@ mod vm {
         /// Host-invoke a closure value previously returned by a call. The closure's captured
         /// cells are shared (by `Rc`), so upvalue writes persist across host calls.
         pub fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RunError> {
-            self.const_cache.clear();
-            self.frozen.clear();
+            self.begin_call();
             let code = match &callee {
                 Value::Closure(c) => c.code.clone(),
                 other => {

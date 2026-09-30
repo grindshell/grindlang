@@ -145,6 +145,30 @@ fn runaway_recursion_is_a_call_error() {
     );
 }
 
+/// A panicking host function used to abort the whole process: the panic tried to unwind out of
+/// an `extern "C"` runtime shim, which Rust turns into an abort. It now propagates out of `call`
+/// like a panic from any other callback, and the module stays usable.
+#[test]
+fn a_panicking_host_function_panics_the_call() {
+    let mut engine = Engine::new();
+    engine.register_fn("check", |n: f64| {
+        assert!(n >= 0.0, "negative input {n}");
+        n
+    });
+    let mut m = engine
+        .compile("function f(x) return check(x) + 1 end")
+        .expect("compile");
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        m.call_typed::<_, f64>("f", (-1.0,))
+    }))
+    .expect_err("the host function's panic must reach the caller");
+    assert_eq!(
+        payload.downcast_ref::<String>().map(String::as_str),
+        Some("negative input -1")
+    );
+    assert_eq!(m.call_typed::<_, f64>("f", (2.0,)).expect("usable"), 3.0);
+}
+
 /// A bool-returning decision function.
 #[test]
 fn bool_result() {

@@ -589,6 +589,10 @@ a host function or method.
   host process instead of returning `Err`. The limit counts calls rather than bytes so that every
   backend fails at the same call. Calling a host function or method and reading a constant are
   not script calls and do not count.
+- **A host panic panics the call.** A host function or method that panics is not a runtime
+  error: the panic propagates out of the host's call unchanged, in every backend. It stops the
+  script where it happened, like an error — nothing after it runs, and effects before it
+  persist — and the module stays usable for later calls if the host catches the panic.
 
 These are the semantics every backend implements; they are what the three-oracle invariant
 (`Interpreter == Vm == JitModule`) is checked against, side effects included.

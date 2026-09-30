@@ -1287,3 +1287,258 @@ fn source_nested_to_the_limit_runs_on_the_stack_it_is_sized_for() {
         .join()
         .expect("no stack overflow");
 }
+
+// ---- A panic in host code panics the call, in every backend ---------------
+//
+// The JIT calls host functions from `extern "C"` runtime shims, and a panic can't unwind out of
+// one: a panicking host function took the whole process down, where the interpreters let the
+// panic out of `call`. The shim now catches it, the compiled code stops as it would on an error,
+// and `call` resumes the panic.
+
+/// The two ways the host enters a script, over any of the three executors.
+trait Exec {
+    fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RunError>;
+    fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RunError>;
+}
+
+impl Exec for Interpreter<'static> {
+    fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RunError> {
+        Interpreter::call(self, name, args)
+    }
+    fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RunError> {
+        self.call_value_public(callee, args)
+    }
+}
+
+impl Exec for Vm<'static> {
+    fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RunError> {
+        Vm::call(self, name, args)
+    }
+    fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RunError> {
+        Vm::call_value(self, callee, args)
+    }
+}
+
+impl Exec for JitModule {
+    fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RunError> {
+        JitModule::call(self, name, args)
+    }
+    fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RunError> {
+        JitModule::call_value(self, callee, args)
+    }
+}
+
+/// One executor for the panic tests, with its `tick` count and its `mem`.
+struct Panicky {
+    name: &'static str,
+    exec: Box<dyn Exec>,
+    ticks: Rc<RefCell<u32>>,
+    mem: Value,
+}
+
+impl Panicky {
+    fn hits(&self) -> String {
+        self.mem
+            .field("hits")
+            .map(|v| v.to_string())
+            .unwrap_or_default()
+    }
+}
+
+/// A host function that panics for a positive argument and otherwise returns it.
+fn boom(args: &[Value]) -> Result<Value, RunError> {
+    let x = args[0].as_f64().unwrap_or(0.0);
+    assert!(x <= 0.0, "boom({x})");
+    Ok(Value::Number(x))
+}
+
+/// All three executors for `src`, with `boom(number) -> number`, a counting `tick()`, and a
+/// fresh `mem = {hits = 0, items = {1, 2, 3}}`, each limited to 10 script calls at once.
+fn panicky(src: &str) -> [Panicky; 3] {
+    let mut cfg = tick_config();
+    cfg.host_functions.insert(
+        "boom".to_string(),
+        FnType {
+            params: vec![Type::Number],
+            ret: Box::new(Type::Number),
+        },
+    );
+    let mut rec = BTreeMap::new();
+    rec.insert("hits".to_string(), Type::Number);
+    rec.insert("items".to_string(), Type::Array(Box::new(Type::Number)));
+    cfg.memory.insert("mem".to_string(), Type::Record(rec));
+
+    let fresh = || {
+        let items = Value::array((1..=3).map(|n| Value::Number(f64::from(n))).collect());
+        Value::table(
+            [
+                ("hits".to_string(), Value::Number(0.0)),
+                ("items".to_string(), items),
+            ]
+            .into(),
+        )
+    };
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let (interp_n, interp_tick) = counter();
+    let (vm_n, vm_tick) = counter();
+    let (jit_n, jit_tick) = counter();
+    let mem = [fresh(), fresh(), fresh()];
+    interp.set_host_function("tick", interp_tick);
+    vm.set_host_function("tick", vm_tick);
+    jit.set_host_function("tick", jit_tick);
+    interp.set_host_function("boom", boom);
+    vm.set_host_function("boom", boom);
+    jit.set_host_function("boom", boom);
+    interp.set_memory("mem", mem[0].clone());
+    vm.set_memory("mem", mem[1].clone());
+    jit.set_memory("mem", mem[2].clone());
+    interp.set_max_call_depth(10);
+    vm.set_max_call_depth(10);
+    jit.set_max_call_depth(10);
+    [
+        Panicky {
+            name: "AST",
+            exec: Box::new(interp),
+            ticks: interp_n,
+            mem: mem[0].clone(),
+        },
+        Panicky {
+            name: "VM",
+            exec: Box::new(vm),
+            ticks: vm_n,
+            mem: mem[1].clone(),
+        },
+        Panicky {
+            name: "JIT",
+            exec: Box::new(jit),
+            ticks: jit_n,
+            mem: mem[2].clone(),
+        },
+    ]
+}
+
+/// A call's outcome, shown: the value, or the error's message.
+fn shown(r: Result<Value, RunError>) -> Result<String, String> {
+    r.map(|v| v.to_string()).map_err(|e| e.to_string())
+}
+
+/// The message of the panic `call` raised, or `None` if it returned.
+fn panic_of(call: impl FnOnce() -> Result<Value, RunError>) -> Option<String> {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)).err()?;
+    Some(
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default(),
+    )
+}
+
+/// The panic propagates out of `call` with its own payload, the statements after the host call
+/// never run, the ones before it keep their effects, and the executor still works afterwards.
+#[test]
+fn a_panicking_host_function_panics_every_backend() {
+    let src = "\
+function f(x)
+  mem.hits = mem.hits + 1
+  local y = boom(x)
+  tick()
+  mem.hits = mem.hits + 100
+  return y
+end
+";
+    for mut b in panicky(src) {
+        let name = b.name;
+        let panic = panic_of(|| b.exec.call("f", vec![Value::Number(1.0)]));
+        assert_eq!(panic.as_deref(), Some("boom(1)"), "{name}");
+        assert_eq!(*b.ticks.borrow(), 0, "{name}: ran on after the panic");
+        assert_eq!(b.hits(), "1", "{name}: memory after the panic");
+
+        let r = b.exec.call("f", vec![Value::Number(0.0)]);
+        assert_eq!(shown(r), Ok("0".to_string()), "{name}");
+        assert_eq!(
+            (*b.ticks.borrow(), b.hits()),
+            (1, "102".to_string()),
+            "{name}"
+        );
+    }
+}
+
+/// A panic deep in nested calls, and one inside a closure, unwinds every script call between it
+/// and the host. The calls it unwound no longer count against the call-depth limit, and a
+/// closure the host invokes panics the same way.
+#[test]
+fn a_panic_unwinds_nested_calls_and_closures() {
+    let src = "\
+function down(n, x)
+  if n == 0 then return boom(x) end
+  return 1 + down(n - 1, x)
+end
+function via_closure(x, label)
+  local go = function(k) return boom(k) + 1 end
+  tick()
+  local r = go(x)
+  tick()
+  return label .. tostring(r)
+end
+function make() return function(x) return boom(x) end end
+";
+    for mut b in panicky(src) {
+        let name = b.name;
+        let args = |n, x| vec![Value::Number(n), Value::Number(x)];
+        assert!(
+            panic_of(|| b.exec.call("down", args(8.0, 1.0))).is_some(),
+            "{name}"
+        );
+        // Ten calls deep: exactly the limit, so any depth the panic left behind fails it.
+        let r = b.exec.call("down", args(9.0, 0.0));
+        assert_eq!(shown(r), Ok("9".to_string()), "{name}");
+
+        let args = |x| vec![Value::Number(x), Value::string("r=")];
+        let panic = panic_of(|| b.exec.call("via_closure", args(2.0)));
+        assert_eq!(panic.as_deref(), Some("boom(2)"), "{name}");
+        assert_eq!(*b.ticks.borrow(), 1, "{name}: ran on after the panic");
+        let r = b.exec.call("via_closure", args(-1.0));
+        assert_eq!(shown(r), Ok("r=0".to_string()), "{name}");
+
+        let closure = b.exec.call("make", vec![]).expect("make");
+        let panic = panic_of(|| b.exec.call_value(closure.clone(), vec![Value::Number(3.0)]));
+        assert_eq!(panic.as_deref(), Some("boom(3)"), "{name}");
+        let r = b.exec.call_value(closure, vec![Value::Number(0.0)]);
+        assert_eq!(shown(r), Ok("0".to_string()), "{name}");
+    }
+}
+
+/// The runtime itself can panic: reading an array the host holds mutably borrowed across the
+/// call. Under the JIT that happens inside a shim — one whose op can't otherwise fail, so the
+/// generated code used not to check it — and must stop the call there, as it does elsewhere.
+#[test]
+fn a_panic_inside_the_runtime_stops_the_call() {
+    let src = "\
+function count()
+  local n = #mem.items
+  tick()
+  return n
+end
+";
+    let mut messages = Vec::new();
+    for mut b in panicky(src) {
+        let name = b.name;
+        let items = b.mem.field("items").expect("items");
+        let Value::Array(cells) = &items else {
+            panic!("items is an array")
+        };
+        let held = cells.borrow_mut();
+        let panic = panic_of(|| b.exec.call("count", vec![]));
+        drop(held);
+        messages.push(panic.unwrap_or_else(|| panic!("{name}: count() returned")));
+        assert_eq!(*b.ticks.borrow(), 0, "{name}: ran on after the panic");
+
+        let r = b.exec.call("count", vec![]);
+        assert_eq!(shown(r), Ok("3".to_string()), "{name}");
+    }
+    assert!(
+        messages.iter().all(|m| *m == messages[0]),
+        "the backends panicked differently: {messages:?}"
+    );
+}

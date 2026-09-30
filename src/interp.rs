@@ -285,9 +285,15 @@ impl<'a> Interpreter<'a> {
 
     /// Start a top-level invocation: drop the previous call's memoized constants so this one
     /// re-evaluates what it reads (`SPEC.md` §1 — only host memory survives between calls).
+    ///
+    /// Also start with no calls active. A call normally leaves none behind, but one a host
+    /// function panicked out of never unwound its depth count or environment, and the host may
+    /// have caught that panic and kept using this interpreter.
     fn begin_call(&mut self) {
         self.consts.clear();
         self.frozen.clear();
+        self.depth = 0;
+        self.env.clear();
     }
 
     /// How many arguments an export accepts, or `None` when there is no declared arity to check
