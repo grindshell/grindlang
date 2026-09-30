@@ -92,15 +92,20 @@ type Counted = (
     Box<dyn Fn(&[Value]) -> Result<Value, RunError>>,
 );
 
-/// A host function that records how many times it ran.
+/// A host function that records how many times it ran, returning `0`.
 fn counter() -> Counted {
+    counter_returning(Value::Number(0.0))
+}
+
+/// A host function that records how many times it ran, returning `ret`.
+fn counter_returning(ret: Value) -> Counted {
     let cell = Rc::new(RefCell::new(0u32));
     let c = cell.clone();
     (
         cell,
         Box::new(move |_: &[Value]| {
             *c.borrow_mut() += 1;
-            Ok(Value::Number(0.0))
+            Ok(ret.clone())
         }),
     )
 }
@@ -1328,6 +1333,46 @@ end
     assert_eq!(
         call_all(&mut all, "first_big", 5.0).unwrap().to_string(),
         "nil"
+    );
+}
+
+// ---- Returning a call to a function that returns nothing -------------------
+//
+// `return log()` where `log` returns nothing failed JIT compilation: lowering returned the call's
+// (absent) value from a function whose native signature returns none. It now makes the call and
+// returns no value — the call must still be made, once, in every backend.
+
+#[test]
+fn returning_a_valueless_host_call_calls_it_once_everywhere() {
+    let src = "function main(x) if x > 0 then return log() end end";
+    let mut cfg = TypeConfig::default();
+    cfg.host_functions.insert(
+        "log".to_string(),
+        FnType {
+            params: vec![],
+            ret: Box::new(Type::Unit),
+        },
+    );
+    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let (ast_n, ast_fn) = counter_returning(Value::Nil);
+    let (vm_n, vm_fn) = counter_returning(Value::Nil);
+    let (jit_n, jit_fn) = counter_returning(Value::Nil);
+    interp.set_host_function("log", ast_fn);
+    vm.set_host_function("log", vm_fn);
+    jit.set_host_function("log", jit_fn);
+
+    for x in [1.0, -1.0] {
+        let args = vec![Value::Number(x)];
+        let a = interp.call("main", args.clone());
+        let b = vm.call("main", args.clone());
+        let c = jit.call("main", args);
+        assert_agree("return of a value-less host call", &a, &b, &c);
+        assert_eq!(c.unwrap().to_string(), "nil");
+    }
+    assert_eq!(
+        (*ast_n.borrow(), *vm_n.borrow(), *jit_n.borrow()),
+        (1, 1, 1),
+        "`log` runs on the branch that returns it, and only there"
     );
 }
 

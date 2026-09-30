@@ -1292,6 +1292,58 @@ fn annotated_unused_param_runs() {
     );
 }
 
+// ---- returning a call to a function that returns nothing (`SPEC.md` §5.5) ----------------
+//
+// `return f()` where `f` returns nothing makes the call, then returns no value. Lowering used to
+// return the call's (absent) value, which the JIT couldn't compile: a function returning `()` has
+// no return value in its native signature.
+
+#[test]
+fn returning_a_valueless_call() {
+    let src = "function f() end\nfunction main() return f() end";
+    assert_all_return(src, "main", vec![], "nil");
+    // Parenthesized, the call is still value-less.
+    let src = "function f() end\nfunction main() return (f()) end";
+    assert_all_return(src, "main", vec![], "nil");
+}
+
+#[test]
+fn returning_a_valueless_call_on_one_branch() {
+    let src = "function f() end\nfunction h(c) if c then return f() end end";
+    for c in [true, false] {
+        assert_all_return(src, "h", vec![Value::Bool(c)], "nil");
+    }
+}
+
+#[test]
+fn a_closure_returning_a_valueless_call() {
+    let src = "function f() end\n\
+               function main() local g = function() return f() end return g() end";
+    assert_all_return(src, "main", vec![], "nil");
+    // The host invoking such a closure gets `nil` back too.
+    let src = "function f() end\nfunction make() return function() return f() end end";
+    assert_eq!(
+        agree_return_then_invoke(src, "make", vec![], vec![]),
+        "ok:nil"
+    );
+}
+
+#[test]
+fn a_returned_valueless_call_still_runs() {
+    // `return bump()` must make the call: each one is counted.
+    let src = "function main()\n\
+                 local n = 0\n\
+                 local bump = function() n = n + 1 end\n\
+                 local twice = function() bump() return bump() end\n\
+                 twice()\n\
+                 return n\n\
+               end";
+    assert_all_return(src, "main", vec![], "2");
+    // A value-less function recursing through its own `return`.
+    let src = "function countdown(n) if n > 0 then return countdown(n - 1) end end";
+    assert_all_return(src, "countdown", vec![Value::Number(3.0)], "nil");
+}
+
 // ---- multi-return / tuples (Tier A, `SPEC.md` §5.5) -------------------------
 //
 // These validate that `MakeTuple`/`TupleGet` — and a directly-returned tuple crossing the host

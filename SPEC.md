@@ -482,6 +482,9 @@ end
   may do either, and the call then returns `nil`. The check follows the structure of the code:
   an `if` returns on every path only when it has an `else` and every branch returns, a
   `while true` loop with no `break` never finishes, and any other loop may run zero times.
+- `return f()`, where `f` returns nothing (its return type is `()`), calls `f` and then returns
+  no value, as in Lua. The returning function returns nothing too; the host calling it gets
+  `nil`, as from a bare `return`.
 - A function whose return type is optional (`T?`) may `return` a `T` or `nil` on any path, as
   an assignment to a `T?` slot may. The type is optional either because `---@return T?` declares
   it (for a tuple return, per element) or because the function returns the literal `nil` on one

@@ -805,7 +805,12 @@ impl<'a> FnLowerer<'a> {
         if let Some(ret) = &block.ret {
             let v = match ret.exprs.len() {
                 0 => None,
-                1 => Some(self.lower_expr(&ret.exprs[0])?),
+                1 => {
+                    // `return f()` where `f` returns nothing makes the call, then returns no
+                    // value (`SPEC.md` §5.5): there is no value to hand back.
+                    let v = self.lower_expr(&ret.exprs[0])?;
+                    (self.values[v as usize] != Type::Unit).then_some(v)
+                }
                 _ => {
                     // A return list builds a tuple value (`SPEC.md` §5.5).
                     let elems = ret
@@ -1740,7 +1745,16 @@ fn verify_function(f: &Function) -> Result<(), LowerError> {
             }
         }
         match &block.term {
-            Terminator::Return(Some(v)) => check_value(*v)?,
+            Terminator::Return(Some(v)) => {
+                check_value(*v)?;
+                // A backend compiles a function returning `()` to return nothing at all.
+                if f.ret == Type::Unit {
+                    return Err(LowerError::Internal(format!(
+                        "function `{}` returns no value, but block {i} returns value {v}",
+                        f.name
+                    )));
+                }
+            }
             Terminator::Return(None) | Terminator::Unreachable => {}
             Terminator::Jump(b) => check_block(*b)?,
             Terminator::Branch {
@@ -2377,5 +2391,28 @@ mod tests {
             .find(|f| f.is_closure)
             .expect("a closure fn");
         assert!(lifted.is_closure);
+    }
+
+    #[test]
+    fn returning_a_valueless_call_makes_the_call_then_returns_nothing() {
+        let mut p = build(
+            "function f() end\nfunction main() return f() end",
+            &TypeConfig::default(),
+        );
+        let main = p.functions.get_mut("main").unwrap();
+        assert_eq!(main.ret, Type::Unit);
+        let entry = &mut main.blocks[main.entry as usize];
+        let call = entry
+            .instrs
+            .iter()
+            .find(|i| matches!(&i.op, Op::CallScript(n, _) if n == "f"))
+            .and_then(|i| i.dest)
+            .expect("the call to `f` is still made");
+        assert!(matches!(entry.term, Terminator::Return(None)));
+
+        // A value returned from a function returning `()` would not match its native signature,
+        // so `verify` rejects it rather than leaving it to the backend.
+        entry.term = Terminator::Return(Some(call));
+        assert!(verify(&p).is_err());
     }
 }
