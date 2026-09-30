@@ -127,6 +127,8 @@ pub struct JitModule {
     bindings_dirty: bool,
     /// The most script calls that may be active at once (`SPEC.md` §7.3).
     max_call_depth: u32,
+    /// How far a loop lets the value table grow before compacting it (see `rt::COMPACT_SLACK`).
+    compact_slack: u32,
 }
 
 impl JitModule {
@@ -352,6 +354,7 @@ impl JitModule {
             cached_ctx: None,
             bindings_dirty: false,
             max_call_depth: crate::value::DEFAULT_MAX_CALL_DEPTH,
+            compact_slack: rt::COMPACT_SLACK as u32,
         })
     }
 
@@ -360,6 +363,15 @@ impl JitModule {
     /// sized for a 1 MiB stack; raise it only when calls run on a thread with a bigger stack.
     pub fn set_max_call_depth(&mut self, depth: u32) {
         self.max_call_depth = depth;
+    }
+
+    /// Set how many values a loop may create beyond the ones it keeps before it compacts the
+    /// value table again. A loop drops what its past iterations created at its back edge, but
+    /// not on every iteration: the default, 32, amortizes each compaction over that many new
+    /// values, and so leaves up to that many dead ones alive per running loop. Zero compacts at
+    /// every back edge that follows a new value, which is mainly useful for testing.
+    pub fn set_compact_slack(&mut self, slack: u32) {
+        self.compact_slack = slack;
     }
 
     /// Register a host function callable from scripts under `name`.
@@ -670,6 +682,7 @@ impl JitModule {
         };
         self.bindings_dirty = false;
         ctx.set_max_call_depth(self.max_call_depth);
+        ctx.set_compact_slack(u64::from(self.compact_slack));
         ctx
     }
 
@@ -876,11 +889,10 @@ mod tests {
         jit.cached_ctx.as_ref().expect("pooled ctx").value_count()
     }
 
-    /// The value table lives for a whole call and is never compacted, so anything a loop body
-    /// adds to it per iteration is memory proportional to the iteration count. None of these
-    /// loops creates a value that outlives its iteration — they only move scalars across the
-    /// runtime boundary or re-read the same objects — so the table must end the same size
-    /// whether the loop ran 10 times or 1000.
+    /// None of these loops creates a value — they only move scalars across the runtime boundary
+    /// or re-read the same objects — so none should add to the value table per iteration, which
+    /// would cost a loop compactions it has no garbage to justify. The table must end the same
+    /// size whether the loop ran 10 times or 1000.
     #[test]
     fn loops_do_not_grow_the_value_table_per_iteration() {
         let bodies = [
@@ -925,6 +937,49 @@ mod tests {
             assert_eq!(
                 small, large,
                 "{label}: the value table grew with the iteration count\n{src}"
+            );
+        }
+    }
+
+    /// Loops that create a value every iteration and keep at most the latest. The interpreters
+    /// free the rest as the iteration lets go of it, and the value table has to as well, or a
+    /// loop's memory grows with its iteration count — quadratically for a string built up by
+    /// concatenation, whose every intermediate stays alive.
+    #[test]
+    fn loops_that_allocate_do_not_grow_the_value_table_either() {
+        let loops = [
+            ("concatenation", "local s = \"\"", "s = s .. \"x\"", "#s"),
+            ("fresh table", "local t = {v = 0}", "t = {v = i}", "t.v"),
+            (
+                "tables kept in an array",
+                "local xs = {}",
+                "xs[#xs + 1] = {v = i}",
+                "#xs",
+            ),
+            (
+                "closure",
+                "local s = 0",
+                "local g = function() return i end s = s + g()",
+                "s",
+            ),
+            ("script call", "local s = 0", "s = s + wrap(i).v", "s"),
+            (
+                "inner loop",
+                "local s = \"\"",
+                "for j = 1, 3 do s = s .. tostring(j) end",
+                "#s",
+            ),
+        ];
+        for (label, setup, body, result) in loops {
+            let src = format!(
+                "function wrap(i) return {{v = i + 0}} end\n\
+                 function f(n)\n  {setup}\n  for i = 1, n do\n    {body}\n  end\n  return {result}\nend"
+            );
+            let mut jit = module(&src);
+            let entries = entries_after(&mut jit, 5000.0);
+            assert!(
+                entries < 100,
+                "{label}: {entries} values left in the table after 5000 iterations\n{src}"
             );
         }
     }

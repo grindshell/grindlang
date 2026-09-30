@@ -15,9 +15,10 @@
 //!
 //! ## Operands, results, and the value table
 //!
-//! The value table lives for the whole invocation and is never compacted, so anything a loop
-//! body interns per iteration is memory proportional to the iteration count. Two rules keep
-//! ordinary loops from growing it:
+//! The value table lives for the whole invocation, and a table entry keeps its value alive, so
+//! anything a loop body interns per iteration is memory proportional to the iteration count —
+//! quadratic, for a string built up by concatenation. Two rules keep ordinary loops from
+//! interning at all:
 //!
 //! * **Scalars cross as bits.** A value going into a shim (a stored element, a call argument)
 //!   or coming out of one (a field read, a call result) is an operand word plus a [`repr_tag`]
@@ -29,6 +30,15 @@
 //!   host memory, the string pool — is interned through [`RtCtx::intern_shared`], which reuses
 //!   the handle already given to the same object this call. Freshly *created* values (a table
 //!   literal, a concatenation) still take a new entry each: they are new objects.
+//!
+//! A loop that does create values compacts the table at its back edge ([`rt_compact`]). What an
+//! iteration interned is garbage by the next one unless the next can still reach its handle, and
+//! the only way it can is through a local variable — the IR has no other way for a value to
+//! cross a back edge — or the per-call constant cache. So everything interned since the loop was
+//! entered is dropped except what those hold, which moves down to fill the gap. Compacting every
+//! iteration would cost more than it saves, so a loop lets the table grow [`COMPACT_SLACK`]
+//! entries past what it last kept before compacting again, which bounds the table's size by the
+//! loop's live values rather than its iteration count.
 //!
 //! ## Errors
 //!
@@ -246,11 +256,21 @@ pub struct RtCtx {
     /// it from [`MAX_CALL_DEPTH_OFFSET`] as the call budget it hands the function it enters,
     /// which counts down from there in a register (see `translate`'s module docs).
     max_call_depth: u32,
+    /// The value table's length, mirrored where a loop's back edge can load it (see
+    /// [`TABLE_LEN_OFFSET`]) to decide whether to compact. Kept in sync by
+    /// [`intern`](Self::intern), [`reset`](Self::reset), and [`compact`](Self::compact).
+    table_len: u64,
+    /// How far a loop lets the table grow past what it last kept before it compacts again (see
+    /// [`COMPACT_SLACK`]). Loaded from [`COMPACT_SLACK_OFFSET`] as a loop is entered.
+    compact_slack: u64,
     /// The value table; index `0` is permanently `nil`.
     values: Vec<Value>,
     /// The handle already given to each object interned by [`intern_shared`](Self::intern_shared)
     /// this call, keyed by allocation address.
     shared: HashMap<usize, Handle, BuildHasherDefault<AddrHasher>>,
+    /// [`compact`](Self::compact)'s working space, kept so a loop that compacts often doesn't
+    /// allocate each time.
+    compact_scratch: Vec<Handle>,
     pools: Rc<Pools>,
     /// Host functions resolved by id (parallel to [`Pools::host_fns`]).
     host: Vec<Option<NativeFn>>,
@@ -388,6 +408,18 @@ pub const ERRORED_OFFSET: i32 = 0;
 /// Byte offset of [`RtCtx::max_call_depth`], which the trampolines load directly.
 pub const MAX_CALL_DEPTH_OFFSET: i32 = std::mem::offset_of!(RtCtx, max_call_depth) as i32;
 
+/// Byte offset of [`RtCtx::table_len`], which a loop loads as it is entered and at its back edge.
+pub const TABLE_LEN_OFFSET: i32 = std::mem::offset_of!(RtCtx, table_len) as i32;
+
+/// Byte offset of [`RtCtx::compact_slack`], which a loop loads as it is entered.
+pub const COMPACT_SLACK_OFFSET: i32 = std::mem::offset_of!(RtCtx, compact_slack) as i32;
+
+/// How many entries a loop lets the value table grow past what it last kept before compacting it
+/// again (see the module docs). Each compaction costs a call plus work proportional to what it
+/// scans, so this amortizes that over at least this many new values; in exchange, up to this
+/// many dead values stay alive at a time per active loop.
+pub const COMPACT_SLACK: u64 = 32;
+
 impl RtCtx {
     /// Build a context for one invocation. `host`/`memory` are resolved into id order by the
     /// caller (the compiled module) from the user-registered bindings.
@@ -402,8 +434,11 @@ impl RtCtx {
         RtCtx {
             errored: 0,
             max_call_depth: DEFAULT_MAX_CALL_DEPTH,
+            table_len: 1,
+            compact_slack: COMPACT_SLACK,
             values: vec![Value::Nil],
             shared: HashMap::default(),
+            compact_scratch: Vec::new(),
             const_cache: vec![None; pools.consts.len()],
             frozen: std::collections::HashSet::new(),
             pools,
@@ -423,6 +458,7 @@ impl RtCtx {
             return NIL;
         }
         self.values.push(v);
+        self.table_len = self.values.len() as u64;
         (self.values.len() - 1) as Handle
     }
 
@@ -531,6 +567,7 @@ impl RtCtx {
     pub fn reset(&mut self) {
         self.values.clear();
         self.values.push(Value::Nil);
+        self.table_len = 1;
         self.shared.clear();
         // Constants are memoized per call: the next invocation re-evaluates what it reads, so
         // no constant (and nothing reachable from one) survives between calls.
@@ -544,6 +581,67 @@ impl RtCtx {
     /// Set how many script calls may be active at once, for calls entered from now on.
     pub fn set_max_call_depth(&mut self, depth: u32) {
         self.max_call_depth = depth;
+    }
+
+    /// Set how far a loop lets the value table grow before compacting it, for loops entered from
+    /// now on (see `COMPACT_SLACK`).
+    pub fn set_compact_slack(&mut self, slack: u64) {
+        self.compact_slack = slack;
+    }
+
+    /// Compact the part of the value table a loop has added since `mark`, the table's length
+    /// when the loop was entered (see the module docs).
+    ///
+    /// The values `live` holds survive, and so does any constant memoized since `mark`: they move
+    /// down to start at `mark`, and `live`, the constant cache, and the shared-handle index are
+    /// rewritten to match. The rest of the region is dropped. Returns the table length past which
+    /// the loop should compact again.
+    fn compact(&mut self, mark: usize, live: &mut [Handle]) -> u64 {
+        let len = self.values.len();
+        let mark = mark.min(len);
+        let in_region = |h: Handle| (mark..len).contains(&(h as usize));
+        // Where each entry of the region goes: `ERR` until placed if it survives, else `NIL`.
+        let mut dest = std::mem::take(&mut self.compact_scratch);
+        dest.clear();
+        dest.resize(len - mark, NIL);
+        for &h in live.iter().chain(self.const_cache.iter().flatten()) {
+            if in_region(h) {
+                dest[h as usize - mark] = ERR;
+            }
+        }
+
+        // Survivors move down in order. Every slot at or past `old` still holds its original
+        // value, since a swap only brings back one the loop has already passed.
+        let mut next = mark;
+        for old in mark..len {
+            let addr = identity(&self.values[old]);
+            let indexed = addr.filter(|a| self.shared.get(a) == Some(&(old as Handle)));
+            if dest[old - mark] == ERR {
+                self.values.swap(next, old);
+                dest[old - mark] = next as Handle;
+                if let Some(a) = indexed {
+                    self.shared.insert(a, next as Handle);
+                }
+                next += 1;
+            } else if let Some(a) = indexed {
+                // The object may outlive its entry, and a freed one's address can be reused, so
+                // the index must not keep pointing at the dropped handle.
+                self.shared.remove(&a);
+            }
+        }
+        let moved = |h: &mut Handle| {
+            if in_region(*h) {
+                *h = dest[*h as usize - mark];
+            }
+        };
+        live.iter_mut().for_each(moved);
+        self.const_cache.iter_mut().flatten().for_each(moved);
+        self.compact_scratch = dest;
+
+        // Last, so the context is consistent even if dropping a value panics.
+        self.table_len = next as u64;
+        self.values.truncate(next);
+        self.table_len.saturating_add(self.compact_slack)
     }
 
     /// Take the latched error, clearing the errored state. The only way out of the context, so
@@ -984,6 +1082,24 @@ define_shims! {
     }
 }
 
+// ---- loops ------------------------------------------------------------------
+
+define_shims! {
+    /// Compact the value table at a loop's back edge: see [`RtCtx::compact`] and the module docs.
+    /// `live` holds the `count` handles in the reference-typed variables live at the loop's
+    /// header, and is rewritten in place with where they moved. Returns the table length past
+    /// which the loop compacts again.
+    fn rt_compact(ctx, mark: u64, live: *mut Handle, count: u32) -> u64 {
+        let live: &mut [Handle] = if count == 0 {
+            &mut []
+        } else {
+            // SAFETY: generated code passes `count` handles at `live`, in a stack slot of its own.
+            unsafe { std::slice::from_raw_parts_mut(live, count as usize) }
+        };
+        ctx.compact(mark as usize, live)
+    }
+}
+
 // ---- calls ------------------------------------------------------------------
 
 /// Decode `argc` call arguments. Each takes two words at `argv`: the operand bits, then its tag
@@ -1195,6 +1311,7 @@ abi_types! {
     u64 => I64,
     *mut RtCtx => I64,
     *const u64 => I64,
+    *mut u64 => I64,
 }
 
 /// One runtime shim, as the JIT links and declares it.
@@ -1257,6 +1374,7 @@ shim_table! {
     rt_pow(f64, f64) -> f64;
     rt_raise_nan_compare(*mut RtCtx);
     rt_raise_call_depth(*mut RtCtx);
+    rt_compact(*mut RtCtx, u64, *mut Handle, u32) -> u64;
     rt_call_host(*mut RtCtx, u32, *const u64, u32, u32) -> u64;
     rt_call_method(*mut RtCtx, u32, *const u64, u32, u32) -> u64;
     rt_call_builtin_value(*mut RtCtx, u32, *const u64, u32, u32) -> u64;

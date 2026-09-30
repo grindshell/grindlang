@@ -14,9 +14,15 @@ use grindlang::interp::Interpreter;
 use grindlang::ir::Vm;
 use grindlang::{Type, TypeConfig, Value};
 
-/// Build all three executors for a program. Artifacts are leaked for `'static` — fine for a
-/// test harness.
-fn triple(src: &str, cfg: &TypeConfig) -> (Interpreter<'static>, Vm<'static>, JitModule) {
+/// Build all three executors for a program, plus a second JIT that compacts its value table at
+/// every loop back edge after the loop creates a value (`JitModule::set_compact_slack(0)`). The
+/// default only compacts once a loop has created dozens, which few loops in this corpus do, so
+/// the second JIT is what puts every loop here through compaction. Artifacts are leaked for
+/// `'static` — fine for a test harness.
+fn executors(
+    src: &str,
+    cfg: &TypeConfig,
+) -> (Interpreter<'static>, Vm<'static>, JitModule, JitModule) {
     let (module, res, info) = grindlang::analyze(src, cfg).expect("analyze");
     let module = Box::leak(Box::new(module));
     let res = Box::leak(Box::new(res));
@@ -29,24 +35,39 @@ fn triple(src: &str, cfg: &TypeConfig) -> (Interpreter<'static>, Vm<'static>, Ji
     let interp = Interpreter::new(module, res).expect("interp");
     let vm = Vm::new(program);
     let jit = JitModule::compile(program).expect("jit compile");
-    (interp, vm, jit)
+    let mut eager = JitModule::compile(program).expect("jit compile");
+    eager.set_compact_slack(0);
+    (interp, vm, jit, eager)
 }
 
-/// Assert AST == IR == JIT for one call (default config, no host/memory).
+/// Assert AST == IR == JIT for one call (default config, no host/memory), with the JIT compacting
+/// both lazily and eagerly.
 fn assert_same(src: &str, func: &str, args: Vec<Value>) {
     let cfg = TypeConfig::default();
-    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let (mut interp, mut vm, mut jit, mut eager) = executors(src, &cfg);
     let a = interp.call(func, args.clone());
     let b = vm.call(func, args.clone());
-    let c = jit.call(func, args);
-    match (a, b, c) {
-        (Ok(av), Ok(bv), Ok(cv)) => {
-            let (sa, sb, sc) = (format!("{av}"), format!("{bv}"), format!("{cv}"));
+    let c = jit.call(func, args.clone());
+    let d = eager.call(func, args);
+    match (a, b, c, d) {
+        (Ok(av), Ok(bv), Ok(cv), Ok(dv)) => {
+            let (sa, sb, sc, sd) = (
+                format!("{av}"),
+                format!("{bv}"),
+                format!("{cv}"),
+                format!("{dv}"),
+            );
             assert_eq!(sa, sb, "AST vs IR mismatch for `{func}` in:\n{src}");
             assert_eq!(sb, sc, "IR vs JIT mismatch for `{func}` in:\n{src}");
+            assert_eq!(
+                sc, sd,
+                "JIT vs eagerly compacting JIT for `{func}` in:\n{src}"
+            );
         }
-        (Err(_), Err(_), Err(_)) => {} // all three agree it fails
-        (a, b, c) => panic!("oracle disagreement for `{func}`: {a:?} / {b:?} / {c:?}\n{src}"),
+        (Err(_), Err(_), Err(_), Err(_)) => {} // all agree it fails
+        (a, b, c, d) => {
+            panic!("oracle disagreement for `{func}`: {a:?} / {b:?} / {c:?} / {d:?}\n{src}")
+        }
     }
 }
 
@@ -56,11 +77,12 @@ fn assert_same(src: &str, func: &str, args: Vec<Value>) {
 #[track_caller]
 fn assert_all_return(src: &str, func: &str, args: Vec<Value>, want: &str) {
     let cfg = TypeConfig::default();
-    let (mut interp, mut vm, mut jit) = triple(src, &cfg);
+    let (mut interp, mut vm, mut jit, mut eager) = executors(src, &cfg);
     for (oracle, got) in [
         ("AST", interp.call(func, args.clone())),
         ("IR", vm.call(func, args.clone())),
         ("JIT", jit.call(func, args.clone())),
+        ("eager JIT", eager.call(func, args.clone())),
     ] {
         match got {
             Ok(v) => assert_eq!(
@@ -1251,4 +1273,190 @@ fn pairs_directly_over_map_literals() {
                end";
     assert_all_return(src, "f", vec![Value::string("a")], "41");
     assert_all_return(src, "f", vec![Value::string("z")], "36");
+}
+
+// ---- Loops that create values, which the JIT compacts away at the back edge ----
+//
+// A loop drops what its past iterations interned, keeping only what its reference-typed locals
+// still hold (and constants read since it began), which move. Every case here runs 200
+// iterations, so even the default JIT compacts several times, and `assert_all_return`'s eager
+// JIT compacts at every back edge.
+
+const COMPACTING_LOOPS: &str = "\
+C = {x = 1}
+function wrap(i) return {v = i + 0} end
+function pair(i) return i + 0, tostring(i) end
+function concat(n)
+  local s = \"\"
+  for i = 1, n do s = s .. tostring(i % 10) end
+  return #s
+end
+function first_and_last(n)
+  local first = {v = 0}
+  local last = {v = 0}
+  local seen = false
+  for i = 1, n do
+    local t = {v = i}
+    if not seen then
+      first = t
+      seen = true
+    end
+    last = t
+  end
+  return first.v * 100000 + last.v
+end
+function kept_in_array(n)
+  local xs = {}
+  for i = 1, n do xs[#xs + 1] = wrap(i) end
+  local s = 0
+  for _, t in ipairs(xs) do s = s + t.v end
+  return s
+end
+function closures(n)
+  local fs = {}
+  for i = 1, n do fs[#fs + 1] = function() return i * 2 end end
+  local s = 0
+  for _, f in ipairs(fs) do s = s + f() end
+  return s
+end
+function captured(n)
+  local total = 0
+  for i = 1, n do
+    local c = 0
+    local inc = function() c = c + i end
+    inc()
+    inc()
+    total = total + c
+  end
+  return total
+end
+function constant_in_loop(n)
+  local same = 0
+  for i = 1, n do
+    local junk = {v = i}
+    local a = C
+    local b = C
+    if a == b then same = same + 1 end
+  end
+  return same + C.x
+end
+function write_constant(n)
+  for i = 1, n do
+    local junk = {v = i}
+    local c = C
+  end
+  local c = C
+  c.x = 5
+  return 0
+end
+function nested(n)
+  local s = \"\"
+  for i = 1, n do
+    local row = \"\"
+    for j = 1, 3 do row = row .. tostring(j) end
+    s = s .. row .. \",\"
+  end
+  return string.sub(s, 1, 12) .. tostring(#s)
+end
+function grow(n)
+  local s = \"\"
+  while #s < n do
+    s = s .. \"ab\"
+    if #s > 1000000 then break end
+  end
+  return s
+end
+function shared_reads(n)
+  local p = {name = \"abc\"}
+  local out = \"\"
+  for i = 1, n do
+    local nm = p.name
+    local junk = {v = i}
+    if nm == \"abc\" and i == n then out = nm .. \"!\" end
+  end
+  return out
+end
+function shared_carried(n)
+  local p = {name = \"ab\" .. \"c\"}
+  local prev = \"start\"
+  local same = 0
+  for i = 1, n do
+    local junk = {v = i}
+    local cur = p.name
+    if cur == prev then same = same + 1 end
+    prev = cur
+  end
+  return same
+end
+function tuples(n)
+  local s = \"\"
+  for i = 1, n do
+    local k, name = pair(i)
+    if k == n then s = name end
+  end
+  return s
+end
+function rec(n)
+  if n == 0 then return \"\" end
+  local s = \"\"
+  for i = 1, 3 do s = s .. rec(n - 1) .. \"x\" end
+  return s
+end
+";
+
+#[test]
+fn loops_that_create_values_agree_everywhere() {
+    let grown = "ab".repeat(100);
+    let rec = "x".repeat(120);
+    let cases = [
+        ("concat", 200.0, "200"),
+        ("first_and_last", 200.0, "100200"),
+        ("kept_in_array", 200.0, "20100"),
+        // A captured loop variable is one cell for the whole loop, so every closure sees 200.
+        ("closures", 200.0, "80000"),
+        ("captured", 200.0, "40200"),
+        ("constant_in_loop", 200.0, "201"),
+        ("nested", 200.0, "123,123,123,800"),
+        ("shared_reads", 200.0, "abc!"),
+        // `prev` carries the handle every read of `p.name` returns. The string was built, not
+        // read, before the loop, so that handle is first given out inside it, and moves.
+        ("shared_carried", 200.0, "199"),
+        ("tuples", 200.0, "200"),
+        ("grow", 200.0, &grown),
+        ("rec", 4.0, &rec),
+    ];
+    // One set of executors for every case: compiling the program per case is slow in debug.
+    let (mut interp, mut vm, mut jit, mut eager) =
+        executors(COMPACTING_LOOPS, &TypeConfig::default());
+    for (func, n, want) in cases {
+        let args = || vec![Value::Number(n)];
+        for (oracle, got) in [
+            ("AST", interp.call(func, args())),
+            ("IR", vm.call(func, args())),
+            ("JIT", jit.call(func, args())),
+            ("eager JIT", eager.call(func, args())),
+        ] {
+            let got = got.unwrap_or_else(|e| panic!("{oracle} failed on `{func}`: {e}"));
+            assert_eq!(got.to_string(), want, "{oracle} result of `{func}`");
+        }
+    }
+}
+
+/// A constant first read inside a loop stays frozen after the loop compacts: the write after it
+/// fails in every backend.
+#[test]
+fn a_constant_read_in_a_compacting_loop_stays_frozen() {
+    assert_same(
+        COMPACTING_LOOPS,
+        "write_constant",
+        vec![Value::Number(200.0)],
+    );
+    let cfg = TypeConfig::default();
+    let (_, _, mut jit, mut eager) = executors(COMPACTING_LOOPS, &cfg);
+    for jit in [&mut jit, &mut eager] {
+        let e = jit
+            .call("write_constant", vec![Value::Number(200.0)])
+            .expect_err("a constant is immutable");
+        assert!(e.to_string().contains("constant"), "got {e}");
+    }
 }

@@ -45,13 +45,28 @@
 //! path: a counter in memory costs a load and a store on entry and again on every return, and
 //! each call waits on the store its caller just made. As a parameter it costs a compare and a
 //! subtract, and a return has nothing to undo. See [`Translator::enter_frame`].
+//!
+//! ## Loops and the value table
+//!
+//! A loop that can intern values compacts the value table at its back edge (see [`super::rt`]'s
+//! module docs). On entering the loop it notes the table's length, its *mark*: everything
+//! interned from there on is the loop's to drop. At the back edge it keeps only the handles held
+//! by reference-typed locals that are live at the loop header and assigned inside the loop. The
+//! IR carries nothing else across a back edge — it has no block parameters, so a value computed
+//! in one iteration reaches the next only through a local — and a local the loop never assigns
+//! still holds a handle from before the mark. Compaction moves the survivors, so the back edge
+//! reloads those locals from where the runtime rewrote them.
+//!
+//! The back edge only calls into the runtime once the table has outgrown a limit, which the
+//! runtime sets on each compaction; the hot path is a load, a compare, and a branch. A loop made
+//! only of ops that never intern (see [`never_interns`]) skips even that.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    AbiParam, Block as ClifBlock, InstBuilder, MemFlags, Signature, StackSlotData, StackSlotKind,
-    Value as ClifValue, types,
+    AbiParam, Block as ClifBlock, InstBuilder, MemFlags, Signature, StackSlot, StackSlotData,
+    StackSlotKind, Value as ClifValue, types,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, Variable};
@@ -156,6 +171,21 @@ pub struct Translator<'a, 'b> {
     ssa: Vec<Option<ClifValue>>,
     /// Per-function cache of imported shim func refs.
     shim_refs: HashMap<&'static str, cranelift_codegen::ir::FuncRef>,
+    /// The loops that compact the value table, by header block index (see the module docs).
+    loops: HashMap<usize, LoopPlan>,
+}
+
+/// How one loop keeps the value table from growing with its iteration count (see the module docs).
+struct LoopPlan {
+    /// The blocks whose jump to the header is a back edge. Any other jump to it enters the loop.
+    back_edges: HashSet<usize>,
+    /// Two words: the table's length when the loop was last entered (its mark), then the length
+    /// past which the next back edge compacts. In the frame rather than in variables, so the
+    /// loop's hot path keeps no extra values alive across its iterations — or across its calls.
+    bounds: StackSlot,
+    /// The locals whose handles survive a compaction: reference-typed, live at the header, and
+    /// assigned inside the loop.
+    live: Vec<Variable>,
 }
 
 impl<'a, 'b> Translator<'a, 'b> {
@@ -181,6 +211,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             vars: HashMap::new(),
             ssa: vec![None; func.values.len()],
             shim_refs: HashMap::new(),
+            loops: HashMap::new(),
         }
     }
 
@@ -206,6 +237,19 @@ impl<'a, 'b> Translator<'a, 'b> {
                 let var = self.builder.declare_var(t);
                 self.vars.insert(*id, var);
             }
+        }
+
+        for (header, back_edges, live) in plan_loops(self.func) {
+            let plan = LoopPlan {
+                back_edges,
+                bounds: self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    16,
+                    3, // align 2^3 = 8
+                )),
+                live: live.iter().map(|id| self.vars[id]).collect(),
+            };
+            self.loops.insert(header, plan);
         }
 
         // A prologue block receives the parameters — the hidden ctx and call budget first, then
@@ -305,7 +349,18 @@ impl<'a, 'b> Translator<'a, 'b> {
             Terminator::Jump(t) => {
                 // No back-edge error check: every fallible op now diverts to the error-exit at
                 // its own call site, so control can't reach a back-edge with an error pending.
-                self.builder.ins().jump(self.blocks[*t as usize], &[]);
+                let target = *t as usize;
+                match self.loops.get(&target) {
+                    Some(plan) if plan.back_edges.contains(&idx) => {
+                        self.compact_at_back_edge(target);
+                    }
+                    entering => {
+                        if entering.is_some() {
+                            self.enter_loop(target);
+                        }
+                        self.builder.ins().jump(self.blocks[target], &[]);
+                    }
+                }
             }
             Terminator::Branch {
                 cond,
@@ -426,6 +481,61 @@ impl<'a, 'b> Translator<'a, 'b> {
         let spent = self.builder.ins().icmp_imm(IntCC::Equal, depth, 0);
         self.guard_raising(spent, "rt_raise_call_depth");
         self.builder.ins().iadd_imm(depth, -1)
+    }
+
+    /// Load a `u64` field of the context at `offset`.
+    fn load_ctx_u64(&mut self, offset: i32) -> ClifValue {
+        self.builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), self.ctx_val, offset)
+    }
+
+    /// On a jump into the loop at `header` from outside it, mark where the loop's part of the value
+    /// table starts, and how far it may grow before the first compaction.
+    fn enter_loop(&mut self, header: usize) {
+        let bounds = self.loops[&header].bounds;
+        let len = self.load_ctx_u64(super::rt::TABLE_LEN_OFFSET);
+        let slack = self.load_ctx_u64(super::rt::COMPACT_SLACK_OFFSET);
+        let limit = self.builder.ins().iadd(len, slack);
+        self.builder.ins().stack_store(len, bounds, 0);
+        self.builder.ins().stack_store(limit, bounds, 8);
+    }
+
+    /// Take the back edge to the loop at `header`, compacting the value table first once the
+    /// loop has grown it past its limit (see the module docs). Only that cold path calls into the
+    /// runtime. Ends the current block.
+    fn compact_at_back_edge(&mut self, header: usize) {
+        let plan = &self.loops[&header];
+        let (bounds, live) = (plan.bounds, plan.live.clone());
+        let header = self.blocks[header];
+        let len = self.load_ctx_u64(super::rt::TABLE_LEN_OFFSET);
+        let limit = self.builder.ins().stack_load(types::I64, bounds, 8);
+        let grown = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, len, limit);
+        let compact = self.builder.create_block();
+        self.builder.set_cold_block(compact);
+        self.builder.ins().brif(grown, compact, &[], header, &[]);
+
+        self.builder.switch_to_block(compact);
+        let mark = self.builder.ins().stack_load(types::I64, bounds, 0);
+        let handles: Vec<ClifValue> = live.iter().map(|&v| self.builder.use_var(v)).collect();
+        let (base, count) = self.arg_array(&handles);
+        let limit = self
+            .call_shim("rt_compact", &[self.ctx_val, mark, base, count])
+            .unwrap();
+        self.guard_errored();
+        // Each survivor's handle now reads back from where the runtime rewrote it.
+        for (i, &var) in live.iter().enumerate() {
+            let h = self
+                .builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), base, (i * 8) as i32);
+            self.builder.def_var(var, h);
+        }
+        self.builder.ins().stack_store(limit, bounds, 8);
+        self.builder.ins().jump(header, &[]);
     }
 
     fn script_ref(&mut self, id: FuncId) -> cranelift_codegen::ir::FuncRef {
@@ -1084,6 +1194,174 @@ impl<'a, 'b> Translator<'a, 'b> {
             None => Repr::Ptr,
         }
     }
+}
+
+/// A block's successors, by index.
+fn successors(term: &Terminator) -> Vec<usize> {
+    match term {
+        Terminator::Jump(t) => vec![*t as usize],
+        Terminator::Branch {
+            then_blk, else_blk, ..
+        } => vec![*then_blk as usize, *else_blk as usize],
+        Terminator::Return(_) | Terminator::Unreachable => Vec::new(),
+    }
+}
+
+/// The loops in `func` that compact the value table (see the module docs): each loop's header,
+/// the blocks whose jump to it is a back edge, and the locals whose handles must survive.
+///
+/// A loop is left alone if every op in it never interns, if its header is the function's entry
+/// (which the prologue enters with no mark), or if anything enters or repeats it through a
+/// branch rather than a jump, since only a jump carries the code that marks or compacts. The last
+/// two never happen with the IR's structured lowering; they are checked because a loop entered
+/// without its mark would compact values from before the loop.
+fn plan_loops(func: &Function) -> Vec<(usize, HashSet<usize>, Vec<LocalId>)> {
+    let n = func.blocks.len();
+    let succs: Vec<Vec<usize>> = func.blocks.iter().map(|b| successors(&b.term)).collect();
+    let mut preds = vec![Vec::new(); n];
+    for (b, ss) in succs.iter().enumerate() {
+        for &s in ss {
+            preds[s].push(b);
+        }
+    }
+
+    // Back edges: edges to a block still on the depth-first stack. The IR's CFG comes from
+    // structured lowering, so it is reducible, and these are exactly the edges that close loops.
+    let entry = func.entry as usize;
+    let mut back: BTreeMap<usize, HashSet<usize>> = BTreeMap::new();
+    let mut state = vec![0u8; n]; // 0 unvisited, 1 on the stack, 2 done
+    let mut stack = vec![(entry, 0usize)];
+    state[entry] = 1;
+    while let Some(&(b, i)) = stack.last() {
+        match succs[b].get(i) {
+            Some(&s) => {
+                let top = stack.len() - 1;
+                stack[top].1 += 1;
+                match state[s] {
+                    0 => {
+                        state[s] = 1;
+                        stack.push((s, 0));
+                    }
+                    1 => {
+                        back.entry(s).or_default().insert(b);
+                    }
+                    _ => {}
+                }
+            }
+            None => {
+                state[b] = 2;
+                stack.pop();
+            }
+        }
+    }
+
+    let mut live_in: Option<Vec<BTreeSet<LocalId>>> = None;
+    let mut plans = Vec::new();
+    for (header, sources) in back {
+        let jumped = |b: usize| matches!(func.blocks[b].term, Terminator::Jump(_));
+        if header == entry || !preds[header].iter().all(|&p| jumped(p)) {
+            continue;
+        }
+        // The loop's blocks: the header, plus every block that reaches a back edge without
+        // passing through the header.
+        let mut body = BTreeSet::from([header]);
+        let mut work: Vec<usize> = sources.iter().copied().collect();
+        while let Some(b) = work.pop() {
+            if body.insert(b) {
+                work.extend(preds[b].iter().copied());
+            }
+        }
+        let instrs = || body.iter().flat_map(|&b| &func.blocks[b].instrs);
+        if instrs().all(|i| never_interns(func, &i.op, i.dest)) {
+            continue;
+        }
+        let assigned: BTreeSet<LocalId> = instrs()
+            .filter_map(|i| match i.op {
+                Op::LocalSet(id, _) => Some(id),
+                _ => None,
+            })
+            .collect();
+        let live_in = live_in.get_or_insert_with(|| live_handle_locals(func, &succs));
+        let live = live_in[header].intersection(&assigned).copied().collect();
+        plans.push((header, sources, live));
+    }
+    plans
+}
+
+/// Whether the JIT's lowering of `op` never adds to the value table, so that a loop of nothing
+/// else never needs compacting.
+fn never_interns(func: &Function, op: &Op, dest: Option<ValueId>) -> bool {
+    let repr = |v: ValueId| repr_of(func.value_type(v));
+    let scalar = |r: Repr| matches!(r, Repr::Number | Repr::Bool);
+    let dest_scalar = dest.is_some_and(|d| scalar(repr(d)));
+    match op {
+        Op::ConstNil | Op::ConstBool(_) | Op::ConstNumber(_) | Op::LocalGet(_) => true,
+        Op::Unary(..) | Op::Truthy(_) => true,
+        Op::Binary(bop, ..) => *bop != BinOp::Concat,
+        // Writes pass their operand as bits; nothing is interned.
+        Op::ArraySet(..) | Op::MapSet(..) | Op::FieldSet(..) | Op::CellSet(..) => true,
+        // A scalar stored into a reference-typed local, or unwrapped into a reference, is boxed.
+        Op::LocalSet(id, v) => {
+            let into = func.locals.get(id).map_or(Repr::Ptr, repr_of);
+            !(scalar(repr(*v)) && into == Repr::Ptr)
+        }
+        Op::Unwrap(v) => !scalar(repr(*v)) || dest_scalar,
+        // A read or call whose result is a scalar returns it as bits.
+        Op::TupleGet(..)
+        | Op::ArrayGet(..)
+        | Op::MapGet(..)
+        | Op::FieldGet(..)
+        | Op::CellGet(_)
+        | Op::MemoryRef(_)
+        | Op::NamespaceField(..)
+        | Op::CallHost(..)
+        | Op::CallMethod(..)
+        | Op::CallBuiltinValue(..)
+        | Op::CallBuiltinMember(..) => dest_scalar,
+        // Script calls, constants, strings, and everything that builds a value.
+        _ => false,
+    }
+}
+
+/// The reference-typed locals live on entry to each block: read on some path from there before
+/// being assigned.
+fn live_handle_locals(func: &Function, succs: &[Vec<usize>]) -> Vec<BTreeSet<LocalId>> {
+    let is_handle = |id: &LocalId| func.locals.get(id).map(repr_of) == Some(Repr::Ptr);
+    let n = func.blocks.len();
+    // Per block: the locals it reads before assigning, and the ones it assigns.
+    let mut uses = vec![BTreeSet::new(); n];
+    let mut defs = vec![BTreeSet::new(); n];
+    for (b, block) in func.blocks.iter().enumerate() {
+        for instr in &block.instrs {
+            match instr.op {
+                Op::LocalGet(id) if is_handle(&id) && !defs[b].contains(&id) => {
+                    uses[b].insert(id);
+                }
+                Op::LocalSet(id, _) if is_handle(&id) => {
+                    defs[b].insert(id);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut live_in = uses.clone();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in (0..n).rev() {
+            let mut live: BTreeSet<LocalId> = succs[b]
+                .iter()
+                .flat_map(|&s| live_in[s].iter().copied())
+                .filter(|id| !defs[b].contains(id))
+                .collect();
+            live.extend(uses[b].iter().copied());
+            if live != live_in[b] {
+                live_in[b] = live;
+                changed = true;
+            }
+        }
+    }
+    live_in
 }
 
 /// Decode a raw 64-bit ABI word into the typed value of representation `r`. Scalars are

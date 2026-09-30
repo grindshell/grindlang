@@ -35,6 +35,9 @@ impl Lcg {
     }
 }
 
+/// All three executors. The JIT compacts its value table at every loop back edge after the loop
+/// creates a value (`JitModule::set_compact_slack(0)`), so the fuzzed loops exercise compaction
+/// rather than only the default's rare one.
 fn triple(src: &str) -> (Interpreter<'static>, Vm<'static>, JitModule) {
     let cfg = TypeConfig::default();
     let (module, res, info) = grindlang::analyze(src, &cfg).expect("analyze");
@@ -47,7 +50,8 @@ fn triple(src: &str) -> (Interpreter<'static>, Vm<'static>, JitModule) {
     grindlang::ir::verify(program).expect("verify");
     let interp = Interpreter::new(module, res).expect("interp");
     let vm = Vm::new(program);
-    let jit = JitModule::compile(program).expect("jit");
+    let mut jit = JitModule::compile(program).expect("jit");
+    jit.set_compact_slack(0);
     (interp, vm, jit)
 }
 

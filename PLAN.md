@@ -66,7 +66,12 @@ final design intent, not options — revisit only with a concrete consumer need.
 4. **Arena-per-invocation, no GC.** Strings/tables created during a call live in a bump
    arena reset wholesale when the call returns. Persistent data goes through host memory
    (Rust-owned). This fits short embedded invocations perfectly and removes the single
-   biggest implementation cost — a garbage collector — entirely.
+   biggest implementation cost — a garbage collector — entirely. One refinement: a loop drops
+   what its past iterations created at its back edge, keeping what its variables still hold.
+   Without that, a loop building a string by concatenation keeps every intermediate string
+   until the call returns, which is quadratic memory. It is still not a GC: nothing is traced,
+   because the IR carries a value across a back edge only in a local, so which values survive
+   is known from the code (see `codegen::rt`'s module docs).
 5. **No fuel budget, no sandbox.** Per the trust model, scripts are trusted dev code.
    An *opt-in* debug step counter may exist purely to help developers catch accidental
    infinite loops during authoring, but it is off by default and is not a security or
@@ -311,7 +316,9 @@ design sketched in Phase 6, for whoever picks this up:
 
 - **Allocation.** A bump arena per invocation, reset wholesale when the call returns and keeping
   its capacity, so steady-state calls stop allocating. Nothing is freed individually, so array
-  growth reallocates a larger object instead of growing in place.
+  growth reallocates a larger object instead of growing in place. Loops need the same care the
+  handle table gets today: a loop resets the arena to its entry mark at its back edge, first
+  copying down what its live locals point at, or a concatenating loop's memory is quadratic.
 - **Layouts.** Every payload cell is one 8-byte word. A `string` is a `u32` length followed by
   its UTF-8 bytes; an `array` is a `u32` length and capacity followed by its elements (element
   `i` at cell `i - 1`); a `map` is a length and capacity followed by (key handle, value) pairs
