@@ -105,7 +105,7 @@ fn visit_block_literals<F: FnMut(&FuncBody)>(block: &Block, f: &mut F) {
 
 fn visit_stat_literals<F: FnMut(&FuncBody)>(stat: &Stat, f: &mut F) {
     match &stat.kind {
-        StatKind::Empty | StatKind::Break => {}
+        StatKind::Empty | StatKind::Break | StatKind::Continue => {}
         StatKind::Local { exprs, .. } => {
             for e in exprs {
                 visit_expr_literals(e, f);
@@ -205,6 +205,11 @@ fn visit_expr_literals<F: FnMut(&FuncBody)>(expr: &Expr, f: &mut F) {
         }
         ExprKind::Unary { operand, .. } => visit_expr_literals(operand, f),
         ExprKind::Paren(inner) => visit_expr_literals(inner, f),
+        ExprKind::Cond { cond, then, els } => {
+            visit_expr_literals(cond, f);
+            visit_expr_literals(then, f);
+            visit_expr_literals(els, f);
+        }
     }
 }
 
@@ -227,7 +232,7 @@ fn collect_block_ids(res: &Resolution, block: &Block, out: &mut HashSet<SymbolId
 
 fn collect_stat_ids(res: &Resolution, stat: &Stat, out: &mut HashSet<SymbolId>) {
     match &stat.kind {
-        StatKind::Empty | StatKind::Break => {}
+        StatKind::Empty | StatKind::Break | StatKind::Continue => {}
         StatKind::Local { exprs, .. } => {
             for e in exprs {
                 collect_expr_ids(res, e, out);
@@ -338,6 +343,11 @@ fn collect_expr_ids(res: &Resolution, expr: &Expr, out: &mut HashSet<SymbolId>) 
         }
         ExprKind::Unary { operand, .. } => collect_expr_ids(res, operand, out),
         ExprKind::Paren(inner) => collect_expr_ids(res, inner, out),
+        ExprKind::Cond { cond, then, els } => {
+            collect_expr_ids(res, cond, out);
+            collect_expr_ids(res, then, out);
+            collect_expr_ids(res, els, out);
+        }
     }
 }
 

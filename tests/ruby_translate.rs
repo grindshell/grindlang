@@ -57,19 +57,30 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("X = 1, 2\n", "E0604"),
             ("def f(x)\n  x + 1\n  x\nend\n", "E0605"),
             ("def f(x)\n  return x\n  x + 1\nend\n", "E0606"),
+            (
+                "def f(xs)\n  xs.each do |x|\n    next\n    x\n  end\nend\n",
+                "E0606",
+            ),
             ("def f\n  g = ->(x) { x }\n  g(1)\nend\n", "E0607"),
             ("def f\n  h = {}\nend\n", "E0608"),
+            (
+                "def f(c)\n  1 + (if c then y = 1; y else 2 end)\nend\n",
+                "E0609",
+            ),
+            (
+                "def f\n  1 + (case g when 1 then 2 else 3 end)\nend\n",
+                "E0609",
+            ),
+            (
+                "def f(c)\n  x = if c\n    y = 1\n  else\n    2\n  end\n  x\nend\n",
+                "E0609",
+            ),
+            ("X = if true\n  y = 1\n  y\nend\n", "E0609"),
         ],
     ),
     (
         "not_yet",
-        &[
-            ("def f(xs)\n  xs.each { |x| next }\nend\n", "E0699"),
-            ("def f(c)\n  c ? 1 : 2\nend\n", "E0699"),
-            ("def f(c)\n  x = if c then 1 else 2 end\nend\n", "E0699"),
-            ("def f(c)\n  x = case c when 1 then 2 end\nend\n", "E0699"),
-            ("def f(xs)\n  ys = xs.map { |x| x * 2 }\nend\n", "E0699"),
-        ],
+        &[("def f(xs)\n  ys = xs.map { |x| x * 2 }\nend\n", "E0699")],
     ),
     (
         "checker_in_ruby",
@@ -92,8 +103,11 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
                 "E0415",
             ),
             ("return 1\n", "E0309"),
+            ("def f\n  next\nend\n", "E0311"),
             ("# @param x nope[\ndef f(x)\n  x\nend\n", "E0110"),
-            ("def f(c)\n  1 if c\nend\n", "E0480"),
+            ("def f(c)\n  x = c ? 1 : \"one\"\nend\n", "E0455"),
+            // Reaching the end returns `nil`, which a declared `number` can't hold.
+            ("# @return number\ndef f(c)\n  1 if c\nend\n", "E0480"),
         ],
     ),
 ];
@@ -132,13 +146,11 @@ fn snapshot_translation_diagnostics() {
 }
 
 #[test]
-fn the_worked_example_waits_only_on_the_ternary() {
+fn the_worked_example_translates_and_checks() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/ruby/stat_calc.rb"
     );
     let src = std::fs::read_to_string(path).expect("read stat_calc.rb");
-    let diags = diagnose(&src, false).expect_err("`?:` comes with R3");
-    let codes: Vec<_> = diags.iter().map(|d| d.code).collect();
-    assert_eq!(codes, ["E0699"], "{}", diags.render(&src));
+    diagnose(&src, false).unwrap_or_else(|d| panic!("{}", d.render(&src)));
 }

@@ -423,7 +423,7 @@ history before the commit that deleted it.
 
 A second syntax for the same language: a strict subset of Ruby's syntax aimed at game logic and
 dialog DSLs. [`SPEC-RUBY.md`](SPEC-RUBY.md) (draft) is its authoring contract; this section is
-why it is built the way it is. R0–R2 are done; the rest is not implemented yet.
+why it is built the way it is. R0–R3 are done; the rest is not implemented yet.
 
 **Approach: translate into the shared AST.** The backends only see `ir::Program`, and
 everything above the IR sees `ast::Module`. A Ruby frontend that translates into `ast::Module`
@@ -488,16 +488,30 @@ differential cases (AGENTS.md §6).
 
 - **C1 — `return f()` of a call that returns nothing.** ✅ Landed (7c30866; E0435 in 37fbd61).
   It type-checked but failed the cranelift verifier; it now calls `f` and returns no value.
-- **C2 — a conditional expression, `ExprKind::Cond`.** Touches the AST, resolver, capture,
-  checker, interpreter, and lowering. The branches join the way `or` operands do (`T` and `nil`
-  give `T?`; no covering type is an error) and narrow like an `if`. Lowering reuses the result
-  temporary and merge block `lower_logic` builds, so no IR op is added and the Vm and JIT are
-  untouched. It has no Lua spelling.
-- **C3 — `StatKind::Continue`.** Allowed only inside a loop, like `break`; jumps to the loop's
-  step block, or a `while` loop's header. The Lua surface gains Luau's `continue` with it.
-- **C4 — `FuncBody::fallthrough`, Error or Nil.** The Lua surface keeps Error (E0480). With
-  Nil, reaching `end` in a function that returns a value returns `nil` and makes its return type
-  optional, reusing `infer_optional_return`.
+- **C2 — a conditional expression, `ExprKind::Cond`.** ✅ Done. Touches the AST, resolver,
+  capture, checker, interpreter, and lowering. The branches join the way `or` operands do (`T`
+  and `nil` give `T?`; no covering type is `E0455`) and narrow like an `if`'s, the else-branch by
+  `== nil` too (C8). Its type goes in `TypeInfo::logic` beside `and`/`or`'s, and lowering
+  (`lower_cond`) stores the chosen branch into one result temporary and jumps to a merge block,
+  as `lower_logic` does, so no IR op is added and the Vm and JIT are untouched. It has no Lua
+  spelling; SPEC.md §3.5 records it and its resolved decisions why.
+- **C3 — `StatKind::Continue`.** ✅ Done. Allowed only inside a loop, like `break` (`E0311`,
+  worded `next` for Ruby); jumps to the loop's step block, or a `while` loop's header. The JIT
+  already handled a loop with several back edges. The Lua surface gains Luau's `continue`,
+  contextual as in Luau: a statement starting with the name that neither calls nor assigns it,
+  so `continue` stays a usable name.
+- **C4 — `FuncBody::fallthrough`, Error or Nil.** ✅ Done. The Lua surface keeps Error
+  (E0480). With Nil, a path without a value in a function that returns one elsewhere returns
+  `nil` and makes its return type optional, decided up front in `infer_return_up_front` as a
+  `return nil` is. Settling it took one more rule: Ruby can't tell a method that returns nothing
+  from one that returns `nil`, and every tail call is a `return f()`, so a `def` whose tail call
+  returns nothing would become optional and reject the call (`E0413`). With Nil, returning a
+  call that gives nothing is a path without a value, and which top-level functions return
+  nothing is settled first from their `return`s alone, to a fixed point (`valueless_functions`),
+  so the decision still doesn't depend on the order of the code. A function none of whose paths
+  gives a value returns nothing, as before. A declared return type and a tuple keep `E0480`. The
+  interpreters and lowering already returned `nil` for a path without a value in an
+  optional-returning function, so only the checker changed.
 - **C5 — entry points that start from an AST.** ✅ Done. `analyze_module` and `compile_module`
   (`analyze` and `compile` now parse and call them), `Engine::compile_module` (likewise under
   `Engine::compile`), and the `Executors` harness in `tests/common`, built from source or from an
@@ -513,8 +527,8 @@ differential cases (AGENTS.md §6).
   `ipairs` as a value's `E0301` — keep their Lua wording. Every rewritten message is
   byte-identical to before.
 - **C7 — dropped.** See the locked decisions: the host already reads constants.
-- **C8 — narrowing on `== nil`.** ✅ Done, for `if` statements; the else-branch of a C2
-  conditional comes with C2. `x == nil` narrows `x` in the else-branch and in the conditions
+- **C8 — narrowing on `== nil`.** ✅ Done, for `if` statements and, with C2, conditional
+  expressions. `x == nil` narrows `x` in the else-branch and in the conditions
   and bodies of later `elseif` arms; `nil` may be on either side, and `not` and parentheses are
   seen through (`types.rs` `narrowing_from`). Each arm starts from what was narrowed before the
   `if` plus what the earlier conditions being false imply, and after the `if` a place stays
@@ -581,9 +595,34 @@ counts exclude tests; the total is about 6k.
   checker errors worded for Ruby); and `tests/core_changes.rs` for C8 and C9. The shared
   `Executors` harness gained memory, methods, and host functions. (~1.9k lines without tests,
   as estimated.)
-- **R3 — language additions.** C2, C3, and C4, each with its `SPEC.md` section, and the Ruby
-  forms that need them: `?:`, `if`/`case` as values, `next`, `nil` on falling off the end.
-  (~700 lines)
+- **R3 — language additions.** ✅ Done. C2, C3, and C4 (above), each with its `SPEC.md`
+  section, and the Ruby forms that need them: `?:`, `if`/`case` as values, `next`, and `nil`
+  on falling off the end. What settling them took, recorded in SPEC-RUBY.md §4.2, §4.4, and §6:
+  - Where an `if`, `case`, or `?:` is decides what it becomes. At the end of a body, or as a
+    `return`'s value, it is an `if` statement returning from each branch, which lets a branch
+    hold statements and a tail call return nothing (C1), where a conditional expression would
+    make that call a value (`E0435`); as another statement, one whose branches are statements
+    (`c ? attack : defend`). As the whole right side of an assignment it is a conditional
+    expression when every branch is one expression, and otherwise the assignment moves into the
+    branches, which makes a local it declares optional, as a hoisted one is. Anywhere else it is
+    a conditional expression, and a branch of statements is `E0609`.
+  - A missing `else` is `nil`. A `return` of an `if` without one is followed by a bare
+    `return`, so the path that skips every branch returns there rather than running on, as it
+    would in a nested block.
+  - A value `case` reads a local or constant subject again for each `when`. As the whole right
+    side of an assignment any other subject is evaluated once, into a numbered temporary
+    (`case#1`, …) declared just before, which can't sit in a `do` block, since the local being
+    assigned must outlive it; anywhere else such a subject is `E0609`.
+  - An `elsif` or `when` arm's conditional expression takes the span from its condition to the
+    end of the whole `if` or `case`, since the checker keys a conditional's type by span.
+  Tests: `tests/core_changes.rs` holds C2 (through Lua whose `cond(c, a, b)` calls a walker
+  rewrites into conditional expressions), C3 (Lua's `continue` in every kind of loop, and as a
+  name), and C4 (Lua with every function marked Nil) to all three oracles; `tests/ruby_corpus.rs`
+  gains three programs over every form; `tests/ruby_twins/control` pins `next`, the statement
+  forms, and an assignment moved into its branches to the IR of their Lua spelling; and
+  `tests/ruby_translate.rs` covers `E0609`, `E0311`, and the Ruby wording of `E0455` and
+  `E0480`. SPEC-RUBY.md §7's worked example now translates and checks. (~600 lines without
+  tests, under the ~700 estimated.)
 - **R4 — collection methods** (SPEC-RUBY.md §4.12), with diagnostics for each position a call
   can't be translated in. (~400 lines)
 - **R5 — DSL layer.** The keyword declaration API, handler and data keywords, E06xx for unknown

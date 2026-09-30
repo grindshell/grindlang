@@ -44,14 +44,26 @@ error[E0309]: top-level code cannot `return`; a script exports its public `def`s
   1| return 1
    | ^^^^^^^^
 
+error[E0311]: `next` outside of a loop
+  --> 2:3
+   |
+  2|   next
+   |   ^^^^
+
 error[E0110]: malformed type in `# @param x`: expected `]` for an array type `T[]`
   --> 1:1
    |
   1| # @param x nope[
    | ^^^^^^^^^^^^^^^^
 
-error[E0480]: missing `return`: this function returns number, but can reach its end without returning a value
-  --> 3:1
+error[E0455]: this conditional expression yields a number or a string, which are not one type; its branches must have the same type, apart from being optional
+  --> 2:7
    |
-  3| end
+  2|   x = c ? 1 : "one"
+   |       ^^^^^^^^^^^^^
+
+error[E0480]: missing `return`: this function returns number, but can reach its end without returning a value
+  --> 4:1
+   |
+  4| end
    | ^^^

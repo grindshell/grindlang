@@ -462,6 +462,253 @@ end
     ex.assert_returns("KIND", vec![], "six+");
 }
 
+#[test]
+fn if_case_and_ternary_as_values() {
+    let mut ex = ruby(
+        r##"
+TIER = case 3 when 1..2 then "low" else "high" end
+SCALE = TIER == "high" ? 2 : 1
+
+def pick(c)
+  c ? "yes" : "no"
+end
+
+def label(hp)
+  status = if hp <= 0 then "dead" elsif hp < 10 then "hurt" else "fine" end
+  "#{status}!"
+end
+
+def maybe(c)
+  x = if c then 5 end
+  x.nil? ? -1 : x
+end
+
+def nested(a, b)
+  v = a > 0 ? (b > 0 ? 1 : 2) : 3
+  v * SCALE
+end
+
+def in_operands(n)
+  1 + (n > 5 ? 10 : 20) + (unless n > 5 then 100 else 0 end)
+end
+
+def kind(n)
+  k = case n
+      when 0 then "zero"
+      when 1..9 then "small"
+      else "big"
+      end
+  k
+end
+
+# The subject isn't a local, so it is evaluated once, into a temporary.
+def size_of(n)
+  size = case half(n) when 0..2 then "low" when 3...6 then "mid" end
+  size.nil? ? "none" : size
+end
+
+private def half(n)
+  n / 2
+end
+
+def spelled(n)
+  return case n when 1 then "one" else "many" end
+end
+
+def described(s)
+  n = s.to_f
+  d = case n when nil then "not a number" else "#{n + 1}" end
+  d
+end
+
+def flag(n)
+  n > 3 ? true : false
+end
+
+# A `?:` statement runs one branch's call.
+def side(c)
+  n = 0
+  inc = -> { n += 1 }
+  dec = -> { n -= 1 }
+  c ? inc.() : dec.()
+  c ? inc.() : dec.()
+  n
+end
+"##,
+    );
+    ex.assert_returns("TIER", vec![], "high");
+    ex.assert_returns("pick", vec![Value::Bool(true)], "yes");
+    ex.assert_returns("pick", vec![Value::Bool(false)], "no");
+    for (hp, want) in [(0.0, "dead!"), (5.0, "hurt!"), (50.0, "fine!")] {
+        ex.assert_returns("label", vec![num(hp)], want);
+    }
+    ex.assert_returns("maybe", vec![Value::Bool(true)], "5");
+    ex.assert_returns("maybe", vec![Value::Bool(false)], "-1");
+    for (a, b, want) in [(1.0, 1.0, "2"), (1.0, 0.0, "4"), (0.0, 1.0, "6")] {
+        ex.assert_returns("nested", vec![num(a), num(b)], want);
+    }
+    ex.assert_returns("in_operands", vec![num(3.0)], "121");
+    ex.assert_returns("in_operands", vec![num(7.0)], "11");
+    for (n, want) in [(0.0, "zero"), (4.0, "small"), (12.0, "big")] {
+        ex.assert_returns("kind", vec![num(n)], want);
+    }
+    for (n, want) in [(4.0, "low"), (8.0, "mid"), (20.0, "none")] {
+        ex.assert_returns("size_of", vec![num(n)], want);
+    }
+    ex.assert_returns("spelled", vec![num(1.0)], "one");
+    ex.assert_returns("spelled", vec![num(2.0)], "many");
+    ex.assert_returns("described", vec![string("2")], "3");
+    ex.assert_returns("described", vec![string("x")], "not a number");
+    ex.assert_returns("flag", vec![num(5.0)], "true");
+    ex.assert_returns("side", vec![Value::Bool(true)], "2");
+    ex.assert_returns("side", vec![Value::Bool(false)], "-2");
+}
+
+#[test]
+fn branches_holding_statements() {
+    let mut ex = ruby(
+        r##"
+# The assignment moves into each branch, so `total` is declared first, and optional.
+def bonus(crit, base)
+  total = if crit
+    mult = 2
+    base * mult
+  else
+    base
+  end
+  total.nil? ? 0 : total
+end
+
+# `g` already holds a string, and every branch gives one.
+def steps(n)
+  g = "?"
+  g = case n
+      when 1
+        t = "one"
+        t
+      else
+        "many"
+      end
+  g
+end
+
+def compute(c)
+  return (if c
+    y = 3
+    y * 2
+  end)
+end
+
+def skip_negatives(xs)
+  total = 0
+  xs.each do |x|
+    step = if x < 0
+      next
+    else
+      x * 2
+    end
+    total += step.nil? ? 0 : step
+  end
+  total
+end
+"##,
+    );
+    ex.assert_returns("bonus", vec![Value::Bool(true), num(5.0)], "10");
+    ex.assert_returns("bonus", vec![Value::Bool(false), num(5.0)], "5");
+    ex.assert_returns("steps", vec![num(1.0)], "one");
+    ex.assert_returns("steps", vec![num(2.0)], "many");
+    ex.assert_returns("compute", vec![Value::Bool(true)], "6");
+    ex.assert_returns("compute", vec![Value::Bool(false)], "nil");
+    ex.assert_returns("skip_negatives", vec![nums(&[1.0, -5.0, 2.0])], "6");
+}
+
+#[test]
+fn next_and_nil_at_the_end() {
+    let mut ex = ruby(
+        r##"
+def odd_sum(xs)
+  total = 0
+  xs.each do |x|
+    next if x % 2 == 0
+    total += x
+  end
+  total
+end
+
+def count_up(n)
+  i = 0
+  hits = 0
+  while i < n
+    i += 1
+    next if i % 3 == 0
+    hits += 1
+  end
+  hits
+end
+
+def late(n)
+  s = 0
+  n.times do |i|
+    next unless i > 2
+    s += i
+  end
+  s
+end
+
+def indexed(xs)
+  s = 0
+  xs.each_with_index do |x, i|
+    next if i == 0
+    s += x
+  end
+  s
+end
+
+def find_big(xs)
+  xs.each do |x|
+    return x if x > 10
+  end
+end
+
+def maybe_double(c, x)
+  x * 2 if c
+end
+
+def through_a_lambda(n)
+  f = ->(x) { x if x > 0 }
+  v = f.(n)
+  v.nil? ? 0 : v
+end
+
+def noop
+end
+
+# Returning what `noop` gives is returning nothing, so `act` returns nothing too...
+def act(c)
+  noop if c
+end
+
+# ...unless another path gives a value: then that path gives `nil`.
+def mixed(c)
+  if c then 5 else noop end
+end
+"##,
+    );
+    ex.assert_returns("odd_sum", vec![nums(&[1.0, 2.0, 3.0, 4.0, 5.0])], "9");
+    ex.assert_returns("count_up", vec![num(10.0)], "7");
+    ex.assert_returns("late", vec![num(6.0)], "12");
+    ex.assert_returns("indexed", vec![nums(&[5.0, 6.0, 7.0])], "13");
+    ex.assert_returns("find_big", vec![nums(&[3.0, 12.0, 20.0])], "12");
+    ex.assert_returns("find_big", vec![nums(&[3.0])], "nil");
+    ex.assert_returns("maybe_double", vec![Value::Bool(true), num(4.0)], "8");
+    ex.assert_returns("maybe_double", vec![Value::Bool(false), num(4.0)], "nil");
+    ex.assert_returns("through_a_lambda", vec![num(3.0)], "3");
+    ex.assert_returns("through_a_lambda", vec![num(-3.0)], "0");
+    ex.assert_returns("act", vec![Value::Bool(true)], "nil");
+    ex.assert_returns("mixed", vec![Value::Bool(true)], "5");
+    ex.assert_returns("mixed", vec![Value::Bool(false)], "nil");
+}
+
 fn memory_cfg() -> (TypeConfig, RubyConfig) {
     let mut fields = BTreeMap::new();
     fields.insert("hp".to_string(), Type::Number);
@@ -566,7 +813,7 @@ end
 
 #[test]
 fn best_name_from_the_worked_example() {
-    // SPEC-RUBY.md §7, with the final `?:` (R3) written as an `if`.
+    // SPEC-RUBY.md §7.
     let mut ex = ruby(
         r##"
 # @param items {name: string, score: number}[]
@@ -579,11 +826,7 @@ def best_name(items)
       best = item
     end
   end
-  if best.nil?
-    "none"
-  else
-    best[:name]
-  end
+  best.nil? ? "none" : best[:name]
 end
 "##,
     );

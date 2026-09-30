@@ -118,6 +118,19 @@ pub struct FuncBody {
     pub params: Vec<Ident>,
     pub block: Block,
     pub span: Span,
+    /// What a path that gives no value returns, in a function that returns one on another path.
+    pub fallthrough: Fallthrough,
+}
+
+/// What reaching a function's end, or a `return` without a value, means in a function that
+/// returns a value on some other path (`SPEC.md` §5.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fallthrough {
+    /// It is an error (`E0480`) unless the return type is optional. The Lua surface's rule.
+    Error,
+    /// It returns `nil`, which makes the return type optional, and so does returning a call
+    /// that gives nothing. The Ruby surface's rule, where every method returns a value.
+    Nil,
 }
 
 /// A sequence of statements with an optional terminating `return`.
@@ -169,7 +182,7 @@ pub enum StatKind {
         var: Ident,
         start: Expr,
         end: Expr,
-        step: Option<Expr>,
+        step: Option<Box<Expr>>,
         body: Block,
     },
     /// `for names in ipairs(e)/pairs(e) do ... end`.
@@ -180,6 +193,9 @@ pub enum StatKind {
     },
     /// `break`.
     Break,
+    /// `continue` (Luau's): on to the loop's next pass. A `while` loop tests its condition
+    /// again; a `for` loop takes its next value.
+    Continue,
 }
 
 /// The restricted iterator forms permitted in a generic `for` (SPEC §3.3).
@@ -243,6 +259,14 @@ pub enum ExprKind {
     },
     /// `( e )` — preserved so multi-value adjustment rules can see the parens later.
     Paren(Box<Expr>),
+    /// A conditional expression: `then` if `cond` holds, else `els`, evaluating only the one
+    /// chosen (`SPEC.md` §3.5). The Lua surface has no spelling for it; the Ruby surface's `?:`
+    /// and `if`/`case` used as values become it.
+    Cond {
+        cond: Box<Expr>,
+        then: Box<Expr>,
+        els: Box<Expr>,
+    },
 }
 
 /// A field inside a table constructor.

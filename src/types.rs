@@ -19,7 +19,8 @@
 //! * **`and`/`or`** yield one of their operands, which may differ in type: the result has the
 //!   one type that covers each operand it can yield (`x or 0` with `x : number?` is a `number`),
 //!   recorded in [`TypeInfo::logic`] for lowering. The left operand must be able to be `nil` or
-//!   `false` (§3.5).
+//!   `false` (§3.5). A **conditional expression** (which only the Ruby surface spells) joins its
+//!   two branches the same way, and its condition narrows them as an `if`'s would.
 //!
 //! * **Multi-value returns** produce a [`Type::Tuple`], consumable only by a matching-arity
 //!   parallel binding or a pass-through `return` (§5.5); anywhere else is `E0415`.
@@ -35,7 +36,9 @@
 //!   record/array-typed *parameter* be expressed.
 //! * **Every path returns a value** in a function whose return type isn't optional: a bare
 //!   `return`, or control reaching the closing `end`, is `E0480` (§5.5). Checked after every
-//!   body, once return types are settled.
+//!   body, once return types are settled. A function whose [`FuncBody::fallthrough`] is
+//!   [`Fallthrough::Nil`] (the Ruby surface's) returns `nil` there instead, which makes its
+//!   return type optional.
 //! * **Optional returns**: where the return type is `T?` — declared by `---@return`, or inferred
 //!   because the function returns a literal `nil` beside a value — a `return` may give a `T` or
 //!   `nil`, checked like an assignment. Decided before the body is checked, so it doesn't depend
@@ -59,7 +62,7 @@
 //! * Narrowing from an early return, or from either operand of `and`/`or`.
 //! * Iterating a record with `pairs` (its fields don't share a type).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, Diagnostics, Span};
@@ -226,9 +229,10 @@ pub struct TypeInfo {
     /// IR lowering unwraps each of these reads to the narrowed type — without that, a narrowed
     /// `number?` would reach native code as a boxed handle where an `f64` is expected.
     pub narrowed: HashMap<Span, Type>,
-    /// The type of every `and`/`or` expression that isn't an operand of another (`SPEC.md`
-    /// §3.5), keyed by its span. Its operands can differ from it and from each other
-    /// (`x or 0` with `x` a `number?` is a `number`), so lowering can't take it from them.
+    /// The type of every `and`/`or` expression that isn't an operand of another, and of every
+    /// conditional expression (`SPEC.md` §3.5), keyed by its span. Its operands can differ from
+    /// it and from each other (`x or 0` with `x` a `number?` is a `number`), so lowering can't
+    /// take it from them.
     pub logic: HashMap<Span, Type>,
 }
 
@@ -428,6 +432,9 @@ struct ReturnFrame {
     saw_value: bool,
     /// Each bare `return` in the function, which returns no value.
     bare_returns: Vec<Span>,
+    /// Whether a `return` of a call that gives nothing counts as a bare `return`, as it does
+    /// where a path without a value returns `nil` ([`Fallthrough::Nil`]).
+    nil_fallthrough: bool,
 }
 
 /// The ways a value-returning function can return no value, checked once every body has been
@@ -524,8 +531,8 @@ struct Checker<'a> {
     /// The `T` of the type `T?` of each `local x = nil` or uninitialized `local x`, which is
     /// `nil` if nothing else is ever assigned to `x` ([`Checker::settle_nil_locals`]).
     nil_locals: Vec<Type>,
-    /// The type of each `and`/`or` expression that isn't an operand of another, by span
-    /// (deep-resolved into [`TypeInfo::logic`] at the end).
+    /// The type of each `and`/`or` expression that isn't an operand of another, and of each
+    /// conditional expression, by span (deep-resolved into [`TypeInfo::logic`] at the end).
     logic_types: HashMap<Span, Type>,
     /// The `T` of each `T?` operand of `and`/`or` typed before `T` was known, with the operand's
     /// span ([`Checker::check_logic_optionals`]).
@@ -533,6 +540,9 @@ struct Checker<'a> {
     /// The type of each call used as a value before its callee's return type was known, with
     /// the call's span ([`Checker::check_valueless_calls`]).
     valueless_calls: Vec<(Type, Span)>,
+    /// The top-level functions known before any body is checked to return nothing
+    /// ([`Checker::valueless_functions`]).
+    valueless_fns: HashSet<String>,
     diags: Diagnostics,
 }
 
@@ -556,6 +566,7 @@ impl<'a> Checker<'a> {
             logic_types: HashMap::new(),
             logic_optionals: Vec::new(),
             valueless_calls: Vec::new(),
+            valueless_fns: HashSet::new(),
             diags: Diagnostics::new(),
         }
     }
@@ -565,6 +576,7 @@ impl<'a> Checker<'a> {
     }
 
     fn run(&mut self, module: &Module) -> BTreeMap<String, Type> {
+        self.valueless_fns = self.valueless_functions(module);
         // Pass 1: pre-create a signature (fresh vars) for every top-level function so
         // calls — including mutual recursion — resolve before bodies are checked. `---@`
         // annotations pin parameter/return vars here, *before* Pass 3, so the body sees a
@@ -601,6 +613,7 @@ impl<'a> Checker<'a> {
             widen: false,
             saw_value: false,
             bare_returns: Vec::new(),
+            nil_fallthrough: false,
         });
         for decl in &module.decls {
             match decl {
@@ -838,6 +851,7 @@ impl<'a> Checker<'a> {
             widen,
             saw_value: false,
             bare_returns: Vec::new(),
+            nil_fallthrough: body.fallthrough == Fallthrough::Nil,
         });
         self.check_block(&body.block);
         let frame = self.return_stack.pop().expect("return frame");
@@ -1062,7 +1076,17 @@ impl<'a> Checker<'a> {
             return;
         } else if ret.exprs.len() == 1 {
             let e = &ret.exprs[0];
-            (self.check_expr_multi(e), e.span)
+            let t = self.check_expr_multi(e);
+            // Where a path without a value returns `nil`, so does returning a call that gives
+            // none: it is a bare `return` after the call.
+            if let Some(frame) = self.return_stack.last_mut()
+                && frame.nil_fallthrough
+                && matches!(self.u.shallow(&t), Type::Unit)
+            {
+                frame.bare_returns.push(ret.span);
+                return;
+            }
+            (t, e.span)
         } else {
             // Each element is typed through `check_expr` (the guard), so a nested multi-value
             // call inside the list is rejected as E0415 rather than silently flattened.
@@ -1092,23 +1116,91 @@ impl<'a> Checker<'a> {
     ///   is checked against `T?` whichever comes first. Otherwise the first `return` would fix
     ///   the type: `return 1` makes it `number` and a later `return nil` a mismatch, while the
     ///   same two returns the other way round would infer `nil` and reject the `1`.
+    ///
+    /// Where a path without a value returns `nil` ([`Fallthrough::Nil`]), such a path — a bare
+    /// `return`, reaching the end, or returning a call to a function that returns nothing — counts
+    /// as returning `nil` beside a value, and the function returns nothing when all its paths are
+    /// such. Which calls return nothing is decided for every top-level function first
+    /// ([`Self::valueless_functions`]), so that returning one doesn't make a function optional.
     fn infer_return_up_front(&mut self, body: &FuncBody, sig: &FnType) {
+        let nil_fallthrough = body.fallthrough == Fallthrough::Nil;
         let (mut returns_nil, mut returns_value, mut returns_any) = (false, false, false);
-        visit_returns(&body.block, &mut |ret| {
-            returns_any |= !ret.exprs.is_empty();
-            if let [e] = ret.exprs.as_slice() {
-                if is_literal_nil(e) {
-                    returns_nil = true;
-                } else {
-                    returns_value = true;
-                }
-            }
+        let mut no_value = nil_fallthrough && !always_returns(&body.block);
+        visit_returns(&body.block, &mut |ret| match ret.exprs.as_slice() {
+            [] => no_value = true,
+            [e] if is_literal_nil(e) => returns_nil = true,
+            [e] if nil_fallthrough && self.gives_nothing(e, &self.valueless_fns) => no_value = true,
+            [_] => returns_value = true,
+            _ => returns_any = true,
         });
+        returns_any |= returns_nil || returns_value;
         if !returns_any {
             let _ = self.u.unify(&sig.ret, &Type::Unit);
-        } else if returns_nil && returns_value {
+        } else if returns_value && (returns_nil || (nil_fallthrough && no_value)) {
             let inner = self.u.fresh();
             let _ = self.u.unify(&sig.ret, &Type::optional(inner));
+        }
+    }
+
+    /// The top-level functions that return nothing, as far as their `return`s show before any
+    /// body is checked: those none of whose `return`s gives a value. Where a path without a value
+    /// returns `nil` ([`Fallthrough::Nil`]), returning a call to one of these gives no value
+    /// either, so the set grows until it stops changing.
+    fn valueless_functions(&self, module: &Module) -> HashSet<String> {
+        let mut valueless = HashSet::new();
+        loop {
+            let before = valueless.len();
+            for decl in &module.decls {
+                let TopDecl::Function(f) = decl else { continue };
+                if !f.annotations.ret.is_empty() || valueless.contains(&f.name.node) {
+                    continue;
+                }
+                let nil_fallthrough = f.body.fallthrough == Fallthrough::Nil;
+                let mut gives_value = false;
+                visit_returns(&f.body.block, &mut |ret| match ret.exprs.as_slice() {
+                    [] => {}
+                    [e] if nil_fallthrough && self.gives_nothing(e, &valueless) => {}
+                    _ => gives_value = true,
+                });
+                if !gives_value {
+                    valueless.insert(f.name.node.clone());
+                }
+            }
+            if valueless.len() == before {
+                return valueless;
+            }
+        }
+    }
+
+    /// Whether `e` is a call known before any body is checked to return nothing: of a top-level
+    /// function in `valueless`, or of a host function or memory method declared to return `()`.
+    fn gives_nothing(&self, e: &Expr, valueless: &HashSet<String>) -> bool {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.gives_nothing(inner, valueless),
+            ExprKind::Call { callee, .. } => match &callee.kind {
+                ExprKind::Name(_) => match self.res.binding(callee.span) {
+                    Some(Binding::TopFunction(f)) => valueless.contains(f),
+                    Some(Binding::HostFunction(f)) => self
+                        .cfg
+                        .host_functions
+                        .get(f)
+                        .is_some_and(|ft| *ft.ret == Type::Unit),
+                    _ => false,
+                },
+                _ => false,
+            },
+            ExprKind::MethodCall {
+                receiver, method, ..
+            } => match self.res.binding(receiver.span) {
+                Some(Binding::Memory(m)) => self
+                    .cfg
+                    .methods
+                    .get(m)
+                    .and_then(|methods| methods.get(&method.node))
+                    .is_some_and(|ft| *ft.ret == Type::Unit),
+                _ => false,
+            },
+            _ => false,
         }
     }
 
@@ -1116,7 +1208,7 @@ impl<'a> Checker<'a> {
 
     fn check_stat(&mut self, stat: &Stat) {
         match &stat.kind {
-            StatKind::Empty | StatKind::Break => {}
+            StatKind::Empty | StatKind::Break | StatKind::Continue => {}
             StatKind::Local { names, exprs } => self.check_local(names, exprs, stat.span),
             StatKind::LocalFunction { name, body } => {
                 let sig = self.make_sig(&body.params);
@@ -1458,6 +1550,7 @@ impl<'a> Checker<'a> {
             // Parentheses are transparent in Tier A (no value-count adjustment): `(f())` has
             // the same type as `f()`, so a paren'd pass-through stays legal.
             ExprKind::Paren(inner) => self.check_expr_multi(inner),
+            ExprKind::Cond { cond, then, els } => self.check_cond(expr, cond, then, els),
             ExprKind::Name(_) => self.check_name(expr),
             ExprKind::Function(body) => {
                 let sig = self.make_sig(&body.params);
@@ -2051,6 +2144,39 @@ impl<'a> Checker<'a> {
         ty
     }
 
+    /// A conditional expression (`SPEC.md` §3.5): a `bool` condition, and two branches whose
+    /// types join as `or`'s operands do. The condition narrows each branch as it would an `if`'s,
+    /// and branches assign nothing, so what is narrowed after it is what was before.
+    fn check_cond(&mut self, expr: &Expr, cond: &Expr, then: &Expr, els: &Expr) -> Type {
+        let entry = self.narrowed.clone();
+        self.check_condition(cond);
+        let narrowing = self.narrowing_from(cond);
+        self.narrowed.extend(narrowing.then);
+        let a = self.check_expr(then);
+        self.narrowed = entry.clone();
+        self.narrowed.extend(narrowing.els);
+        let b = self.check_expr(els);
+        self.narrowed = entry;
+        let ty = match self.join(&a, &b) {
+            Some(ty) => ty,
+            None => {
+                self.error(
+                    "E0455",
+                    format!(
+                        "this conditional expression yields a {} or a {}, which are not one type; \
+                         its branches must have the same type, apart from being optional",
+                        self.u.deep(&a),
+                        self.u.deep(&b)
+                    ),
+                    expr.span,
+                );
+                Type::Error
+            }
+        };
+        self.logic_types.insert(expr.span, ty.clone());
+        ty
+    }
+
     /// What an operand of `and`/`or` can yield, looking through a chain of them.
     fn logic_outcomes(&mut self, expr: &Expr) -> Outcomes {
         let (op, lhs, rhs) = match &expr.kind {
@@ -2633,7 +2759,7 @@ impl<'a> Checker<'a> {
 /// Only called on a function body and the blocks nested in it outside any loop, so a `break`
 /// never has to be considered here — one can only occur inside a loop, and a loop is only ever
 /// treated as not finishing when it has no `break` ([`stat_always_returns`]).
-fn always_returns(block: &Block) -> bool {
+pub(crate) fn always_returns(block: &Block) -> bool {
     block.ret.is_some() || block.stats.iter().any(stat_always_returns)
 }
 

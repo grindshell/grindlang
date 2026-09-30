@@ -366,6 +366,7 @@ impl Parser {
             params,
             block,
             span: lparen.span.to(end.span),
+            fallthrough: Fallthrough::Error,
         })
     }
 
@@ -563,7 +564,7 @@ impl Parser {
             self.expect(TokenKind::Comma)?;
             let end_e = self.parse_expr()?;
             let step = if self.eat(&TokenKind::Comma) {
-                Some(self.parse_expr()?)
+                Some(Box::new(self.parse_expr()?))
             } else {
                 None
             };
@@ -676,6 +677,13 @@ impl Parser {
                 Ok(Stat {
                     kind: StatKind::Call(first),
                     span,
+                })
+            } else if matches!(&first.kind, ExprKind::Name(n) if n == "continue") {
+                // Luau's `continue` is no reserved word: a statement starting with the name, which
+                // doesn't call or assign it, is the statement.
+                Ok(Stat {
+                    kind: StatKind::Continue,
+                    span: first.span,
                 })
             } else {
                 self.err(

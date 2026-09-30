@@ -122,6 +122,12 @@ error[E0606]: this code never runs: it comes after a `return`
   3|   x + 1
    |   ^^^^^
 
+error[E0606]: this code never runs: it comes after a `next`
+  --> 4:5
+   |
+  4|     x
+   |     ^
+
 error[E0607]: `g` is a local here, not a method; call the lambda it holds with `g.(…)` or `g.call(…)`
   --> 3:3
    |
@@ -133,3 +139,27 @@ error[E0608]: an empty hash is not supported yet: Grindlang has no way to write 
    |
   2|   h = {}
    |       ^^
+
+error[E0609]: each branch of an `if` or `case` used as a value here must be one expression; its branches may hold statements only where it is the whole right side of an assignment or a `return`
+  --> 2:18
+   |
+  2|   1 + (if c then y = 1; y else 2 end)
+   |                  ^^^^^
+
+error[E0609]: a `case` used as a value here reads its subject again for each `when`, so the subject must be a local or a constant; assign it to a local first, or make the `case` the whole right side of an assignment or a `return`
+  --> 2:13
+   |
+  2|   1 + (case g when 1 then 2 else 3 end)
+   |             ^
+
+error[E0609]: this branch gives the `if` or `case` no value to assign: its last statement must be an expression
+  --> 3:5
+   |
+  3|     y = 1
+   |     ^^^^^
+
+error[E0609]: `X` is a constant, which takes one expression, so each branch of the `if` or `case` giving its value must be one expression
+  --> 1:5
+   |
+  1| X = if true
+   |     ^^^^^^^

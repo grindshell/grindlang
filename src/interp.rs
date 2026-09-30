@@ -26,7 +26,7 @@
 //!   A closure captures the individual [`Slot`]s of its free variables (its upvalues),
 //!   not the enclosing frames — capturing whole frames would create `Rc` reference cycles
 //!   whenever a closure is stored back into a frame it reads an upvalue from.
-//! * `return`/`break` propagate via [`Flow`].
+//! * `return`/`break`/`continue` propagate via [`Flow`].
 //! * Host state is injected after construction: [`Interpreter::set_host_function`] and
 //!   [`Interpreter::set_memory`]. Memory tables are shared by `Rc`, so script mutations are
 //!   observable by the host through [`Interpreter::memory`] after a call returns.
@@ -100,6 +100,7 @@ fn new_frame() -> Frame {
 enum Flow {
     Normal,
     Break,
+    Continue,
     Return(Value),
 }
 
@@ -291,8 +292,8 @@ impl<'a> Interpreter<'a> {
                             self.set_global(&Binding::Module(id), v)?;
                         }
                     }
-                    // Top-level code can't `return` or `break` out of itself (the resolver's
-                    // `E0309` and `E0306`), so the flow is always `Normal`.
+                    // Top-level code can't `return`, `break`, or `continue` out of itself (the
+                    // resolver's `E0309`, `E0306`, and `E0311`), so the flow is always `Normal`.
                     _ => {
                         self.exec_stat(stat)?;
                     }
@@ -475,9 +476,9 @@ impl<'a> Interpreter<'a> {
                 match result? {
                     Flow::Return(v) => Ok(v),
                     Flow::Normal => Ok(Value::Nil),
-                    Flow::Break => {
-                        Err(RunError::Internal("`break` escaped a function body".into()))
-                    }
+                    Flow::Break | Flow::Continue => Err(RunError::Internal(
+                        "`break` or `continue` escaped a function body".into(),
+                    )),
                 }
             }
             other => Err(RunError::Internal(format!(
@@ -519,6 +520,7 @@ impl<'a> Interpreter<'a> {
         match &stat.kind {
             StatKind::Empty => Ok(Flow::Normal),
             StatKind::Break => Ok(Flow::Break),
+            StatKind::Continue => Ok(Flow::Continue),
             StatKind::Local { names, exprs } => {
                 let values = self.eval_rhs(exprs)?;
                 for (i, name) in names.iter().enumerate() {
@@ -555,7 +557,7 @@ impl<'a> Interpreter<'a> {
             StatKind::While { cond, body } => {
                 while self.eval_expr(cond)?.is_truthy() {
                     match self.exec_block(body)? {
-                        Flow::Normal => {}
+                        Flow::Normal | Flow::Continue => {}
                         Flow::Break => break,
                         ret @ Flow::Return(_) => return Ok(ret),
                     }
@@ -579,7 +581,7 @@ impl<'a> Interpreter<'a> {
                 end,
                 step,
                 body,
-            } => self.exec_numeric_for(var, start, end, step.as_ref(), body),
+            } => self.exec_numeric_for(var, start, end, step.as_deref(), body),
             StatKind::GenericFor { names, iter, body } => self.exec_generic_for(names, iter, body),
         }
     }
@@ -606,7 +608,7 @@ impl<'a> Interpreter<'a> {
             }
             self.declare(var, Value::Number(i))?;
             match self.exec_block(body)? {
-                Flow::Normal => {}
+                Flow::Normal | Flow::Continue => {}
                 Flow::Break => break,
                 ret @ Flow::Return(_) => return Ok(ret),
             }
@@ -643,7 +645,7 @@ impl<'a> Interpreter<'a> {
                         self.declare(v, item)?;
                     }
                     match self.exec_block(body)? {
-                        Flow::Normal => {}
+                        Flow::Normal | Flow::Continue => {}
                         Flow::Break => break,
                         ret @ Flow::Return(_) => return Ok(ret),
                     }
@@ -673,7 +675,7 @@ impl<'a> Interpreter<'a> {
                         self.declare(vn, v)?;
                     }
                     match self.exec_block(body)? {
-                        Flow::Normal => {}
+                        Flow::Normal | Flow::Continue => {}
                         Flow::Break => break,
                         ret @ Flow::Return(_) => return Ok(ret),
                     }
@@ -871,6 +873,13 @@ impl<'a> Interpreter<'a> {
             ExprKind::Number(n) => Ok(Value::Number(*n)),
             ExprKind::Str(s) => Ok(Value::string(s.clone())),
             ExprKind::Paren(inner) => self.eval_expr(inner),
+            ExprKind::Cond { cond, then, els } => {
+                if self.eval_expr(cond)?.is_truthy() {
+                    self.eval_expr(then)
+                } else {
+                    self.eval_expr(els)
+                }
+            }
             ExprKind::Name(name) => self.eval_name(expr, name),
             ExprKind::Function(body) => {
                 let func = Func {

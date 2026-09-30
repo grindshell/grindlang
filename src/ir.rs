@@ -428,8 +428,8 @@ fn lower_init(
                         fl.emit_stmt(Op::GlobalSet(slot, v));
                     }
                 }
-                // Top-level code can't `return` or `break` out of itself (the resolver's `E0309`
-                // and `E0306`), so no statement ends it early.
+                // Top-level code can't `return`, `break`, or `continue` out of itself (the
+                // resolver's `E0309`, `E0306`, and `E0311`), so no statement ends it early.
                 _ => {
                     fl.lower_stat(stat)?;
                 }
@@ -512,8 +512,8 @@ struct FnLowerer<'a> {
     blocks: Vec<Block>,
     current: usize,
     next_temp: LocalId,
-    /// Stack of loop-exit blocks for `break`.
-    loop_exits: Vec<BlockId>,
+    /// The loops enclosing the current point, innermost last: where `continue` and `break` go.
+    loops: Vec<LoopTargets>,
 
     // ---- closure conversion ----
     /// Nesting depth of the function being lowered (0 = top-level).
@@ -529,6 +529,15 @@ struct FnLowerer<'a> {
     discovered: Vec<Pending>,
     /// Per-function counter for minting unique lifted-closure names.
     closure_counter: u32,
+}
+
+/// Where a loop's `continue` and `break` jump.
+#[derive(Clone, Copy)]
+struct LoopTargets {
+    /// The start of the next pass: a `while` loop's condition, a `for` loop's step.
+    next: BlockId,
+    /// The block after the loop.
+    exit: BlockId,
 }
 
 /// Where control goes once an operand of `and`/`or` is found truthy or falsy
@@ -562,7 +571,7 @@ impl<'a> FnLowerer<'a> {
             blocks: Vec::new(),
             current: 0,
             next_temp,
-            loop_exits: Vec::new(),
+            loops: Vec::new(),
             depth: 0,
             boxed: HashSet::new(),
             upvalue_index: HashMap::new(),
@@ -835,12 +844,16 @@ impl<'a> FnLowerer<'a> {
     fn lower_stat(&mut self, stat: &Stat) -> Result<bool, LowerError> {
         match &stat.kind {
             StatKind::Empty => Ok(false),
-            StatKind::Break => {
-                let exit = *self
-                    .loop_exits
+            StatKind::Break | StatKind::Continue => {
+                let targets = *self
+                    .loops
                     .last()
                     .ok_or_else(|| LowerError::Internal("`break` outside a loop".into()))?;
-                self.terminate(Terminator::Jump(exit));
+                let to = match stat.kind {
+                    StatKind::Break => targets.exit,
+                    _ => targets.next,
+                };
+                self.terminate(Terminator::Jump(to));
                 Ok(true)
             }
             StatKind::Local { names, exprs } => {
@@ -893,7 +906,7 @@ impl<'a> FnLowerer<'a> {
                 end,
                 step,
                 body,
-            } => self.lower_numeric_for(var, start, end, step.as_ref(), body),
+            } => self.lower_numeric_for(var, start, end, step.as_deref(), body),
             StatKind::GenericFor { names, iter, body } => self.lower_generic_for(names, iter, body),
         }
     }
@@ -985,9 +998,9 @@ impl<'a> FnLowerer<'a> {
         });
 
         self.switch(body_b);
-        self.loop_exits.push(exit);
+        self.loops.push(LoopTargets { next: header, exit });
         let terminated = self.lower_block(body)?;
-        self.loop_exits.pop();
+        self.loops.pop();
         if !terminated {
             self.terminate(Terminator::Jump(header));
         }
@@ -1121,9 +1134,9 @@ impl<'a> FnLowerer<'a> {
         self.switch(body_b);
         let current = self.emit_value(Op::LocalGet(counter_l), Type::Number);
         self.write_symbol(var_id, current);
-        self.loop_exits.push(exit);
+        self.loops.push(LoopTargets { next: latch, exit });
         let terminated = self.lower_block(body)?;
-        self.loop_exits.pop();
+        self.loops.pop();
         if !terminated {
             self.terminate(Terminator::Jump(latch));
         }
@@ -1261,9 +1274,9 @@ impl<'a> FnLowerer<'a> {
             self.write_symbol(vid, value_v);
         }
 
-        self.loop_exits.push(exit);
+        self.loops.push(LoopTargets { next: latch, exit });
         let terminated = self.lower_block(body)?;
-        self.loop_exits.pop();
+        self.loops.pop();
         if !terminated {
             self.terminate(Terminator::Jump(latch));
         }
@@ -1289,6 +1302,7 @@ impl<'a> FnLowerer<'a> {
             ExprKind::Number(n) => Ok(self.emit_value(Op::ConstNumber(*n), Type::Number)),
             ExprKind::Str(s) => Ok(self.emit_value(Op::ConstString(s.clone()), Type::String)),
             ExprKind::Paren(inner) => self.lower_expr(inner),
+            ExprKind::Cond { cond, then, els } => self.lower_cond(expr, cond, then, els),
             ExprKind::Name(_) => self.lower_name(expr),
             ExprKind::Function(body) => self.lower_closure_literal(body),
             ExprKind::Field { base, name } => self.lower_field(base, name, expr.span),
@@ -1624,6 +1638,42 @@ impl<'a> FnLowerer<'a> {
         let merge = self.new_block();
         let yielded = LogicExit::Yield { result, merge };
         self.lower_logic_operand(expr, yielded, yielded)?;
+        self.switch(merge);
+        Ok(self.emit_value(Op::LocalGet(result), ty))
+    }
+
+    /// A conditional expression, lowered as `and`/`or` is ([`Self::lower_logic`]): the branch the
+    /// condition picks stores its value into one result temporary, of the type the checker gave
+    /// the whole expression, and jumps to a merge block.
+    fn lower_cond(
+        &mut self,
+        expr: &Expr,
+        cond: &Expr,
+        then: &Expr,
+        els: &Expr,
+    ) -> Result<ValueId, LowerError> {
+        let ty = self
+            .types
+            .logic
+            .get(&expr.span)
+            .cloned()
+            .ok_or_else(|| LowerError::Internal("untyped conditional expression".into()))?;
+        let result = self.fresh_temp(ty.clone());
+        let merge = self.new_block();
+        let c = self.lower_expr(cond)?;
+        let then_blk = self.new_block();
+        let else_blk = self.new_block();
+        self.terminate(Terminator::Branch {
+            cond: c,
+            then_blk,
+            else_blk,
+        });
+        for (block, branch) in [(then_blk, then), (else_blk, els)] {
+            self.switch(block);
+            let v = self.lower_expr(branch)?;
+            self.emit_stmt(Op::LocalSet(result, v));
+            self.terminate(Terminator::Jump(merge));
+        }
         self.switch(merge);
         Ok(self.emit_value(Op::LocalGet(result), ty))
     }

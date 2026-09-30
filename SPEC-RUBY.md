@@ -7,12 +7,10 @@
 >
 > Status: **draft, partly implemented.** Behind the `ruby` feature: the lexer and parser (§2,
 > §3, and the syntax rejections of §6; `grindlang::ruby::parse`), and the translation of §4
-> into the shared tree (`grindlang::ruby::parse_module`), except the forms that wait on core
-> changes or later steps: `?:`, `if`/`case` as values, `next`, and returning `nil` from the end
-> of a function (R3), the collection methods of §4.12 (R4), and the DSL keywords of §5 (R5).
-> Each of those is `E0699` until then. The decisions below were confirmed with the stakeholder
-> on 2026-09-30; details marked _(open)_ are still to settle. Items that depend on a core change
-> name it (C2–C9, PLAN.md Phase 10).
+> into the shared tree (`grindlang::ruby::parse_module`), except the collection methods of
+> §4.12 (R4) and the DSL keywords of §5 (R5). A collection method is `E0699` until then. The
+> decisions below were confirmed with the stakeholder on 2026-09-30; details marked _(open)_
+> are still to settle. Items that depend on a core change name it (C2–C9, PLAN.md Phase 10).
 
 ## 1. What a Ruby-surface script is
 
@@ -293,7 +291,12 @@ The **last statement** of a `def` or lambda body decides what it returns:
 
 Reaching the end of a function that returns a value on some other path returns `nil`, making
 its return type optional (C4), as Ruby does. So `def f(c) if c then 1 end end` returns
-`number?`. Explicit `return` works as in SPEC.md.
+`number?`. A bare `return` does the same, and so does returning a call to a method that returns
+nothing: `def f(c) if c then 1 else log end end` is `number?`, and `nil` where it logs. A `def`
+none of whose paths gives a value — `def f(c) log if c end` — returns nothing (SPEC.md §5.5).
+A declared `# @return number` keeps its type, so reaching the end is then an error (`E0480`),
+as is reaching it in a `def` that returns several values (`return a, b`) on another path.
+Explicit `return` otherwise works as in SPEC.md.
 
 A DSL block's return follows its declared signature instead (§5): a block declared to return
 nothing never gets an implicit `return`.
@@ -330,9 +333,33 @@ Only a lambda made in the loop and called on a later pass can tell.
 | `break`, `next` | `break`, `continue` (C3) |
 | `c ? a : b`; `if`/`unless`/`case` used as a value | a conditional expression (C2) |
 
-An `if` or `case` used as a value may have branches of several statements only when it is the
-whole right side of an assignment or a `return`; elsewhere each branch must be one expression.
-`c ? a : b` is **not** `c and a or b`, which yields `b` when `a` is `false` or `nil`.
+`next` goes on to the next pass of the innermost loop, a block of §4.5 or §4.12 included; outside
+a loop it is SPEC.md's `E0311`.
+
+What an `if`, `unless`, `case`, or `?:` becomes depends on where it is:
+
+- **At the end of a body** (§4.2) and **as the value of a `return`**, it is an `if` statement
+  whose branches each return their value, so a branch may hold statements, and one that ends in
+  a statement returns nothing, as §4.2 says. `c ? a : b` there is
+  `if c then return a else return b end`. After a `return` of one, a path through a branch
+  that gives no value returns nothing. **As any other statement**, each branch runs as one:
+  `c ? attack : defend` calls one of the two.
+- **As the whole right side of an assignment**, it is a conditional expression (C2) when each
+  branch is one expression: `x = c ? a : b` is `local x = c ? a : b` in the shared tree, typed
+  like `a or b` (SPEC.md §3.5). When a branch holds statements, the assignment moves into each
+  branch instead, `if c then …; x = e1 else …; x = e2 end`, and a local it declares is declared
+  just before with no value, so it is optional, like the locals of §4.3; each branch must then
+  end in an expression, a jump, or `stmt if c` (`E0609`). A `case` here whose subject is not a
+  local or constant evaluates it once, into a temporary declared just before the assignment.
+- **Anywhere else** — an operand, an argument, a condition, one of several values — it is a
+  conditional expression, so each branch must be one expression, and a `case` subject a local
+  or constant it can read again for each `when` (`E0609`).
+
+A missing `else`, or an empty branch, gives `nil`, as in Ruby: `x = if c then 1 end` is a
+`number?`. The condition narrows the branches as an `if` does, so `x.nil? ? 0 : x + 1` needs no
+more. `c ? a : b` is **not** `c and a or b`, which yields `b` when `a` is `false` or `nil`. A
+constant's value is one expression (§4.1), so each branch of an `if` or `case` giving it is one
+too.
 
 `begin … end while c` (a do-while loop) is rejected.
 
@@ -637,14 +664,16 @@ once for its branches.
   - `E0604`: a constant assigned anywhere but directly at the top level, or with more than one
     value.
   - `E0605`: a value used as a statement, except the last one of a `def` or lambda.
-  - `E0606`: a statement after `return` or `break` in the same body.
+  - `E0606`: a statement after `return`, `break`, or `next` in the same body.
   - `E0607`: a local called like a method, `f(x)`, rather than as a lambda, `f.(x)`.
   - `E0608`: an empty hash (Open items).
-  - Planned for later steps: a collection method (§4.12) outside an assignment or `return`
-    (R4), and an `if` or `case` value with multi-statement branches outside an assignment or
-    `return` (R3).
-  - `E0699`, until the step that translates it: `?:`, `if`/`case` as values, `next` (R3), and
-    the collection methods (R4).
+  - `E0609`: an `if` or `case` used as a value that needs statements where it can't have them
+    (§4.4): a branch of several statements, or a `case` subject that isn't a local or constant,
+    anywhere but the whole right side of an assignment or a `return`; a branch that ends in a
+    statement with no value when the assignment moves into the branches; and a branch of more
+    than one expression in a constant's value.
+  - Planned for R4: a collection method (§4.12) outside an assignment or `return`.
+  - `E0699`, until R4 translates them: the collection methods.
 
 ## 7. Worked example
 
@@ -675,6 +704,8 @@ def best_name(items)
 end
 ```
 
+The `?:` at the end of `best_name` returns from each branch (§4.4):
+
 ```lua
 XP_BASE = 10
 
@@ -696,8 +727,12 @@ function best_name(items)
       best = item
     end
   end
-  return (best == nil) ? "none" : best["name"]  -- a conditional expression (C2);
-end                                             -- no Lua spelling
+  if best == nil then
+    return "none"
+  else
+    return best["name"]                     -- best narrowed here too (C8)
+  end
+end
 
 return { XP_BASE = XP_BASE, xp_for = xp_for, best_name = best_name }
 ```

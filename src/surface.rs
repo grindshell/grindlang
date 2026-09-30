@@ -90,6 +90,14 @@ impl Surface {
         }
     }
 
+    /// The statement that goes on to a loop's next pass (`SPEC.md` §3.3), quoted.
+    pub fn continue_stat(self) -> &'static str {
+        match self {
+            Surface::Lua => "`continue`",
+            Surface::Ruby => "`next`",
+        }
+    }
+
     /// A closure calling the named function `name`, which makes it a value (`SPEC.md` §5.5).
     pub fn closure_calling(self, name: &str) -> String {
         match self {

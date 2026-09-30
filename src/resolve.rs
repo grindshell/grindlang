@@ -21,7 +21,7 @@
 //!     and frozen them.
 //!   * **Top-level code** may not `return` (`E0309`) or touch host memory (`E0310`), which
 //!     isn't bound until after the module initializes.
-//!   * **`break` only inside a loop.**
+//!   * **`break` and `continue` only inside a loop.**
 //!   * **No shadowing reserved names** by a top-level declaration (SPEC §7).
 //!   * **Duplicate top-level declarations** are rejected.
 //!
@@ -482,7 +482,7 @@ impl<'a> Resolver<'a> {
         for p in &body.params {
             self.declare(&p.node, p.span, SymbolKind::Param);
         }
-        // `break` cannot cross a function boundary.
+        // `break` and `continue` cannot cross a function boundary.
         let saved_loop_depth = self.loop_depth;
         self.loop_depth = 0;
         // A function body is not top-level code, even when written in top-level code: it runs
@@ -600,6 +600,12 @@ impl<'a> Resolver<'a> {
             StatKind::Break => {
                 if self.loop_depth == 0 {
                     self.error("E0306", "`break` outside of a loop", stat.span);
+                }
+            }
+            StatKind::Continue => {
+                if self.loop_depth == 0 {
+                    let word = self.surface.continue_stat();
+                    self.error("E0311", format!("{word} outside of a loop"), stat.span);
                 }
             }
         }
@@ -752,6 +758,11 @@ impl<'a> Resolver<'a> {
             }
             ExprKind::Unary { operand, .. } => self.resolve_expr(operand),
             ExprKind::Paren(inner) => self.resolve_expr(inner),
+            ExprKind::Cond { cond, then, els } => {
+                self.resolve_expr(cond);
+                self.resolve_expr(then);
+                self.resolve_expr(els);
+            }
             // A nested anonymous function: a closure that may capture enclosing locals.
             ExprKind::Function(body) => self.resolve_func_body(body),
         }

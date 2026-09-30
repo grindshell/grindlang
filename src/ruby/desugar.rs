@@ -20,12 +20,22 @@
 //! - the `tostring` around an interpolation takes the two bytes before the interpolated
 //!   expression (`#{`), where no other node starts;
 //! - the memory binding `@name` reads takes the span of its `@`;
-//! - a `case` subject, read again for each `when`, takes that `when` keyword's span;
-//! - a hoisted `local x` takes the span of `x` in its first assignment, which is a use of the
-//!   same local.
+//! - a `case` subject, read again for each `when`, takes that `when` keyword's span, and the
+//!   temporary one is evaluated into, that `case` keyword's;
+//! - a hoisted `local x`, or one declared before an assignment that moves into the branches of
+//!   an `if`, takes the span of `x` in its first assignment, which is a use of the same local.
 //!
 //! Only names are looked up by span, so a call may share the span of the name it calls, and a
-//! builtin's `math.abs` the span of its `math`.
+//! builtin's `math.abs` the span of its `math`. The one other node keyed by span is the
+//! conditional expression, whose type the checker records as it does an `and`/`or`'s: an `if` or
+//! `case` used as a value becomes one per arm, and each arm after the first takes the span from
+//! its condition, or its `when`, to the end of the whole `if` or `case`.
+//!
+//! ## `if`, `case`, and `?:`
+//!
+//! Where one of these is decides what it becomes (`SPEC-RUBY.md` §4.4): an `if` statement whose
+//! branches each return, assign, or run their last expression ([`Tail`]), or a conditional
+//! expression, which needs each branch to be one expression.
 
 use std::collections::HashSet;
 
@@ -33,8 +43,8 @@ use super::RubyConfig;
 use super::ast as rb;
 use super::scope::{self, Scopes};
 use crate::ast::{
-    self, BinOp, Block, ConstDecl, Expr, ExprKind, Field, FuncBody, FuncDecl, Ident, IterExpr,
-    RetStat, Spanned, Stat, StatKind, TopDecl, UnOp,
+    self, BinOp, Block, ConstDecl, Expr, ExprKind, Fallthrough, Field, FuncBody, FuncDecl, Ident,
+    IterExpr, RetStat, Spanned, Stat, StatKind, TopDecl, UnOp,
 };
 use crate::diagnostics::{Diagnostic, Diagnostics, Span};
 use crate::surface::Surface;
@@ -69,6 +79,7 @@ pub(super) fn translate(
         defs,
         diags: Diagnostics::new(),
         in_def: false,
+        temps: 0,
     };
     let module = t.program(program);
     if t.diags.has_errors() {
@@ -78,13 +89,16 @@ pub(super) fn translate(
     }
 }
 
-/// Whether a body's last statement returns its value (`SPEC-RUBY.md` §4.2).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Tail {
-    /// Not the last statement of a `def` or lambda body, or not in one at all.
+/// What a body's last statement does with its value (`SPEC-RUBY.md` §4.2, §4.4).
+#[derive(Clone, Copy)]
+pub(super) enum Tail<'t> {
+    /// Nothing: not the last statement of a `def` or lambda body, or not in one at all.
     None,
     /// An expression here becomes `return expr`.
     Return,
+    /// An expression here is assigned to this target: the last statement of a branch of an `if`,
+    /// `case`, or `?:` that an assignment takes the value of, when its branches hold statements.
+    Assign(&'t Expr),
 }
 
 pub(super) struct Translator<'a> {
@@ -96,6 +110,9 @@ pub(super) struct Translator<'a> {
     pub(super) diags: Diagnostics,
     /// Whether the code being translated is in a `def`, including a block or lambda in one.
     pub(super) in_def: bool,
+    /// How many `case` subjects have been evaluated into a temporary of their own, which
+    /// numbers the next one.
+    temps: u32,
 }
 
 // ---- building nodes ------------------------------------------------------------------------
@@ -170,8 +187,55 @@ pub(super) fn index(base: Expr, idx: Expr, zero_based: bool, span: Span) -> Expr
     )
 }
 
+/// A conditional expression (C2): `then` if `cond` holds, else `els`.
+fn cond_expr(cond: Expr, then: Expr, els: Expr, span: Span) -> Expr {
+    expr(
+        ExprKind::Cond {
+            cond: Box::new(cond),
+            then: Box::new(then),
+            els: Box::new(els),
+        },
+        span,
+    )
+}
+
 fn stat(kind: StatKind, span: Span) -> Stat {
     Stat { kind, span }
+}
+
+/// `target = nil`: what a branch that Ruby gives no value assigns (`SPEC-RUBY.md` §4.4).
+fn nil_block(target: &Expr, span: Span) -> Block {
+    let assign = StatKind::Assign {
+        targets: vec![target.clone()],
+        exprs: vec![expr(ExprKind::Nil, span)],
+    };
+    Block {
+        stats: vec![stat(assign, span)],
+        ret: None,
+        span,
+    }
+}
+
+/// Conditional expressions testing each arm's condition in turn: the first arm's takes `span`,
+/// the whole `if` or `case`, and each later one the span from its own condition or `when` to the
+/// end of it, which no other node has. `els` is the value when no condition holds.
+fn chain(arms: Vec<(Expr, Expr, Span)>, els: Expr, span: Span) -> Expr {
+    let mut acc = els;
+    for (i, (cond, then, at)) in arms.into_iter().enumerate().rev() {
+        let at = if i == 0 { span } else { at.to(span) };
+        acc = cond_expr(cond, then, acc, at);
+    }
+    acc
+}
+
+/// The `if`, `unless`, `case`, or `?:` that `e` is, seen through parentheses: the forms that
+/// choose between values.
+fn choice(e: &rb::Expr) -> Option<&rb::Expr> {
+    match &e.kind {
+        rb::ExprKind::If(_) | rb::ExprKind::Case(_) | rb::ExprKind::Ternary { .. } => Some(e),
+        rb::ExprKind::Paren(inner) => choice(inner),
+        _ => None,
+    }
 }
 
 /// `local a, b` with no values.
@@ -302,10 +366,26 @@ impl<'a> Translator<'a> {
                 );
                 return;
             }
+            if let Some(choice) = choice(&values[0])
+                && !self.cond_ok(choice, true)
+            {
+                self.error(
+                    "E0609",
+                    format!(
+                        "`{c}` is a constant, which takes one expression, so each branch of the \
+                         `if` or `case` giving its value must be one expression"
+                    ),
+                    choice.span,
+                );
+                return;
+            }
+            let mut before = Vec::new();
+            let value = self.rhs(&values[0], &mut before);
+            decls.extend(before.into_iter().map(|st| TopDecl::Stat(Box::new(st))));
             let name = ident(c, target.span);
             decls.push(TopDecl::Const(ConstDecl {
                 name: name.clone(),
-                value: self.expr(&values[0]),
+                value,
                 span: s.span,
             }));
             exports.push(name);
@@ -342,6 +422,7 @@ impl<'a> Translator<'a> {
                 params: d.params.clone(),
                 block,
                 span: d.span,
+                fallthrough: Fallthrough::Nil,
             },
             annotations,
             span: d.span,
@@ -360,6 +441,12 @@ impl<'a> Translator<'a> {
             stats.push(declare(names.clone()));
         }
         let mut ret = None;
+        // An empty branch is `nil`, as in Ruby.
+        if body.stmts.is_empty()
+            && let Tail::Assign(target) = tail
+        {
+            stats.extend(nil_block(target, body.span).stats);
+        }
         for (i, s) in body.stmts.iter().enumerate() {
             let last = i + 1 == body.stmts.len();
             self.stmt(
@@ -368,11 +455,16 @@ impl<'a> Translator<'a> {
                 &mut stats,
                 &mut ret,
             );
-            if !last && matches!(s.kind, rb::StmtKind::Return(_) | rb::StmtKind::Break) {
-                let word = if ret.is_some() { "return" } else { "break" };
+            let jump = match s.kind {
+                rb::StmtKind::Return(_) => "return",
+                rb::StmtKind::Break => "break",
+                rb::StmtKind::Next => "next",
+                _ => continue,
+            };
+            if !last {
                 self.error(
                     "E0606",
-                    format!("this code never runs: it comes after a `{word}`"),
+                    format!("this code never runs: it comes after a `{jump}`"),
                     body.stmts[i + 1].span,
                 );
                 break;
@@ -399,6 +491,27 @@ impl<'a> Translator<'a> {
 
     fn stmt(&mut self, s: &rb::Stmt, tail: Tail, out: &mut Vec<Stat>, ret: &mut Option<RetStat>) {
         let span = s.span;
+        // A branch whose value is assigned ends in an expression, a jump, or `stmt if c`.
+        if let Tail::Assign(_) = tail
+            && !matches!(
+                s.kind,
+                rb::StmtKind::Expr(_)
+                    | rb::StmtKind::Return(_)
+                    | rb::StmtKind::Break
+                    | rb::StmtKind::Next
+                    | rb::StmtKind::Modified {
+                        modifier: rb::Modifier::If | rb::Modifier::Unless,
+                        ..
+                    }
+            )
+        {
+            self.error(
+                "E0609",
+                "this branch gives the `if` or `case` no value to assign: its last statement must \
+                 be an expression",
+                span,
+            );
+        }
         match &s.kind {
             rb::StmtKind::Expr(e) => self.expr_stmt(e, span, tail, out, ret),
             rb::StmtKind::Assign { targets, values } => self.assign(targets, values, span, out),
@@ -417,10 +530,29 @@ impl<'a> Translator<'a> {
                 out.push(stat(StatKind::While { cond, body }, span));
             }
             rb::StmtKind::Break => out.push(stat(StatKind::Break, span)),
-            rb::StmtKind::Next => {
-                self.not_yet("`next`", span);
-            }
+            rb::StmtKind::Next => out.push(stat(StatKind::Continue, span)),
             rb::StmtKind::Return(values) => {
+                // `return` of a choice returns from each branch, and returns nothing after one
+                // that gives no value, as a bare `return` does (§4.4).
+                if let [value] = values.as_slice()
+                    && let Some(choice) = choice(value)
+                {
+                    let mut stats = Vec::new();
+                    self.choice_stmt(choice, Tail::Return, &mut stats);
+                    let block = Block {
+                        stats,
+                        ret: None,
+                        span,
+                    };
+                    if !crate::types::always_returns(&block) {
+                        *ret = Some(RetStat {
+                            exprs: Vec::new(),
+                            span,
+                        });
+                    }
+                    out.extend(block.stats);
+                    return;
+                }
                 let exprs = values.iter().map(|v| self.expr(v)).collect();
                 *ret = Some(RetStat { exprs, span });
             }
@@ -435,10 +567,15 @@ impl<'a> Translator<'a> {
                 match modifier {
                     rb::Modifier::If | rb::Modifier::Unless => {
                         let block = self.single(inner, tail);
+                        // A branch ending in `y if c` gives `nil` where `c` doesn't hold.
+                        let else_block = match tail {
+                            Tail::Assign(target) => Some(nil_block(target, span)),
+                            _ => None,
+                        };
                         out.push(stat(
                             StatKind::If {
                                 arms: vec![(cond, block)],
-                                else_block: None,
+                                else_block,
                             },
                             span,
                         ));
@@ -460,9 +597,19 @@ impl<'a> Translator<'a> {
         out: &mut Vec<Stat>,
         ret: &mut Option<RetStat>,
     ) {
+        if let Some(choice) = choice(e) {
+            return self.choice_stmt(choice, tail, out);
+        }
+        if let Tail::Assign(target) = tail {
+            let v = self.expr(e);
+            let assign = StatKind::Assign {
+                targets: vec![target.clone()],
+                exprs: vec![v],
+            };
+            out.push(stat(assign, span));
+            return;
+        }
         match &e.kind {
-            rb::ExprKind::If(if_) => return self.if_stmt(if_, e.span, tail, out),
-            rb::ExprKind::Case(case) => return self.case_stmt(case, e.span, tail, out),
             rb::ExprKind::MethodCall {
                 recv,
                 name,
@@ -493,7 +640,9 @@ impl<'a> Translator<'a> {
                 return;
             }
             // `CONST.freeze` does nothing: top-level values are frozen anyway (§4.1).
-            rb::ExprKind::Field { recv, name } if name.node == "freeze" && tail == Tail::None => {
+            rb::ExprKind::Field { recv, name }
+                if name.node == "freeze" && matches!(tail, Tail::None) =>
+            {
                 self.expr(recv);
                 return;
             }
@@ -501,7 +650,7 @@ impl<'a> Translator<'a> {
         }
         let before = self.error_count();
         let v = self.expr(e);
-        if tail == Tail::Return {
+        if matches!(tail, Tail::Return) {
             *ret = Some(RetStat {
                 exprs: vec![v],
                 span,
@@ -518,6 +667,52 @@ impl<'a> Translator<'a> {
         }
     }
 
+    /// An `if`, `unless`, `case`, or `?:` as a statement, whose branches each take `tail`: at the
+    /// end of a body, each returns its value; as the whole right side of an assignment whose
+    /// branches hold statements, each assigns it (`SPEC-RUBY.md` §4.4).
+    fn choice_stmt(&mut self, choice: &rb::Expr, tail: Tail, out: &mut Vec<Stat>) {
+        let span = choice.span;
+        match &choice.kind {
+            rb::ExprKind::If(if_) => self.if_stmt(if_, span, tail, out),
+            rb::ExprKind::Case(case) => self.case_stmt(case, span, tail, out),
+            rb::ExprKind::Ternary { cond, then, els } => {
+                let cond = self.expr(cond);
+                let then = self.branch(then, tail);
+                let els = self.branch(els, tail);
+                out.push(stat(
+                    StatKind::If {
+                        arms: vec![(cond, then)],
+                        else_block: Some(els),
+                    },
+                    span,
+                ));
+            }
+            _ => unreachable!("`choice` finds only these"),
+        }
+    }
+
+    /// A branch of `?:` as a block of its own.
+    fn branch(&mut self, e: &rb::Expr, tail: Tail) -> Block {
+        let mut stats = Vec::new();
+        let mut ret = None;
+        self.expr_stmt(e, e.span, tail, &mut stats, &mut ret);
+        Block {
+            stats,
+            ret,
+            span: e.span,
+        }
+    }
+
+    /// The `else` of an `if` or `case` statement, which Ruby gives the value `nil` when it is
+    /// left out.
+    fn else_block(&mut self, body: Option<&rb::Body>, span: Span, tail: Tail) -> Option<Block> {
+        match (body, tail) {
+            (Some(body), _) => Some(self.body(body, None, tail)),
+            (None, Tail::Assign(target)) => Some(nil_block(target, span)),
+            (None, _) => None,
+        }
+    }
+
     fn if_stmt(&mut self, if_: &rb::If, span: Span, tail: Tail, out: &mut Vec<Stat>) {
         let mut arms = Vec::new();
         for (c, body) in &if_.arms {
@@ -529,60 +724,72 @@ impl<'a> Translator<'a> {
             };
             arms.push((cond, self.body(body, None, tail)));
         }
-        let else_block = if_.else_body.as_ref().map(|b| self.body(b, None, tail));
+        let else_block = self.else_block(if_.else_body.as_ref(), span, tail);
         out.push(stat(StatKind::If { arms, else_block }, span));
+    }
+
+    /// The name a `case` reads its subject by again for each `when`: the subject's own, if it is
+    /// a local or a constant, which the tests can't change.
+    fn reread(&self, subject: &rb::Expr) -> Option<String> {
+        match &subject.kind {
+            rb::ExprKind::Name(n) if self.scopes.locals.contains(&subject.span) => Some(n.clone()),
+            rb::ExprKind::Const(n) => Some(n.clone()),
+            _ => None,
+        }
+    }
+
+    /// What a `when` tests of the subject read as `reread` at `at`: `x == a or x == b`, and
+    /// `x >= lo and x <= hi` for a range. `None` if the `when` is too long to translate.
+    fn when_test(&mut self, when: &rb::When, reread: &str, at: Span) -> Option<Expr> {
+        if when.values.len() > MAX_CHAIN {
+            self.diags.push(crate::parser::too_deeply_nested(when.span));
+            return None;
+        }
+        let mut cond: Option<Expr> = None;
+        for v in &when.values {
+            let test = match &v.kind {
+                rb::ExprKind::Range { lo, hi, exclusive } => {
+                    let (lo_e, hi_e) = (self.expr(lo), self.expr(hi));
+                    let upper = if *exclusive { BinOp::Lt } else { BinOp::Le };
+                    binary(
+                        BinOp::And,
+                        binary(BinOp::Ge, name(reread, at), lo_e, lo.span),
+                        binary(upper, name(reread, at), hi_e, hi.span),
+                        v.span,
+                    )
+                }
+                _ => {
+                    let value = self.expr(v);
+                    binary(BinOp::Eq, name(reread, at), value, v.span)
+                }
+            };
+            cond = Some(match cond {
+                None => test,
+                Some(prev) => {
+                    let span = prev.span.to(test.span);
+                    binary(BinOp::Or, prev, test, span)
+                }
+            });
+        }
+        cond
     }
 
     /// `case x when a, b … when lo..hi … else … end`: an `if` chain testing `x == a or x == b`,
     /// then `x >= lo and x <= hi` (`SPEC-RUBY.md` §4.4). A local or constant subject is read
     /// again for each `when`; any other is evaluated once, into a temporary.
     fn case_stmt(&mut self, case: &rb::Case, span: Span, tail: Tail, out: &mut Vec<Stat>) {
-        let direct = match &case.subject.kind {
-            rb::ExprKind::Name(n) if self.scopes.locals.contains(&case.subject.span) => {
-                Some(n.clone())
-            }
-            rb::ExprKind::Const(n) => Some(n.clone()),
-            _ => None,
-        };
+        let direct = self.reread(&case.subject);
         let subject = self.expr(&case.subject);
         let reread = direct.as_deref().unwrap_or(CASE_SUBJECT);
         let mut arms = Vec::new();
         for when in &case.whens {
             let at = keyword(when.span, 4);
-            if when.values.len() > MAX_CHAIN {
-                self.diags.push(crate::parser::too_deeply_nested(when.span));
+            let Some(cond) = self.when_test(when, reread, at) else {
                 continue;
-            }
-            let mut cond: Option<Expr> = None;
-            for v in &when.values {
-                let test = match &v.kind {
-                    rb::ExprKind::Range { lo, hi, exclusive } => {
-                        let (lo_e, hi_e) = (self.expr(lo), self.expr(hi));
-                        let upper = if *exclusive { BinOp::Lt } else { BinOp::Le };
-                        binary(
-                            BinOp::And,
-                            binary(BinOp::Ge, name(reread, at), lo_e, lo.span),
-                            binary(upper, name(reread, at), hi_e, hi.span),
-                            v.span,
-                        )
-                    }
-                    _ => {
-                        let value = self.expr(v);
-                        binary(BinOp::Eq, name(reread, at), value, v.span)
-                    }
-                };
-                cond = Some(match cond {
-                    None => test,
-                    Some(prev) => {
-                        let span = prev.span.to(test.span);
-                        binary(BinOp::Or, prev, test, span)
-                    }
-                });
-            }
-            let Some(cond) = cond else { continue };
+            };
             arms.push((cond, self.body(&when.body, None, tail)));
         }
-        let else_block = case.else_body.as_ref().map(|b| self.body(b, None, tail));
+        let else_block = self.else_block(case.else_body.as_ref(), span, tail);
         let chain = stat(StatKind::If { arms, else_block }, span);
         if direct.is_some() {
             out.push(chain);
@@ -610,11 +817,20 @@ impl<'a> Translator<'a> {
         span: Span,
         out: &mut Vec<Stat>,
     ) {
+        if let ([target], [value]) = (targets, values)
+            && let Some(choice) = choice(value)
+            && !self.cond_ok(choice, true)
+        {
+            return self.assign_by_branch(target, choice, out);
+        }
         // The scope analysis declares every target of an assignment in place, or none.
         let declare = targets.iter().all(|t| {
             matches!(t.kind, rb::ExprKind::Name(_)) && self.scopes.in_place.contains(&t.span)
         });
-        let exprs: Vec<Expr> = values.iter().map(|v| self.expr(v)).collect();
+        let exprs: Vec<Expr> = match values {
+            [value] => vec![self.rhs(value, out)],
+            _ => values.iter().map(|v| self.expr(v)).collect(),
+        };
         if declare {
             let names = targets
                 .iter()
@@ -627,6 +843,158 @@ impl<'a> Translator<'a> {
         } else {
             let targets = targets.iter().map(|t| self.target(t)).collect();
             out.push(stat(StatKind::Assign { targets, exprs }, span));
+        }
+    }
+
+    /// The whole right side of an assignment. A `case` there whose subject it can't read again
+    /// evaluates the subject once, into a temporary declared just before the assignment: the
+    /// right side is evaluated before the target anyway.
+    fn rhs(&mut self, value: &rb::Expr, out: &mut Vec<Stat>) -> Expr {
+        if let Some(choice) = choice(value)
+            && let rb::ExprKind::Case(case) = &choice.kind
+            && self.reread(&case.subject).is_none()
+        {
+            self.temps += 1;
+            let temp = format!("{CASE_SUBJECT}{}", self.temps);
+            let subject = self.expr(&case.subject);
+            out.push(stat(
+                StatKind::Local {
+                    names: vec![ident(&temp, keyword(choice.span, 4))],
+                    exprs: vec![subject],
+                },
+                case.subject.span,
+            ));
+            return self.case_value(case, choice.span, Some(&temp));
+        }
+        self.expr(value)
+    }
+
+    /// `x = if … end` whose branches hold statements: the assignment moves into each branch,
+    /// which assigns its last expression (`SPEC-RUBY.md` §4.4). A local this declares is
+    /// declared first, with no value, so it is optional, as a hoisted local is (§4.3).
+    fn assign_by_branch(&mut self, target: &rb::Expr, choice: &rb::Expr, out: &mut Vec<Stat>) {
+        if let rb::ExprKind::Name(n) = &target.kind
+            && self.scopes.in_place.contains(&target.span)
+        {
+            out.push(declare(vec![ident(n, target.span)]));
+        }
+        let target = self.target(target);
+        self.choice_stmt(choice, Tail::Assign(&target), out);
+    }
+
+    /// Whether the `if`, `unless`, `case`, or `?:` `choice` can be a conditional expression:
+    /// every branch, and every branch of a choice that is one, a single expression or none, and
+    /// every `case` subject one it can read again — except the outermost's, when `outer`, which
+    /// the whole right side of an assignment evaluates into a temporary ([`Self::rhs`]).
+    fn cond_ok(&self, c: &rb::Expr, outer: bool) -> bool {
+        let branch = |e: &rb::Expr| choice(e).is_none_or(|c| self.cond_ok(c, false));
+        let body = |b: &rb::Body| match b.stmts.as_slice() {
+            [] => true,
+            [
+                rb::Stmt {
+                    kind: rb::StmtKind::Expr(e),
+                    ..
+                },
+            ] => branch(e),
+            _ => false,
+        };
+        match &c.kind {
+            rb::ExprKind::Ternary { then, els, .. } => branch(then) && branch(els),
+            rb::ExprKind::If(if_) => {
+                if_.arms.iter().all(|(_, b)| body(b)) && if_.else_body.as_ref().is_none_or(body)
+            }
+            rb::ExprKind::Case(case) => {
+                (outer || self.reread(&case.subject).is_some())
+                    && case.whens.iter().all(|w| body(&w.body))
+                    && case.else_body.as_ref().is_none_or(body)
+            }
+            _ => true,
+        }
+    }
+
+    /// An `if` or `unless` used as a value: a conditional expression per arm, the last one's
+    /// `else` the `else` branch, or `nil` without one (`SPEC-RUBY.md` §4.4).
+    fn if_value(&mut self, if_: &rb::If, span: Span) -> Expr {
+        if if_.arms.len() > MAX_CHAIN {
+            self.diags.push(crate::parser::too_deeply_nested(span));
+            return expr(ExprKind::Nil, span);
+        }
+        let mut arms = Vec::new();
+        for (c, body) in &if_.arms {
+            let cond = self.expr(c);
+            let cond = if if_.unless {
+                negate(cond, c.span)
+            } else {
+                cond
+            };
+            arms.push((cond, self.body_value(body), c.span));
+        }
+        let els = match &if_.else_body {
+            Some(body) => self.body_value(body),
+            None => expr(ExprKind::Nil, span),
+        };
+        chain(arms, els, span)
+    }
+
+    /// A `case` used as a value: a conditional expression per `when`. The subject is read again
+    /// for each, by its own name or, when `temp` names one, from that temporary.
+    fn case_value(&mut self, case: &rb::Case, span: Span, temp: Option<&str>) -> Expr {
+        let reread = match temp
+            .map(str::to_string)
+            .or_else(|| self.reread(&case.subject))
+        {
+            Some(reread) => reread,
+            None => {
+                self.error(
+                    "E0609",
+                    "a `case` used as a value here reads its subject again for each `when`, so the \
+                     subject must be a local or a constant; assign it to a local first, or make \
+                     the `case` the whole right side of an assignment or a `return`",
+                    case.subject.span,
+                );
+                return expr(ExprKind::Nil, span);
+            }
+        };
+        if case.whens.len() > MAX_CHAIN {
+            self.diags.push(crate::parser::too_deeply_nested(span));
+            return expr(ExprKind::Nil, span);
+        }
+        let mut arms = Vec::new();
+        for when in &case.whens {
+            let at = keyword(when.span, 4);
+            let Some(cond) = self.when_test(when, &reread, at) else {
+                continue;
+            };
+            arms.push((cond, self.body_value(&when.body), when.span));
+        }
+        let els = match &case.else_body {
+            Some(body) => self.body_value(body),
+            None => expr(ExprKind::Nil, span),
+        };
+        chain(arms, els, span)
+    }
+
+    /// The value of a branch of an `if` or `case` used as a value, which is one expression, or
+    /// `nil` for an empty branch.
+    fn body_value(&mut self, body: &rb::Body) -> Expr {
+        match body.stmts.as_slice() {
+            [] => expr(ExprKind::Nil, body.span),
+            [
+                rb::Stmt {
+                    kind: rb::StmtKind::Expr(e),
+                    ..
+                },
+            ] => self.expr(e),
+            [first, ..] => {
+                self.error(
+                    "E0609",
+                    "each branch of an `if` or `case` used as a value here must be one \
+                     expression; its branches may hold statements only where it is the whole \
+                     right side of an assignment or a `return`",
+                    first.span,
+                );
+                expr(ExprKind::Nil, body.span)
+            }
         }
     }
 
@@ -785,7 +1153,7 @@ impl<'a> Translator<'a> {
                     let start = self.expr(recv);
                     let mut args = self.pos_args(args).into_iter();
                     let end = args.next().unwrap_or_else(|| number(0.0, method.span));
-                    (start, end, args.next())
+                    (start, end, args.next().map(Box::new))
                 }
             };
             let body = self.body(&block.body, Some(block.span), Tail::None);
@@ -992,11 +1360,14 @@ impl<'a> Translator<'a> {
                     rb::UnOp::Not => negate(v, span),
                 };
             }
-            rb::ExprKind::Ternary { .. } => return self.not_yet("`?:`", span),
-            rb::ExprKind::If(_) => {
-                return self.not_yet("an `if` or `unless` used as a value", span);
+            rb::ExprKind::Ternary { cond, then, els } => {
+                let cond = self.expr(cond);
+                let then = self.expr(then);
+                let els = self.expr(els);
+                return cond_expr(cond, then, els, span);
             }
-            rb::ExprKind::Case(_) => return self.not_yet("a `case` used as a value", span),
+            rb::ExprKind::If(if_) => return self.if_value(if_, span),
+            rb::ExprKind::Case(case) => return self.case_value(case, span, None),
             rb::ExprKind::Paren(inner) => ExprKind::Paren(Box::new(self.expr(inner))),
         };
         expr(kind, span)
@@ -1144,6 +1515,7 @@ impl<'a> Translator<'a> {
             params: block.params.clone(),
             block: self.body(&block.body, Some(block.span), Tail::Return),
             span: block.span,
+            fallthrough: Fallthrough::Nil,
         }
     }
 

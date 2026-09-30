@@ -61,6 +61,11 @@ fn loops() {
 }
 
 #[test]
+fn control() {
+    assert_twins("control", &TypeConfig::default(), &RubyConfig::new());
+}
+
+#[test]
 fn data() {
     let mut fields = BTreeMap::new();
     fields.insert("hp".to_string(), Type::Number);

@@ -73,6 +73,9 @@ Reserved-but-unsupported (tokenized as keywords, but rejected with a "not suppor
 Grindlang" diagnostic wherever they appear): `goto` and Lua's label syntax `::name::`;
 `repeat` / `until` (the `repeat … until` loop is not supported — use `while`).
 
+`continue` (from Luau) is not reserved: as in Luau, it is the `continue` statement (§3.3) where
+a statement starts with it and doesn't call or assign it, and an ordinary name everywhere else.
+
 ### 2.5 Numbers
 All numeric literals denote `f64`. Accepted forms (Lua-compatible):
 - decimal integer / float: `3`, `3.0`, `0.5`, `.5`, `3.`, `1e3`, `2.5E-4`
@@ -209,6 +212,7 @@ stat ::= ';'
        | numericfor
        | genericfor
        | 'break'
+       | 'continue'
        | 'local' 'function' Name funcbody
 
 numericfor ::= 'for' Name '=' exp ',' exp [',' exp] 'do' block 'end'
@@ -234,6 +238,11 @@ explist    ::= exp {',' exp}
   starts**; each element or value is read when the loop reaches it. Writes made earlier in the
   body are therefore observed, but appending to the array or adding a key does not extend the
   loop, so iteration always terminates.
+- `break` leaves the innermost loop, and `continue` (Luau's) goes on to its next pass: a `while`
+  loop tests its condition again, a `numericfor` adds its step, and a `genericfor` takes the next
+  index or key. Either may appear anywhere in the loop's body, nested blocks included; outside a
+  loop each is an error (`E0306`, `E0311`), and a function literal is a function of its own, so a
+  loop around it doesn't count.
 
 ```ebnf
 iterexpr ::= 'ipairs' '(' exp ')'
@@ -330,6 +339,13 @@ that never is (a number, a string, a table, …) is an `E0456` error, since `and
 yield its right operand and `or` never would. An optional operand whose type only later code
 settles (a `local x = nil` assigned further down) is taken to be `nil` when falsy; if it turns
 out to be a `bool?`, which can also be `false`, that is an `E0455` error.
+
+**The conditional expression** picks one of two values by a `bool` condition, and evaluates
+only the branch it picks. The Lua surface has no spelling for it — `c and a or b` is not one,
+since it yields `b` when `a` is `nil` or `false` — and the Ruby surface writes it `c ? a : b`, or
+as an `if` or `case` used as a value (SPEC-RUBY.md §4.4). Its type joins the two branches as
+`or` joins its operands: two `T`s give a `T`, a `T` and `nil` a `T?`, and branches with no one
+type are an `E0455` error. Its condition narrows the branches as an `if`'s does (§5.3).
 
 **Conditions must be `bool`.** Unlike Lua, `if` and `while` require a `bool`; there is no
 implicit "everything except `nil`/`false` is truthy" coercion of arbitrary types. `and`/`or`
@@ -464,6 +480,8 @@ function best_name(items)
 end
 ```
 
+A conditional expression's condition (§3.5) narrows its two branches the same way.
+
 A narrowing lasts to the end of its branch, or until the place, or a record it is a field of,
 is assigned. After the whole `if`, a place an enclosing guard narrowed stays narrowed only if
 no branch assigned it. Narrowing is syntactic: a condition narrows only when it is one of the
@@ -491,6 +509,15 @@ it.
   may do either, and the call then returns `nil`. The check follows the structure of the code:
   an `if` returns on every path only when it has an `else` and every branch returns, a
   `while true` loop with no `break` never finishes, and any other loop may run zero times.
+- **Where a path without a value returns `nil`.** Another surface can give a function that
+  rule instead (`ast::FuncBody::fallthrough`); the Ruby surface gives it to all of its functions
+  (SPEC-RUBY.md §4.2), since every Ruby method returns a value. In a function that returns a value
+  on some path, a bare `return`, reaching the closing `end`, and returning a call to a function
+  that returns nothing then each return `nil`, which makes the return type optional, as a
+  `return nil` there would. A function none of whose paths gives a value still returns nothing.
+  Which calls return nothing is settled for every top-level function from its `return`s alone,
+  before any body is checked, so the outcome doesn't depend on the order of the code. A return
+  type declared with `---@return`, or a tuple, which can't be `nil`, keeps `E0480`.
 - A function **returns nothing** (its return type is `()`) when none of its `return`s gives a
   value, or when it returns a call to such a function: `return f()` calls `f` and then returns
   no value, as in Lua. The host calling it gets `nil`, as from a bare `return`. In a script, a
@@ -739,6 +766,7 @@ Each produces a targeted, span-pointing error:
 
 - a function assigning a module variable (`E0308`) or writing through a module value (`E0307`);
   `return` in top-level code (`E0309`); host memory in top-level code (`E0310`) — §3.1
+- `break` or `continue` outside a loop (`E0306`, `E0311`) — §3.3
 - `local M = {} … return M` idiom (use implicit exports)
 - free global read/write; `_G`, `_ENV`
 - `goto` / labels; varargs `...`; `repeat … until` loops
@@ -811,6 +839,10 @@ both read/write persistent memory.
 - **Array indexing always yields `T?`** — no static bounds analysis; narrow per-access or
   iterate with `ipairs` (§5.4).
 - **`repeat … until` is not supported**; **`//` floor-division is supported** (§3.3, §3.5, §8).
+- **`continue` is Luau's**, a statement only where Luau makes it one, so `continue` stays usable
+  as a name (§2.4, §3.3). **The conditional expression has no Lua spelling** (§3.5): the Ruby
+  surface needs one, and adding Luau's `if … then … else` expressions to the Lua surface waits for
+  a script that wants them.
 - **Multi-return is "Tier A"** (§5.5): a `return`-list builds a tuple, consumed only by a
   parallel binding/assignment or a pass-through `return`, with **exact arity** (no Lua-style
   truncate/pad, no spreading into argument lists, no value-count adjustment). A multi-value
