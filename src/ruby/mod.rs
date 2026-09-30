@@ -9,6 +9,7 @@
 //! both. Translation rejects what needs more than syntax to rule out (`E052x`, `E06xx`).
 
 pub mod ast;
+mod collect;
 mod desugar;
 pub mod lexer;
 mod methods;

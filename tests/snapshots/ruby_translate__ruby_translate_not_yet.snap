@@ -1,9 +1,0 @@
----
-source: tests/ruby_translate.rs
-expression: rendered
----
-error[E0699]: the collection method `map` is not supported yet: it is planned for a later step of the Ruby surface
-  --> 2:11
-   |
-  2|   ys = xs.map { |x| x * 2 }
-   |           ^^^

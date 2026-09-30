@@ -23,7 +23,8 @@
 //! - a `case` subject, read again for each `when`, takes that `when` keyword's span, and the
 //!   temporary one is evaluated into, that `case` keyword's;
 //! - a hoisted `local x`, or one declared before an assignment that moves into the branches of
-//!   an `if`, takes the span of `x` in its first assignment, which is a use of the same local.
+//!   an `if`, takes the span of `x` in its first assignment, which is a use of the same local;
+//! - a collection method's temporary and loop variables are placed as `collect.rs` says.
 //!
 //! Only names are looked up by span, so a call may share the span of the name it calls, and a
 //! builtin's `math.abs` the span of its `math`. The one other node keyed by span is the
@@ -80,6 +81,9 @@ pub(super) fn translate(
         diags: Diagnostics::new(),
         in_def: false,
         temps: 0,
+        chain: Vec::new(),
+        loops: Vec::new(),
+        collecting: None,
     };
     let module = t.program(program);
     if t.diags.has_errors() {
@@ -110,9 +114,16 @@ pub(super) struct Translator<'a> {
     pub(super) diags: Diagnostics,
     /// Whether the code being translated is in a `def`, including a block or lambda in one.
     pub(super) in_def: bool,
-    /// How many `case` subjects have been evaluated into a temporary of their own, which
-    /// numbers the next one.
+    /// How many numbered temporaries have been made ([`Self::temp`]).
     temps: u32,
+    /// The collection method calls starting the method chain of the value being translated, by
+    /// span, which may become loops ([`Self::value`]).
+    pub(super) chain: Vec<Span>,
+    /// The loops those calls have become so far, which go before the statement holding them.
+    pub(super) loops: Vec<Stat>,
+    /// The collection method whose block is the innermost loop being translated, if it is one:
+    /// `next` and `break` directly in it are `E0611`.
+    pub(super) collecting: Option<&'static str>,
 }
 
 // ---- building nodes ------------------------------------------------------------------------
@@ -199,7 +210,7 @@ fn cond_expr(cond: Expr, then: Expr, els: Expr, span: Span) -> Expr {
     )
 }
 
-fn stat(kind: StatKind, span: Span) -> Stat {
+pub(super) fn stat(kind: StatKind, span: Span) -> Stat {
     Stat { kind, span }
 }
 
@@ -238,8 +249,18 @@ fn choice(e: &rb::Expr) -> Option<&rb::Expr> {
     }
 }
 
+/// The jump `s` is, if it is one: `return`, `break`, or `next`.
+pub(super) fn jump(s: &rb::Stmt) -> Option<&'static str> {
+    match s.kind {
+        rb::StmtKind::Return(_) => Some("return"),
+        rb::StmtKind::Break => Some("break"),
+        rb::StmtKind::Next => Some("next"),
+        _ => None,
+    }
+}
+
 /// `local a, b` with no values.
-fn declare(names: Vec<Ident>) -> Stat {
+pub(super) fn declare(names: Vec<Ident>) -> Stat {
     let span = names[0].span;
     stat(
         StatKind::Local {
@@ -252,7 +273,7 @@ fn declare(names: Vec<Ident>) -> Stat {
 
 /// The logical negation of a condition: `a == b` and `a ~= b` swap, `not not c` is `c`, so
 /// `unless x.nil?` is `x ~= nil` (`SPEC-RUBY.md` §4.8). Conditions are `bool`, so each is exact.
-fn negate(e: Expr, span: Span) -> Expr {
+pub(super) fn negate(e: Expr, span: Span) -> Expr {
     match e.kind {
         ExprKind::Binary {
             op: op @ (BinOp::Eq | BinOp::Ne),
@@ -295,17 +316,23 @@ impl<'a> Translator<'a> {
         self.diags.iter().count()
     }
 
-    /// A form a later step of the Ruby surface translates (`PLAN.md` Phase 10). Returns a
-    /// placeholder.
-    pub(super) fn not_yet(&mut self, what: &str, span: Span) -> Expr {
-        self.error(
-            "E0699",
-            format!(
-                "{what} is not supported yet: it is planned for a later step of the Ruby surface"
-            ),
-            span,
-        );
-        expr(ExprKind::Nil, span)
+    /// A new temporary's name, `what#N`, which no Ruby name can be.
+    pub(super) fn temp(&mut self, what: &str) -> String {
+        self.temps += 1;
+        format!("{what}#{}", self.temps)
+    }
+
+    /// Translate the body of a loop or lambda with `f`, where `collecting` is the collection
+    /// method whose block it is, if it is one.
+    pub(super) fn within<T>(
+        &mut self,
+        collecting: Option<&'static str>,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let outer = std::mem::replace(&mut self.collecting, collecting);
+        let result = f(self);
+        self.collecting = outer;
+        result
     }
 
     // ---- top level ---------------------------------------------------------------------------
@@ -455,12 +482,7 @@ impl<'a> Translator<'a> {
                 &mut stats,
                 &mut ret,
             );
-            let jump = match s.kind {
-                rb::StmtKind::Return(_) => "return",
-                rb::StmtKind::Break => "break",
-                rb::StmtKind::Next => "next",
-                _ => continue,
-            };
+            let Some(jump) = jump(s) else { continue };
             if !last {
                 self.error(
                     "E0606",
@@ -489,7 +511,13 @@ impl<'a> Translator<'a> {
         }
     }
 
-    fn stmt(&mut self, s: &rb::Stmt, tail: Tail, out: &mut Vec<Stat>, ret: &mut Option<RetStat>) {
+    pub(super) fn stmt(
+        &mut self,
+        s: &rb::Stmt,
+        tail: Tail,
+        out: &mut Vec<Stat>,
+        ret: &mut Option<RetStat>,
+    ) {
         let span = s.span;
         // A branch whose value is assigned ends in an expression, a jump, or `stmt if c`.
         if let Tail::Assign(_) = tail
@@ -521,16 +549,37 @@ impl<'a> Translator<'a> {
             rb::StmtKind::While { cond, body, until } => {
                 let c = self.expr(cond);
                 let cond = if *until { negate(c, cond.span) } else { c };
-                let body = self.body(body, None, Tail::None);
+                let body = self.within(None, |t| t.body(body, None, Tail::None));
                 out.push(stat(StatKind::While { cond, body }, span));
             }
             rb::StmtKind::Loop(body) => {
                 let cond = expr(ExprKind::Bool(true), keyword(span, 4));
-                let body = self.body(body, None, Tail::None);
+                let body = self.within(None, |t| t.body(body, None, Tail::None));
                 out.push(stat(StatKind::While { cond, body }, span));
             }
-            rb::StmtKind::Break => out.push(stat(StatKind::Break, span)),
-            rb::StmtKind::Next => out.push(stat(StatKind::Continue, span)),
+            rb::StmtKind::Break | rb::StmtKind::Next => {
+                let word = jump(s).expect("a jump");
+                if let Some(m) = self.collecting {
+                    let msg = if word == "next" {
+                        format!(
+                            "`next` can't end a pass of `{m}`'s block: Ruby would give the block \
+                             the value `nil`. Give it its value with `if` or `?:` instead"
+                        )
+                    } else {
+                        format!(
+                            "`break` can't leave `{m}`'s block: Ruby would make `{m}` give `nil`. \
+                             To stop early, loop with `each` and assign to a local"
+                        )
+                    };
+                    self.error("E0611", msg, span);
+                }
+                let kind = if word == "next" {
+                    StatKind::Continue
+                } else {
+                    StatKind::Break
+                };
+                out.push(stat(kind, span));
+            }
             rb::StmtKind::Return(values) => {
                 // `return` of a choice returns from each branch, and returns nothing after one
                 // that gives no value, as a bare `return` does (§4.4).
@@ -553,7 +602,10 @@ impl<'a> Translator<'a> {
                     out.extend(block.stats);
                     return;
                 }
-                let exprs = values.iter().map(|v| self.expr(v)).collect();
+                let exprs = match values.as_slice() {
+                    [value] => vec![self.value(value, out)],
+                    _ => values.iter().map(|v| self.expr(v)).collect(),
+                };
                 *ret = Some(RetStat { exprs, span });
             }
             rb::StmtKind::Modified {
@@ -581,7 +633,7 @@ impl<'a> Translator<'a> {
                         ));
                     }
                     rb::Modifier::While | rb::Modifier::Until => {
-                        let body = self.single(inner, Tail::None);
+                        let body = self.within(None, |t| t.single(inner, Tail::None));
                         out.push(stat(StatKind::While { cond, body }, span));
                     }
                 }
@@ -601,7 +653,7 @@ impl<'a> Translator<'a> {
             return self.choice_stmt(choice, tail, out);
         }
         if let Tail::Assign(target) = tail {
-            let v = self.expr(e);
+            let v = self.value(e, out);
             let assign = StatKind::Assign {
                 targets: vec![target.clone()],
                 exprs: vec![v],
@@ -648,14 +700,17 @@ impl<'a> Translator<'a> {
             }
             _ => {}
         }
-        let before = self.error_count();
-        let v = self.expr(e);
         if matches!(tail, Tail::Return) {
+            let v = self.value(e, out);
             *ret = Some(RetStat {
                 exprs: vec![v],
                 span,
             });
-        } else if matches!(v.kind, ExprKind::Call { .. } | ExprKind::MethodCall { .. }) {
+            return;
+        }
+        let before = self.error_count();
+        let v = self.expr(e);
+        if matches!(v.kind, ExprKind::Call { .. } | ExprKind::MethodCall { .. }) {
             out.push(stat(StatKind::Call(v), span));
         } else if self.error_count() == before {
             self.error(
@@ -779,7 +834,9 @@ impl<'a> Translator<'a> {
     /// again for each `when`; any other is evaluated once, into a temporary.
     fn case_stmt(&mut self, case: &rb::Case, span: Span, tail: Tail, out: &mut Vec<Stat>) {
         let direct = self.reread(&case.subject);
-        let subject = self.expr(&case.subject);
+        // The subject is evaluated first, so it may be a collection method (`collect.rs`).
+        let mut stats = Vec::new();
+        let subject = self.value(&case.subject, &mut stats);
         let reread = direct.as_deref().unwrap_or(CASE_SUBJECT);
         let mut arms = Vec::new();
         for when in &case.whens {
@@ -802,8 +859,9 @@ impl<'a> Translator<'a> {
             },
             case.subject.span,
         );
+        stats.extend([temp, chain]);
         let block = Block {
-            stats: vec![temp, chain],
+            stats,
             ret: None,
             span,
         };
@@ -846,17 +904,16 @@ impl<'a> Translator<'a> {
         }
     }
 
-    /// The whole right side of an assignment. A `case` there whose subject it can't read again
-    /// evaluates the subject once, into a temporary declared just before the assignment: the
-    /// right side is evaluated before the target anyway.
-    fn rhs(&mut self, value: &rb::Expr, out: &mut Vec<Stat>) -> Expr {
+    /// The whole right side of an assignment, or a block's value. A `case` there whose subject
+    /// it can't read again evaluates the subject once, into a temporary declared just before
+    /// the assignment: the right side is evaluated before the target anyway.
+    pub(super) fn rhs(&mut self, value: &rb::Expr, out: &mut Vec<Stat>) -> Expr {
         if let Some(choice) = choice(value)
             && let rb::ExprKind::Case(case) = &choice.kind
             && self.reread(&case.subject).is_none()
         {
-            self.temps += 1;
-            let temp = format!("{CASE_SUBJECT}{}", self.temps);
-            let subject = self.expr(&case.subject);
+            let temp = self.temp("case");
+            let subject = self.value(&case.subject, out);
             out.push(stat(
                 StatKind::Local {
                     names: vec![ident(&temp, keyword(choice.span, 4))],
@@ -866,7 +923,7 @@ impl<'a> Translator<'a> {
             ));
             return self.case_value(case, choice.span, Some(&temp));
         }
-        self.expr(value)
+        self.value(value, out)
     }
 
     /// `x = if … end` whose branches hold statements: the assignment moves into each branch,
@@ -883,11 +940,13 @@ impl<'a> Translator<'a> {
     }
 
     /// Whether the `if`, `unless`, `case`, or `?:` `choice` can be a conditional expression:
-    /// every branch, and every branch of a choice that is one, a single expression or none, and
-    /// every `case` subject one it can read again — except the outermost's, when `outer`, which
-    /// the whole right side of an assignment evaluates into a temporary ([`Self::rhs`]).
+    /// every branch, and every branch of a choice that is one, a single expression or none that
+    /// needs no loop before it (`collect.rs`), and every `case` subject one it can read again —
+    /// except the outermost's, when `outer`, which the whole right side of an assignment
+    /// evaluates into a temporary ([`Self::rhs`]).
     fn cond_ok(&self, c: &rb::Expr, outer: bool) -> bool {
-        let branch = |e: &rb::Expr| choice(e).is_none_or(|c| self.cond_ok(c, false));
+        let branch =
+            |e: &rb::Expr| !self.collects(e) && choice(e).is_none_or(|c| self.cond_ok(c, false));
         let body = |b: &rb::Body| match b.stmts.as_slice() {
             [] => true,
             [
@@ -1080,15 +1139,8 @@ impl<'a> Translator<'a> {
     ) {
         let m = method.node.as_str();
         // A range receiver counts, as `(a..b).each` does.
-        let mut inner = recv;
-        while let rb::ExprKind::Paren(e) = &inner.kind {
-            inner = e;
-        }
-        let range = match &inner.kind {
-            rb::ExprKind::Range { lo, hi, exclusive } if m == "each" => Some((lo, hi, *exclusive)),
-            _ => None,
-        };
-        let counting = range.is_some() || matches!(m, "times" | "upto" | "step");
+        let range = m == "each" && self.is_range(recv);
+        let counting = range || matches!(m, "times" | "upto" | "step");
         let want_args = match m {
             "upto" => 1,
             "step" => 2,
@@ -1134,29 +1186,20 @@ impl<'a> Translator<'a> {
         };
 
         if counting {
-            let (start, end, step) = match range {
-                Some((lo, hi, exclusive)) => {
-                    let (start, hi_e) = (self.expr(lo), self.expr(hi));
-                    let end = if exclusive {
-                        binary(BinOp::Sub, hi_e, number(1.0, hi.span), hi.span)
-                    } else {
-                        hi_e
-                    };
-                    (start, end, None)
-                }
-                None if m == "times" => {
-                    let n = self.expr(recv);
-                    let end = binary(BinOp::Sub, n, number(1.0, method.span), recv.span);
-                    (number(0.0, method.span), end, None)
-                }
-                None => {
-                    let start = self.expr(recv);
-                    let mut args = self.pos_args(args).into_iter();
-                    let end = args.next().unwrap_or_else(|| number(0.0, method.span));
-                    (start, end, args.next().map(Box::new))
-                }
+            let (start, end, step) = if range {
+                let (start, end) = self.range(recv).expect("a range");
+                (start, end, None)
+            } else if m == "times" {
+                let n = self.value(recv, out);
+                let end = binary(BinOp::Sub, n, number(1.0, method.span), recv.span);
+                (number(0.0, method.span), end, None)
+            } else {
+                let start = self.value(recv, out);
+                let mut args = self.pos_args(args).into_iter();
+                let end = args.next().unwrap_or_else(|| number(0.0, method.span));
+                (start, end, args.next().map(Box::new))
             };
-            let body = self.body(&block.body, Some(block.span), Tail::None);
+            let body = self.within(None, |t| t.body(&block.body, Some(block.span), Tail::None));
             let var = var(0);
             out.push(stat(
                 StatKind::NumericFor {
@@ -1171,8 +1214,8 @@ impl<'a> Translator<'a> {
             return;
         }
 
-        let arg = self.expr(recv);
-        let mut body = self.body(&block.body, Some(block.span), Tail::None);
+        let arg = self.value(recv, out);
+        let mut body = self.within(None, |t| t.body(&block.body, Some(block.span), Tail::None));
         let (names, iter) = match (m, params.len()) {
             ("each", 2) | ("each_pair", _) => (
                 vec![var(0), var(1)],
@@ -1214,6 +1257,33 @@ impl<'a> Translator<'a> {
             ),
         };
         out.push(stat(StatKind::GenericFor { names, iter, body }, span));
+    }
+
+    /// Whether `recv` is a range, `(a..b)`, which a loop counts through.
+    fn is_range(&self, recv: &rb::Expr) -> bool {
+        match &recv.kind {
+            rb::ExprKind::Range { .. } => true,
+            rb::ExprKind::Paren(inner) => self.is_range(inner),
+            _ => false,
+        }
+    }
+
+    /// The first and last number of the range `recv` is, if it is one: `a..b` counts to `b`,
+    /// and `a...b` to `b - 1`.
+    pub(super) fn range(&mut self, recv: &rb::Expr) -> Option<(Expr, Expr)> {
+        match &recv.kind {
+            rb::ExprKind::Range { lo, hi, exclusive } => {
+                let (start, end) = (self.expr(lo), self.expr(hi));
+                let end = if *exclusive {
+                    binary(BinOp::Sub, end, number(1.0, hi.span), hi.span)
+                } else {
+                    end
+                };
+                Some((start, end))
+            }
+            rb::ExprKind::Paren(inner) => self.range(inner),
+            _ => None,
+        }
     }
 
     // ---- assignment targets --------------------------------------------------------------------
@@ -1271,8 +1341,10 @@ impl<'a> Translator<'a> {
             | rb::ExprKind::Number(_)
             | rb::ExprKind::Symbol(_) => true,
             rb::ExprKind::Str(parts) => parts.iter().all(|p| matches!(p, rb::StrPart::Text(_))),
+            // A collection method becoming a temporary (`collect.rs`) reads as one.
+            rb::ExprKind::MethodCall { .. } => self.in_chain(e),
             rb::ExprKind::Field { recv, name } => {
-                !super::methods::is_method(&name.node) && self.pure(recv)
+                self.in_chain(e) || (!super::methods::is_method(&name.node) && self.pure(recv))
             }
             rb::ExprKind::Index { base, index } => self.pure(base) && self.pure(index),
             rb::ExprKind::Paren(inner) => self.pure(inner),
@@ -1513,7 +1585,9 @@ impl<'a> Translator<'a> {
     fn lambda(&mut self, block: &rb::Block) -> FuncBody {
         FuncBody {
             params: block.params.clone(),
-            block: self.body(&block.body, Some(block.span), Tail::Return),
+            block: self.within(None, |t| {
+                t.body(&block.body, Some(block.span), Tail::Return)
+            }),
             span: block.span,
             fallthrough: Fallthrough::Nil,
         }

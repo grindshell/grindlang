@@ -61,7 +61,7 @@ impl Surface {
     pub fn array_loop(self) -> &'static str {
         match self {
             Surface::Lua => "`ipairs`",
-            Surface::Ruby => "`each` with one block parameter",
+            Surface::Ruby => "`each` with one block parameter (or `map`, `select`, `sum`, …)",
         }
     }
 

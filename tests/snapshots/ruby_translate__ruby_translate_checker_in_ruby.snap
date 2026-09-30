@@ -2,11 +2,23 @@
 source: tests/ruby_translate.rs
 expression: rendered
 ---
-error[E0412]: `each` with one block parameter expects an array, found map<string, number>
+error[E0412]: `each` with one block parameter (or `map`, `select`, `sum`, …) expects an array, found map<string, number>
   --> 4:3
    |
   4|   m.each { |v| t += v }
    |   ^
+
+error[E0412]: `each` with one block parameter (or `map`, `select`, `sum`, …) expects an array, found map<string, number>
+  --> 3:3
+   |
+  3|   m.sum
+   |   ^
+
+error[E0400]: condition must be a bool: expected bool, found number?; to test whether it is nil, write `unless x.nil?` or `if x.nil?`
+  --> 2:19
+   |
+  2|   xs.select { |x| x.to_f }
+   |                   ^^^^^^
 
 error[E0401]: expected a number: expected number, found string; to join strings, use interpolation: `"#{a}#{b}"`
   --> 4:3

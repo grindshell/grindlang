@@ -79,8 +79,31 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
-        "not_yet",
-        &[("def f(xs)\n  ys = xs.map { |x| x * 2 }\nend\n", "E0699")],
+        "collections",
+        &[
+            ("def f(xs)\n  1 + xs.sum\nend\n", "E0610"),
+            ("def f(xs)\n  g(xs.map { |x| x })\nend\n", "E0610"),
+            ("def f(xs)\n  xs.map { |x| x }\n  1\nend\n", "E0610"),
+            ("def f(xs)\n  t = 0\n  t += xs.sum\nend\n", "E0610"),
+            (
+                "def f(xs)\n  if xs.any? { |x| x > 1 }\n    1\n  end\nend\n",
+                "E0610",
+            ),
+            ("def f(xs)\n  n = xs.count\nend\n", "E0602"),
+            ("def f(xs)\n  ys = xs.map(1) { |x| x }\nend\n", "E0602"),
+            ("def f(xs)\n  ys = xs.map { |a, b| a }\nend\n", "E0602"),
+            ("def f(xs)\n  ys = xs.map { }\nend\n", "E0611"),
+            ("def f(xs)\n  ys = xs.map { |x| y = x }\nend\n", "E0611"),
+            (
+                "def f(xs)\n  ys = xs.select do |x|\n    next if x > 1\n    true\n  end\nend\n",
+                "E0611",
+            ),
+            ("def f(xs)\n  y = xs.find { |x| break }\nend\n", "E0611"),
+            (
+                "def f(xs)\n  ys = xs.map do |x|\n    return 1\n    x\n  end\nend\n",
+                "E0606",
+            ),
+        ],
     ),
     (
         "checker_in_ruby",
@@ -89,6 +112,11 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
                 "# @param m { [string]: number }\ndef f(m)\n  t = 0\n  m.each { |v| t += v }\n  t\nend\n",
                 "E0412",
             ),
+            (
+                "# @param m { [string]: number }\ndef f(m)\n  m.sum\nend\n",
+                "E0412",
+            ),
+            ("def f(xs)\n  xs.select { |x| x.to_f }\nend\n", "E0400"),
             (
                 "# @param a string\n# @param b string\ndef f(a, b)\n  a + b\nend\n",
                 "E0401",

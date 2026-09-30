@@ -1,0 +1,81 @@
+---
+source: tests/ruby_translate.rs
+expression: rendered
+---
+error[E0610]: `sum` runs a loop before its statement, so it must be the whole right side of an assignment, the value of a `return` or a block, or a loop's receiver, or start a method chain there; assign it to a local first
+  --> 2:10
+   |
+  2|   1 + xs.sum
+   |          ^^^
+
+error[E0610]: `map` runs a loop before its statement, so it must be the whole right side of an assignment, the value of a `return` or a block, or a loop's receiver, or start a method chain there; assign it to a local first
+  --> 2:8
+   |
+  2|   g(xs.map { |x| x })
+   |        ^^^
+
+error[E0610]: `map` runs a loop before its statement, so it must be the whole right side of an assignment, the value of a `return` or a block, or a loop's receiver, or start a method chain there; assign it to a local first
+  --> 2:6
+   |
+  2|   xs.map { |x| x }
+   |      ^^^
+
+error[E0610]: `sum` runs a loop before its statement, so it must be the whole right side of an assignment, the value of a `return` or a block, or a loop's receiver, or start a method chain there; assign it to a local first
+  --> 3:11
+   |
+  3|   t += xs.sum
+   |           ^^^
+
+error[E0610]: `any?` runs a loop before its statement, so it must be the whole right side of an assignment, the value of a `return` or a block, or a loop's receiver, or start a method chain there; assign it to a local first
+  --> 2:9
+   |
+  2|   if xs.any? { |x| x > 1 }
+   |         ^^^^
+
+error[E0602]: `count` takes a block: `count { |x| … }`; for the number of elements, use `length`
+  --> 2:10
+   |
+  2|   n = xs.count
+   |          ^^^^^
+
+error[E0602]: `map` takes no arguments, only a block
+  --> 2:11
+   |
+  2|   ys = xs.map(1) { |x| x }
+   |           ^^^
+
+error[E0602]: `map` takes one block parameter, an element of the array or range
+  --> 2:15
+   |
+  2|   ys = xs.map { |a, b| a }
+   |               ^^^^^^^^^^^^
+
+error[E0611]: `map`'s block is empty: its last expression is its value for each element
+  --> 2:15
+   |
+  2|   ys = xs.map { }
+   |               ^^^
+
+error[E0611]: the last statement of `map`'s block must be an expression: it is the block's value for each element
+  --> 2:21
+   |
+  2|   ys = xs.map { |x| y = x }
+   |                     ^^^^^
+
+error[E0611]: `next` can't end a pass of `select`'s block: Ruby would give the block the value `nil`. Give it its value with `if` or `?:` instead
+  --> 3:5
+   |
+  3|     next if x > 1
+   |     ^^^^
+
+error[E0611]: `break` can't leave `find`'s block: Ruby would make `find` give `nil`. To stop early, loop with `each` and assign to a local
+  --> 2:21
+   |
+  2|   y = xs.find { |x| break }
+   |                     ^^^^^
+
+error[E0606]: this code never runs: it comes after a `return`
+  --> 4:5
+   |
+  4|     x
+   |     ^

@@ -7,6 +7,7 @@
 //! `Math.f(x)` is the builtin `math.f(x)`.
 
 use super::ast as rb;
+use super::collect::COLLECTIONS;
 use super::desugar::{Translator, binary, builtin, call, expr, index, name, number, unary};
 use crate::ast::{BinOp, Expr, ExprKind, Ident, UnOp};
 use crate::diagnostics::Span;
@@ -20,11 +21,6 @@ const LOOPS: &[&str] = &[
     "times",
     "upto",
     "step",
-];
-
-/// The collection methods with blocks (§4.12), which a later step translates.
-const COLLECTIONS: &[&str] = &[
-    "map", "select", "reject", "sum", "count", "any?", "all?", "find",
 ];
 
 /// The methods the table translates, with how many arguments each takes (`None`: any number).
@@ -65,6 +61,18 @@ fn plural(n: usize) -> &'static str {
 }
 
 impl Translator<'_> {
+    /// Whether `recv.m` calls a method the host declares on the memory binding `recv` names.
+    pub(super) fn memory_method(&self, recv: &rb::Expr, m: &str) -> bool {
+        match &recv.kind {
+            rb::ExprKind::Name(mem) if self.is_memory(recv) => self
+                .cfg
+                .methods
+                .get(mem)
+                .is_some_and(|ms| ms.contains_key(m)),
+            _ => false,
+        }
+    }
+
     /// `recv.name(args)`, or with `parens` false, `recv.name` alone.
     pub(super) fn method(
         &mut self,
@@ -80,12 +88,7 @@ impl Translator<'_> {
             let rb::ExprKind::Name(mem) = &recv.kind else {
                 unreachable!("a memory binding is a name")
             };
-            let declared = self
-                .cfg
-                .methods
-                .get(mem)
-                .is_some_and(|ms| ms.contains_key(m));
-            if declared {
+            if self.memory_method(recv, m) {
                 if let Some(b) = block {
                     self.error(
                         "E0521",
@@ -134,7 +137,7 @@ impl Translator<'_> {
             return expr(ExprKind::Nil, span);
         }
         if COLLECTIONS.contains(&m) {
-            return self.not_yet(&format!("the collection method `{m}`"), method.span);
+            return self.collection(recv, method, args, block, span);
         }
         let Some(&(_, arity)) = TABLE.iter().find(|(n, _)| *n == m) else {
             // A field read: `r.name`. A name no field can have, or a call, is a method this

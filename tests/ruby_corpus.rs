@@ -709,6 +709,227 @@ end
     ex.assert_returns("mixed", vec![Value::Bool(false)], "nil");
 }
 
+#[test]
+fn collection_methods() {
+    let mut ex = ruby(
+        r##"
+LEVELS = [1, 2, 3]
+TOTAL_XP = LEVELS.sum { |l| l * 100 }
+NAMES = LEVELS.map { |l| "L#{l}" }
+
+def total_xp
+  TOTAL_XP
+end
+
+# `next` here belongs to `each`, the innermost loop.
+def small_sums(xss)
+  xss.map do |xs|
+    n = 0
+    xs.each do |x|
+      next if x > 1
+      n += x
+    end
+    n
+  end
+end
+
+def doubled(xs)
+  xs.map { |x| x * 2 }
+end
+
+def evens(xs)
+  xs.select { |x| x % 2 == 0 }
+end
+
+def odds(xs)
+  ys = xs.reject { |x| x % 2 == 0 }
+  ys
+end
+
+def total(xs)
+  xs.sum
+end
+
+def squares_total(xs)
+  s = xs.sum { |x| x * x }
+  s
+end
+
+def big_count(xs)
+  xs.count { |x| x > 2 }
+end
+
+def any_negative(xs)
+  xs.any? { |x| x < 0 }
+end
+
+def all_positive(xs)
+  xs.all? { |x| x > 0 }
+end
+
+def first_big(xs)
+  found = xs.find { |x| x > 2 }
+  found.nil? ? -1 : found
+end
+
+# The block's parameter changes, but `select` keeps the element it was given.
+def kept(xs)
+  xs.select do |x|
+    x = x * 10
+    x > 20
+  end
+end
+
+def chained(xs)
+  xs.select { |x| x > 1 }.map { |x| x * 10 }.sum
+end
+
+def big_len(xs)
+  xs.select { |x| x > 1 }.length
+end
+
+def last_big(xs)
+  xs.select { |x| x > 1 }.last
+end
+
+def squares(n)
+  (1..n).map { |i| i * i }
+end
+
+def below(n)
+  (0...n).sum
+end
+
+def sums(xss)
+  xss.map { |xs| xs.sum }
+end
+
+def steps(xs)
+  xs.map do |x|
+    y = x * 2
+    y + 1
+  end
+end
+
+def maybe_more(xs, c)
+  ys = c ? xs.map { |x| x + 1 } : xs
+  ys.nil? ? 0 : ys.sum
+end
+
+def early(xs)
+  ys = xs.map do |x|
+    return -1 if x < 0
+    x
+  end
+  ys.length
+end
+
+def each_big(xs)
+  s = 0
+  xs.select { |x| x > 1 }.each { |x| s += x }
+  s
+end
+
+def kind(xs)
+  case xs.count { |x| x > 0 }
+  when 0 then "none"
+  when 1 then "one"
+  else "many"
+  end
+end
+
+# `reject`'s test narrows what it keeps, so `present` sums numbers, not optionals.
+def present(xs)
+  ys = xs.map { |x| x > 1 ? x : nil }
+  zs = ys.reject { |y| y.nil? }
+  zs.sum
+end
+
+def via_lambda(xs)
+  f = ->(ys) { ys.map { |y| y + 1 } }
+  f.(xs)
+end
+
+def labels(xs)
+  xs.map { |x| x > 1 ? "big" : "small" }
+end
+
+# @param items {name: string, score: number}[]
+def best(items)
+  top = items.find { |i| i[:score] > 5 }
+  top.nil? ? "none" : top[:name]
+end
+"##,
+    );
+    let xs = || nums(&[1.0, 2.0, 3.0, 4.0]);
+    ex.assert_returns("total_xp", vec![], "600");
+    ex.assert_returns("NAMES", vec![], "[L1, L2, L3]");
+    ex.assert_returns(
+        "small_sums",
+        vec![Value::array(vec![nums(&[1.0, 2.0, 1.0]), nums(&[5.0])])],
+        "[2, 0]",
+    );
+    ex.assert_returns("doubled", vec![xs()], "[2, 4, 6, 8]");
+    ex.assert_returns("doubled", vec![nums(&[])], "[]");
+    ex.assert_returns("evens", vec![xs()], "[2, 4]");
+    ex.assert_returns("odds", vec![xs()], "[1, 3]");
+    ex.assert_returns("total", vec![xs()], "10");
+    ex.assert_returns("total", vec![nums(&[])], "0");
+    ex.assert_returns("squares_total", vec![xs()], "30");
+    ex.assert_returns("big_count", vec![xs()], "2");
+    ex.assert_returns("any_negative", vec![xs()], "false");
+    ex.assert_returns("any_negative", vec![nums(&[1.0, -1.0])], "true");
+    ex.assert_returns("all_positive", vec![xs()], "true");
+    ex.assert_returns("all_positive", vec![nums(&[1.0, -1.0])], "false");
+    ex.assert_returns("all_positive", vec![nums(&[])], "true");
+    ex.assert_returns("first_big", vec![xs()], "3");
+    ex.assert_returns("first_big", vec![nums(&[1.0])], "-1");
+    ex.assert_returns("kept", vec![xs()], "[3, 4]");
+    ex.assert_returns("chained", vec![xs()], "90");
+    ex.assert_returns("big_len", vec![xs()], "3");
+    ex.assert_returns("last_big", vec![xs()], "4");
+    ex.assert_returns("last_big", vec![nums(&[1.0])], "nil");
+    ex.assert_returns("squares", vec![num(4.0)], "[1, 4, 9, 16]");
+    ex.assert_returns("below", vec![num(4.0)], "6");
+    ex.assert_returns(
+        "sums",
+        vec![Value::array(vec![
+            nums(&[1.0, 2.0]),
+            nums(&[]),
+            nums(&[5.0]),
+        ])],
+        "[3, 0, 5]",
+    );
+    ex.assert_returns("steps", vec![xs()], "[3, 5, 7, 9]");
+    ex.assert_returns("maybe_more", vec![xs(), Value::Bool(true)], "14");
+    ex.assert_returns("maybe_more", vec![xs(), Value::Bool(false)], "10");
+    ex.assert_returns("early", vec![xs()], "4");
+    ex.assert_returns("early", vec![nums(&[1.0, -1.0, 2.0])], "-1");
+    ex.assert_returns("each_big", vec![xs()], "9");
+    ex.assert_returns("kind", vec![nums(&[-1.0])], "none");
+    ex.assert_returns("kind", vec![nums(&[-1.0, 2.0])], "one");
+    ex.assert_returns("kind", vec![xs()], "many");
+    ex.assert_returns("present", vec![xs()], "9");
+    ex.assert_returns("via_lambda", vec![xs()], "[2, 3, 4, 5]");
+    ex.assert_returns("labels", vec![nums(&[1.0, 2.0])], "[small, big]");
+    let item = |name: &str, score: f64| {
+        let mut m = BTreeMap::new();
+        m.insert("name".to_string(), string(name));
+        m.insert("score".to_string(), num(score));
+        Value::table(m)
+    };
+    ex.assert_returns(
+        "best",
+        vec![Value::array(vec![
+            item("a", 1.0),
+            item("b", 7.0),
+            item("c", 9.0),
+        ])],
+        "b",
+    );
+    ex.assert_returns("best", vec![Value::array(vec![item("a", 1.0)])], "none");
+}
+
 fn memory_cfg() -> (TypeConfig, RubyConfig) {
     let mut fields = BTreeMap::new();
     fields.insert("hp".to_string(), Type::Number);

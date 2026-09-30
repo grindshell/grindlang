@@ -423,7 +423,7 @@ history before the commit that deleted it.
 
 A second syntax for the same language: a strict subset of Ruby's syntax aimed at game logic and
 dialog DSLs. [`SPEC-RUBY.md`](SPEC-RUBY.md) (draft) is its authoring contract; this section is
-why it is built the way it is. R0–R3 are done; the rest is not implemented yet.
+why it is built the way it is. R0–R4 are done; the rest is not implemented yet.
 
 **Approach: translate into the shared AST.** The backends only see `ir::Program`, and
 everything above the IR sees `ast::Module`. A Ruby frontend that translates into `ast::Module`
@@ -442,6 +442,7 @@ src/ruby/        feature `ruby`, off by default; front end only, no backend depe
   scope.rs       where each Ruby local is declared
   desugar.rs     ruby::ast → ast::Module
   methods.rs     Ruby method → operator or catalog builtin
+  collect.rs     collection methods with blocks → loops
   dsl.rs         host-declared keywords → closure tables and records
 ```
 
@@ -624,7 +625,27 @@ counts exclude tests; the total is about 6k.
   `E0480`. SPEC-RUBY.md §7's worked example now translates and checks. (~600 lines without
   tests, under the ~700 estimated.)
 - **R4 — collection methods** (SPEC-RUBY.md §4.12), with diagnostics for each position a call
-  can't be translated in. (~400 lines)
+  can't be translated in. ✅ Done, in `ruby/collect.rs`, with no core change. Each call becomes
+  a loop building its result in a numbered temporary (`map#1`), and the call that temporary.
+  What settling it took, recorded in SPEC-RUBY.md §4.12 and §6:
+  - The loop runs before the statement holding the call, which is safe wherever the call's value
+    is the first thing that statement evaluates. That covers more than the whole right side of an
+    assignment and a `return`, as planned: a block's value (so calls nest), a loop's receiver,
+    a `case`'s subject, and the start of a method chain in any of them
+    (`xs.select { … }.map { … }.sum`), found by walking receivers before translating
+    (`Translator::value`). Anything else is `E0610`, including conditions (an open item).
+  - Ruby's `next` in the block gives it `nil`, and `break` makes the call `nil`, which have no
+    typed equivalent, so directly in the block both are `E0611`, as is a block that gives no
+    value. A `return` there returns from the enclosing function, as in Ruby.
+  - `select`, `reject`, and `find` keep the element through a hidden `x#` only when the block
+    assigns its parameter (which `scope.rs` now records); otherwise the parameter is the loop
+    variable, so the test narrows what is kept (`reject { |x| x.nil? }` gives `T[]`).
+  - A range receiver counts, as `each` does, and blocks take one parameter, so a hash is
+    `E0412`, whose Ruby wording now names the collection methods.
+  Tests: `tests/ruby_corpus.rs` gains a program over every method, position, and receiver;
+  `tests/ruby_twins/collect` pins each method's loop to its Lua spelling; and
+  `tests/ruby_translate.rs` covers `E0602`, `E0610`, `E0611`, and `E0412`. (~450 lines without
+  tests, against the ~400 estimated.)
 - **R5 — DSL layer.** The keyword declaration API, handler and data keywords, E06xx for unknown
   keywords, repeated ids, and missing fields, and `examples/embed_ruby.rs` with event handlers
   and a small dialog tree. (~700 lines)

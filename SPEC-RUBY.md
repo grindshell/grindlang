@@ -7,10 +7,10 @@
 >
 > Status: **draft, partly implemented.** Behind the `ruby` feature: the lexer and parser (§2,
 > §3, and the syntax rejections of §6; `grindlang::ruby::parse`), and the translation of §4
-> into the shared tree (`grindlang::ruby::parse_module`), except the collection methods of
-> §4.12 (R4) and the DSL keywords of §5 (R5). A collection method is `E0699` until then. The
-> decisions below were confirmed with the stakeholder on 2026-09-30; details marked _(open)_
-> are still to settle. Items that depend on a core change name it (C2–C9, PLAN.md Phase 10).
+> into the shared tree (`grindlang::ruby::parse_module`). The DSL keywords of §5 are next
+> (R5). The decisions below were confirmed with the stakeholder on 2026-09-30; details marked
+> _(open)_ are still to settle. Items that depend on a core change name it (C2–C9, PLAN.md
+> Phase 10).
 
 ## 1. What a Ruby-surface script is
 
@@ -333,8 +333,8 @@ Only a lambda made in the loop and called on a later pass can tell.
 | `break`, `next` | `break`, `continue` (C3) |
 | `c ? a : b`; `if`/`unless`/`case` used as a value | a conditional expression (C2) |
 
-`next` goes on to the next pass of the innermost loop, a block of §4.5 or §4.12 included; outside
-a loop it is SPEC.md's `E0311`.
+`next` goes on to the next pass of the innermost loop, a block of §4.5 included; outside a loop
+it is SPEC.md's `E0311`, and directly in a block of §4.12, `E0611`.
 
 What an `if`, `unless`, `case`, or `?:` becomes depends on where it is:
 
@@ -376,10 +376,11 @@ too.
 
 `each` with **one** block parameter iterates an array and with **two** a map, since the
 translator can't see types; the wrong one is SPEC.md's E0412, worded for Ruby ("`each` with
-one block parameter expects an array"). The iteration rules of SPEC.md §3.3 apply: what is
-visited is fixed when the loop starts. `times`, `upto`, `step`, and a range's `each` take at
-most one block parameter, `each_pair` exactly two; a block may leave out the ones it doesn't
-use. Each form is a loop, so it is a statement: as a value it is `E0602`.
+one block parameter (or `map`, `select`, `sum`, …) expects an array"). The iteration rules of
+SPEC.md §3.3 apply: what is visited is fixed when the loop starts. `times`, `upto`, `step`,
+and a range's `each` take at most one block parameter, `each_pair` exactly two; a block may
+leave out the ones it doesn't use. Each form is a loop, so it is a statement: as a value it is
+`E0602`. Its receiver may be a collection method (§4.12): `xs.select { … }.each { … }`.
 
 ### 4.6 Literals
 | Ruby | Becomes |
@@ -489,15 +490,48 @@ other method called with parentheses or arguments, or whose name ends in `?` or 
 |---|---|
 | `xs.map { \|x\| e }` | a new array of each `e` |
 | `xs.select { \|x\| c }`, `xs.reject { \|x\| c }` | a new array of the elements where `c` holds, or doesn't |
-| `xs.sum`, `xs.sum { \|x\| e }` | a `number`, starting from 0 |
+| `xs.sum`, `xs.sum { \|x\| e }` | a `number`: 0 plus each element, or each `e`, in order |
 | `xs.count { \|x\| c }` | a `number` |
-| `xs.any? { \|x\| c }`, `xs.all? { \|x\| c }` | a `bool` |
+| `xs.any? { \|x\| c }`, `xs.all? { \|x\| c }` | a `bool`, stopping at the first element that settles it |
 | `xs.find { \|x\| c }` | the first element where `c` holds, as `T?` |
 
-Each becomes a loop, so it is accepted only as the **whole right side of an assignment** or the
-value of a `return`. Elsewhere, such as an argument or an operand, it is an error asking for a
-local. The block's last expression is its value. Blocks here and in §4.5 may use `next` and
-`break`.
+The receiver is an array, or a range, `(a..b)` or `(a...b)`, counted through as in §4.5:
+`(1..n).sum { |i| i * i }`. The block takes at most one parameter, the element, so a hash is
+SPEC.md's `E0412`, as for `each` with one. Only `sum` may leave out the block, and none takes
+arguments (`E0602`; `xs.count` alone suggests `length`).
+
+Each becomes a loop that builds its result in a temporary, and the call is that temporary.
+`ys = xs.select { |x| x > 1 }` is:
+
+```lua
+local t = {}
+for _, x in ipairs(xs) do
+  if x > 1 then t[#t + 1] = x end
+end
+local ys = t
+```
+
+The loop runs before the statement holding the call, so a call is accepted only where its
+value is the first thing that statement evaluates, which then can't tell the difference: the
+**whole right side of an assignment** (not `+=`), the **value of a `return`** or of the end of a
+body, a **block's value**, so that calls nest (`xss.map { |xs| xs.sum }`), and the receiver of
+a loop of §4.5 or the subject of a `case`; and at the **start of a method chain** in one of
+those: `xs.select { … }.map { … }.sum`, `xs.select { … }.length`. Anywhere else — an operand,
+an argument, a condition — running the loop first could change what the program does, so it
+is `E0610`, which asks for a local. In an `if` or `case` giving an assignment its value, a
+branch that is such a call counts as holding statements (§4.4).
+
+The block's last expression is its value for each element: an `if`, `case`, or `?:` there is a
+conditional expression (§4.4), and the statements before it run first. A `return` in the block
+returns from the enclosing `def` or lambda, as in Ruby. Ruby's `next` would give the block
+`nil`, and its `break` would make the whole call `nil`, neither of which has a typed
+equivalent here, so either one directly in the block is `E0611`, as is a block that is empty
+or ends in a statement with no value. In a loop inside the block, they work as usual.
+
+`select`, `reject`, and `find` give the elements themselves, even when the block assigns its
+parameter. When it doesn't, their test narrows the element as an `if`'s does, so
+`xs.reject { |x| x.nil? }` is an array of `T` for an array of `T?`. `sum` adds in order, so a
+sum of fractions can differ from Ruby's, which compensates for rounding, in the last digits.
 
 ### 4.13 Lambdas and closures
 `->(x) { x * 2 }`, `-> do … end`, and `lambda { |x| … }` are anonymous functions (SPEC.md
@@ -659,8 +693,9 @@ once for its branches.
     or a `Math` function the catalog doesn't have.
   - `E0602`: a method used the wrong way: the wrong number of arguments, a loop method without
     a block or used as a value, `push` or `<<` used as a value, and `.last`, `<<`, or a
-    compound assignment reading a receiver that holds a call twice.
-  - `E0603`: a range anywhere but a loop's receiver or a `when` value.
+    compound assignment reading a receiver that holds a call twice; a collection method (§4.12)
+    given arguments, a block of more than one parameter, or no block but `sum`.
+  - `E0603`: a range anywhere but a loop's receiver (§4.5, §4.12) or a `when` value.
   - `E0604`: a constant assigned anywhere but directly at the top level, or with more than one
     value.
   - `E0605`: a value used as a statement, except the last one of a `def` or lambda.
@@ -672,8 +707,11 @@ once for its branches.
     anywhere but the whole right side of an assignment or a `return`; a branch that ends in a
     statement with no value when the assignment moves into the branches; and a branch of more
     than one expression in a constant's value.
-  - Planned for R4: a collection method (§4.12) outside an assignment or `return`.
-  - `E0699`, until R4 translates them: the collection methods.
+  - `E0610`: a collection method (§4.12) where its value isn't the first thing its statement
+    evaluates: anywhere but the whole right side of an assignment, the value of a `return` or
+    a block, a loop's receiver, a `case`'s subject, or the start of a method chain in one.
+  - `E0611`: a collection method's block that gives no value — empty, or ending in a statement
+    with no value — or with `next` or `break` directly in it.
 
 ## 7. Worked example
 
@@ -756,3 +794,7 @@ return { XP_BASE = XP_BASE, xp_for = xp_for, best_name = best_name }
 - **Guard clauses.** `return 0 if x.nil?` narrows nothing after it (SPEC.md §5.3), which rules
   out a common Ruby idiom; narrowing after an early return is a core change that would serve
   Lua scripts equally.
+- **Collection methods in conditions.** `if xs.any? { … }` is `E0610` (§4.12). An `if`'s first
+  condition, a modifier's, and an `unless`'s are evaluated first, so their loops could run
+  before the statement too; a `while`'s, an `elsif`'s, and a `?:`'s couldn't. Accepting the
+  first kind makes the rule harder to state.

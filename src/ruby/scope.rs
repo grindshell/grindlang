@@ -11,7 +11,9 @@
 //!   every other use is inside the Lua block the assignment lands in, so the declaration is in
 //!   scope wherever the local is used;
 //! - the rest, which a bare `local x` at the start of the owning scope declares instead, typed
-//!   as optional, since it holds `nil` until assigned.
+//!   as optional, since it holds `nil` until assigned;
+//! - which parameters are assigned, which `select`'s block can't be allowed to change the
+//!   element it keeps with (`collect.rs`).
 //!
 //! A first assignment is also declared at the start of its scope when it reads the local itself
 //! (`x ||= 1`, or a lambda that calls itself), or shares a multiple assignment with a target
@@ -42,6 +44,9 @@ pub(super) struct Scopes {
     pub hoisted: HashMap<Span, Vec<Ident>>,
     /// The names of the program's own top-level locals, which a `def` can't read.
     pub top_level: HashSet<String>,
+    /// The parameters of a `def`, block, or lambda that its code assigns, by the span of the
+    /// parameter.
+    pub assigned_params: HashSet<Span>,
 }
 
 /// Find the scope of every local in `program`.
@@ -81,6 +86,8 @@ struct Var {
     name: String,
     /// The span of the name in its first assignment; `None` for a parameter.
     first: Option<Span>,
+    /// The span of the parameter, for a parameter.
+    param: Option<Span>,
     /// The Lua block the first assignment lands in.
     body: usize,
     /// The scope that owns it.
@@ -147,6 +154,7 @@ impl Walker {
         self.vars.push(Var {
             name: name.to_string(),
             first,
+            param: None,
             body: *self.bodies.last().expect("a body is open"),
             owner: scope.owner,
             in_place,
@@ -168,7 +176,8 @@ impl Walker {
 
     fn params(&mut self, params: &[Ident]) {
         for p in params {
-            self.declare(&p.node, None, false);
+            let v = self.declare(&p.node, None, false);
+            self.vars[v].param = Some(p.span);
         }
     }
 
@@ -265,6 +274,9 @@ impl Walker {
                 match self.lookup(name) {
                     Some(v) => {
                         self.occurrence(v);
+                        if let Some(p) = self.vars[v].param {
+                            self.out.assigned_params.insert(p);
+                        }
                         None
                     }
                     None => Some(self.declare(name, Some(target.span), in_place)),
@@ -502,5 +514,15 @@ mod tests {
             .collect();
         assert_eq!(reads.len(), 2);
         assert_eq!(s.in_place.len(), 2);
+    }
+
+    #[test]
+    fn assigned_parameters_are_recorded() {
+        // `x` is assigned in a nested block, `n` by `+=`; `y` only shadows a name and `z` is
+        // only read.
+        let src =
+            "def f(n, z)\n  n += z\n  xs.select do |x|\n    ys.each { |y| x = y }\n  end\nend\n";
+        let (s, src) = scopes(src);
+        assert_eq!(texts(&src, &s.assigned_params), ["n@6", "x@37"]);
     }
 }
