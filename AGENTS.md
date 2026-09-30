@@ -168,5 +168,9 @@ the `codegen` and `runtime` module rustdoc for the ABI contract.
 - **Trust model: not a sandbox.** Scripts are trusted dev code. No fuel/step budget as a
   security boundary; the optional debug step counter is an authoring aid, off by default.
 - **Green bar = `cargo build && cargo test --all-features && cargo clippy --all-targets
-  --all-features -- -D warnings`.** Keep it green; the crate is warning-clean.
+  --all-features -- -D warnings`.** Keep it green; the crate is warning-clean. CI
+  (`.github/workflows/ci.yml`) runs it on every push to `master` and every pull request, with the
+  tests on Linux, Windows and macOS (each has its own native calling convention for the JIT), plus
+  `cargo fmt --check` and the three feature checks above. It uses the latest stable toolchain, so
+  a new Rust release can bring clippy lints the crate doesn't pass yet.
 - Edition `2024`. Match the pinned dependency versions unless there's a concrete reason to bump.

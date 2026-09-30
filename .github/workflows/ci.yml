@@ -1,0 +1,76 @@
+# The green bar from AGENTS.md, run on every push to master and every pull request.
+#
+# Tests run on all three desktop platforms because the JIT emits native code: each one has its
+# own calling convention (SysV x86-64, Windows x64, AArch64 on Apple silicon), and the
+# `extern "C"` boundary between compiled code and the runtime has to hold on all of them.
+# Lints and feature checks are platform-independent, so they run once, on Linux.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same pull request supersedes a run in progress; pushes to master all run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # Bounds a hang in compiled code, which no test harness timeout would catch.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      # `--all-features` is what runs the interpreter-vs-JIT differential, fuzz and property
+      # suites; the default features alone compile them to zero tests.
+      - run: cargo test --locked --all-features
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  features:
+    name: Feature combinations
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      # Each backend builds on its own (AGENTS.md, "Respect the feature gating").
+      - run: cargo check --locked --no-default-features
+      - run: cargo check --locked --no-default-features --features interp
+      - run: cargo check --locked

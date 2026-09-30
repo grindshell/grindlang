@@ -183,6 +183,10 @@ The interp-vs-jit differential, fuzz, and property suites are gated on
 them to zero tests and does not exercise the correctness oracle — run
 `cargo test --features interp` (or `--all-features`) before trusting a codegen change.
 
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `cargo test --all-features` on
+Linux, Windows and macOS, plus rustfmt, clippy and a build of each feature combination, on every
+push to `master` and every pull request.
+
 ## Benchmarks vs Luau
 
 The benchmark suite ([`benches/grindlang.rs`](benches/grindlang.rs)) times three workloads
