@@ -6,6 +6,8 @@
 //! * `cargo bench` — front end, grindlang JIT compile/call, and the Luau baseline.
 //! * `cargo bench --features interp` — additionally times the AST `Interpreter` and IR `Vm`,
 //!   so the JIT-vs-interpreter comparison is included.
+//! * `cargo bench --features ruby` — additionally times the Ruby surface's front end
+//!   (`SPEC-RUBY.md`) on each workload written in it, beside the Lua front end's.
 //!
 //! Programs are kept self-contained (default [`TypeConfig`], no host functions or memory) so
 //! each grindlang executor and its Luau twin run the identical computation.
@@ -302,6 +304,197 @@ fn bench_frontend(c: &mut Criterion) {
     g.finish();
 }
 
+// ---- front end, Ruby surface: parse / translate / compile-to-IR -------------
+
+/// The workloads written in the Ruby surface, as `(label, source)`, for the front-end
+/// benchmarks. Each computes what its Lua workload does.
+#[cfg(feature = "ruby")]
+fn ruby_workloads() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "fib",
+            "\
+def fib(n)
+  return n if n < 2
+  fib(n - 1) + fib(n - 2)
+end",
+        ),
+        (
+            "loopsum",
+            "\
+def loopsum(n)
+  s = 0
+  i = 1
+  while i <= n
+    s += i
+    i += 1
+  end
+  s
+end",
+        ),
+        (
+            "mitigated",
+            "\
+def mitigated(attack, defense)
+  raw = attack * 1.25
+  dmg = raw - defense * 0.5
+  return 0 if dmg < 0
+  dmg.floor
+end",
+        ),
+        (
+            "fieldsum",
+            "\
+def fieldsum(n)
+  t = { a: 1, b: 2, c: 3 }
+  s = 0
+  i = 1
+  while i <= n
+    s += t.a + t.b + t.c
+    i += 1
+  end
+  s
+end",
+        ),
+        (
+            "fieldwrite",
+            "\
+def fieldwrite(n)
+  t = { a: 0, b: 0 }
+  arr = [0, 0]
+  i = 1
+  while i <= n
+    t.a = i
+    t.b = t.a
+    arr[0] = i
+    i += 1
+  end
+  t.b
+end",
+        ),
+        (
+            "upvalue",
+            "\
+def upvalue(n)
+  s = 0
+  add = ->(x) { s += x }
+  i = 1
+  while i <= n
+    add.(i)
+    i += 1
+  end
+  s
+end",
+        ),
+        (
+            "minmax",
+            "\
+def minmax(n)
+  s = 0
+  i = 1
+  while i <= n
+    s += Math.max(i % 7, 3) - Math.min(i % 5, 2)
+    i += 1
+  end
+  s
+end",
+        ),
+        (
+            "arraysum",
+            "\
+def arraysum(n)
+  xs = [1, 2, 3, 4, 5, 6, 7, 8]
+  s = 0
+  i = 1
+  while i <= n
+    x = xs[i % 8]
+    s += x unless x.nil?
+    i += 1
+  end
+  s
+end",
+        ),
+        (
+            "mapread",
+            "\
+def mapread(n)
+  m = { \"a\" => 1, \"b\" => 2 }
+  s = 0
+  i = 1
+  while i <= n
+    v = m[\"b\"]
+    s += v unless v.nil?
+    i += 1
+  end
+  s
+end",
+        ),
+        (
+            "constread",
+            "\
+SCALE = 1.5
+T = { a: 1, b: 2 }
+
+def constread(n)
+  s = 0
+  i = 1
+  while i <= n
+    s += SCALE * T.a + T.b
+    i += 1
+  end
+  s
+end",
+        ),
+    ]
+}
+
+/// The Ruby front end beside the Lua one: `parse_ruby` lexes and parses to the Ruby-shaped tree,
+/// `translate_ruby` adds the translation to the shared tree (Lua's `parse` ends there), and
+/// `compile_ir_ruby` the rest of the front end, as Lua's `compile_ir` does.
+#[cfg(feature = "ruby")]
+fn bench_frontend_ruby(c: &mut Criterion) {
+    use grindlang::ruby::{RubyConfig, parse, parse_module};
+
+    let cfg = TypeConfig::default();
+    let ruby = RubyConfig::new();
+    let mut g = c.benchmark_group("frontend");
+    for ((label, src), (lua_label, lua_src, _, func, args)) in
+        ruby_workloads().into_iter().zip(workloads())
+    {
+        // Each must compute what its Lua workload does.
+        assert_eq!(label, lua_label);
+        let module = parse_module(src, &ruby, &cfg).expect("translate");
+        let program = grindlang::compile_module(&module, &cfg).expect("compile");
+        let from_ruby = JitModule::compile(&program)
+            .expect("jit")
+            .call(func, num_args(&args));
+        let from_lua = JitModule::compile(&lower(lua_src))
+            .expect("jit")
+            .call(func, num_args(&args));
+        assert_eq!(
+            from_ruby.expect("call").to_string(),
+            from_lua.expect("call").to_string(),
+            "{label}"
+        );
+        g.bench_function(format!("parse_ruby/{label}"), |b| {
+            b.iter(|| parse(black_box(src)).expect("parse"))
+        });
+        g.bench_function(format!("translate_ruby/{label}"), |b| {
+            b.iter(|| parse_module(black_box(src), &ruby, &cfg).expect("translate"))
+        });
+        g.bench_function(format!("compile_ir_ruby/{label}"), |b| {
+            b.iter(|| {
+                let module = parse_module(black_box(src), &ruby, &cfg).expect("translate");
+                grindlang::compile_module(&module, &cfg).expect("compile")
+            })
+        });
+    }
+    g.finish();
+}
+
+#[cfg(not(feature = "ruby"))]
+fn bench_frontend_ruby(_: &mut Criterion) {}
+
 // ---- backend compile: grindlang JIT vs. Luau --------------------------------
 
 fn bench_compile(c: &mut Criterion) {
@@ -381,5 +574,11 @@ fn bench_call(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_frontend, bench_compile, bench_call);
+criterion_group!(
+    benches,
+    bench_frontend,
+    bench_frontend_ruby,
+    bench_compile,
+    bench_call
+);
 criterion_main!(benches);

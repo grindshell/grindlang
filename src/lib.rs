@@ -25,6 +25,8 @@
 //! * Phase 8: host embedding API ([`api`], `jit` feature).
 //! * Phase 9: hardening, tooling, and docs — differential/fuzz/property tests, benchmarks, the
 //!   `embed` example, and the `grindlang` CLI runner.
+//! * Phase 10: the Ruby surface (`ruby` feature), a second syntax for the same language, with
+//!   host-declared DSL keywords; `Engine::compile_ruby` compiles a script written in it.
 //!
 //! ## Front-end entry points
 //!
@@ -39,7 +41,8 @@
 //! source, so a module parsed from another surface syntax ([`Surface`]) goes through the same
 //! resolver, checker, and lowering. The Ruby surface (`ruby` feature, `PLAN.md` Phase 10) is
 //! the first such syntax: its `ruby::parse_module` translates Ruby source into an
-//! [`ast::Module`].
+//! [`ast::Module`]. [`unparse::to_lua`] prints a module from any surface as Lua, to read what it
+//! became.
 
 pub mod annotations;
 pub mod ast;
@@ -52,6 +55,7 @@ pub mod resolve;
 pub mod runtime;
 pub mod surface;
 pub mod types;
+pub mod unparse;
 pub mod value;
 
 #[cfg(feature = "interp")]

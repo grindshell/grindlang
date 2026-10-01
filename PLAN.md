@@ -4,7 +4,7 @@
 > cranelift JIT, host embedding API); Phase 9 (hardening, tooling, docs) delivered; top-level
 > code (run once, then frozen — §2 decision 1) delivered since. See the per-phase "Delivered"
 > notes below and [`CLAUDE.md`](CLAUDE.md) for the current shape. Phase 10, a Ruby surface
-> ([`SPEC-RUBY.md`](SPEC-RUBY.md), draft), is planned; its first step, R0, is done.
+> ([`SPEC-RUBY.md`](SPEC-RUBY.md)), is delivered.
 
 ## 1. What Grindlang is
 
@@ -419,11 +419,11 @@ history before the commit that deleted it.
 > gated on
 > `all(feature = "interp", feature = "jit")`; run `cargo test --features interp`.
 
-### Phase 10 — Ruby surface  (planned)
+### Phase 10 — Ruby surface  (delivered)
 
 A second syntax for the same language: a strict subset of Ruby's syntax aimed at game logic and
-dialog DSLs. [`SPEC-RUBY.md`](SPEC-RUBY.md) (draft) is its authoring contract; this section is
-why it is built the way it is. R0–R5 are done; R6, integration, remains.
+dialog DSLs. [`SPEC-RUBY.md`](SPEC-RUBY.md) is its authoring contract; this section is why it is
+built the way it is. Steps R0–R6 are done; SPEC-RUBY.md's open items are what remains.
 
 **Approach: translate into the shared AST.** The backends only see `ir::Program`, and
 everything above the IR sees `ast::Module`. A Ruby frontend that translates into `ast::Module`
@@ -690,10 +690,42 @@ counts exclude tests; the total is about 6k.
   declaration panics; and `examples/embed_ruby.rs` runs events and walks a dialog. (~1.4k lines
   without tests, twice the ~700 estimated: the declaration API and its checks are about 600 of
   them, and many messages name exactly what a use is missing.)
-- **R6 — integration.** `Engine::compile_ruby`; the CLI's `.rb` detection, `--surface`, the
-  surface in the cache key, and an option to print the translated module as Lua for debugging;
-  Ruby programs in the fuzz corpus; a parse-and-translate benchmark beside the Lua one; docs
-  (SPEC-RUBY.md out of draft, AGENTS.md §5–6, README). (~400 lines)
+- **R6 — integration.** ✅ Done. What settling it took, recorded in SPEC-RUBY.md §1:
+  - `Engine::compile_ruby(src, &RubyConfig)` translates against the engine's own `TypeConfig`
+    and compiles as `compile` does; translation errors are a `BuildError::Check`.
+    `examples/embed_ruby.rs` uses it.
+  - Printing as Lua is `unparse::to_lua`, in the library rather than the CLI, for any module:
+    Lua source prints back as the same tree. What a translation holds that Lua can't write
+    prints readably instead — Luau's `(if c then a else b)` for a conditional expression,
+    `xs[i --[[from 0]]]`, names with `#` as they are, function types as the checker writes them
+    — with a comment at the top naming each kind the module holds, so the output is for reading,
+    not running.
+  - The CLI reads a `.rb` file (any case) as Ruby, `--surface lua|ruby` overrides, and
+    `--print-lua` prints the module without checking or running it, so it also shows what a
+    script that fails to check became; it takes no cache option. Ruby needs the `ruby` feature,
+    so the CLI builds without it and reports a Ruby script instead (a new CI check,
+    `cargo check --features serde`). The runner declares no keywords and designates no memory
+    for `@`, as it binds none. The cache envelope records the surface (format 5).
+  - The CLI renders diagnostics against the source (line, column, and the line) rather than as
+    byte offsets, for both surfaces: the spans the translator makes up lie past the end of the
+    source, which rendering clamps.
+  - Found on the way, and since fixed in the core: a record written by literal key, `t["a"] = 1`
+    (Ruby `t[:a] = 1`), was `E0424` in both surfaces, though SPEC.md §5.4 allows the key and a
+    read worked; the benchmark writes `t.a`. `t["a"]` is now the place `t.a` to narrowing as
+    well, which also closed a hole: `t["a"].b = nil` didn't end a guard on `t.a.b`.
+  Tests: `tests/jit_fuzz.rs` gains five Ruby programs (`case` over ranges and `?:`, collection
+  methods and indexing from 0, the counting loops with `next` and `break`, lambdas, `nil`
+  fallthrough and multiple assignment, interpolation), each fuzzed with its Lua spelling, so all
+  six executors agree; `tests/prop_differential.rs`'s `surfaces_agree` writes each generated
+  expression in both syntaxes; `tests/unparse.rs` prints every Lua fixture and twin back to the
+  same tree, and snapshots a translated script with every note; and the CLI has unit tests for
+  picking the surface, `--print-lua`'s options, the surface in the cache key, and a Ruby
+  script compiled and printed. The benchmark writes the ten workloads in Ruby, checked at setup
+  to compute what their Lua twins do, and times `parse_ruby`, `translate_ruby`, and
+  `compile_ir_ruby` beside Lua's `parse` and `compile_ir`: in one rough run, parsing and
+  translating took 6–11 µs where parsing Lua took 3–6 µs, and the whole front ends were within
+  about 25% of each other. (~650 lines without tests or the benchmark, over the ~400 estimated:
+  the printer is ~500 of them.)
 
 The first PR is R0: it changes no behavior and turns every later step into a `src/ruby/` change
 plus small, separately reviewable core additions.
@@ -714,7 +746,7 @@ plus small, separately reviewable core additions.
   division, truthy objects. Mitigated by SPEC-RUBY.md's "Differences from Ruby" table and a
   Ruby-worded hint on each rejection.
 - **Two syntaxes for every future language change.** Each needs a Ruby spelling or an explicit
-  "Lua only"; R6 adds that to the AGENTS.md §6 checklist.
+  "Lua only"; R6 added that to the AGENTS.md §6 checklist.
 - **Iterating the wrong kind of table.** `each` picks `ipairs` or `pairs` by its block's
   parameter count, not by type; a mismatch is E0412, which needs a Ruby-worded hint to be
   understandable.

@@ -23,14 +23,47 @@ use grindlang::ir::Vm;
 use grindlang::{TypeConfig, Value};
 use proptest::prelude::*;
 
-/// A numeric expression over `a`/`b`/`c` and non-negative integer literals. Every node is
-/// fully parenthesized so the rendered source is unambiguous regardless of precedence.
-/// Literals are non-negative; negative values arise only via the unary-minus branch (so we
-/// never emit `a + -5`-style adjacency).
-fn arb_expr() -> impl Strategy<Value = String> {
+/// A generated numeric expression over `a`/`b`/`c` and non-negative integer literals, which
+/// prints in either surface.
+#[derive(Clone, Debug)]
+enum Gen {
+    Num(i64),
+    Var(&'static str),
+    Bin(Box<Gen>, &'static str, Box<Gen>),
+    Neg(Box<Gen>),
+}
+
+impl Gen {
+    /// The expression in Lua. Every node is fully parenthesized so the rendered source is
+    /// unambiguous regardless of precedence. Literals are non-negative; negative values arise
+    /// only via the unary-minus branch (so we never emit `a + -5`-style adjacency).
+    fn lua(&self) -> String {
+        match self {
+            Gen::Num(n) => n.to_string(),
+            Gen::Var(v) => v.to_string(),
+            Gen::Bin(l, op, r) => format!("({} {op} {})", l.lua(), r.lua()),
+            Gen::Neg(e) => format!("(-{})", e.lua()),
+        }
+    }
+
+    /// The expression in the Ruby surface (`SPEC-RUBY.md` §4.7), where `^` is `**` and `//` is
+    /// `.div`, and a negated literal is a negative literal.
+    fn ruby(&self) -> String {
+        match self {
+            Gen::Num(n) => n.to_string(),
+            Gen::Var(v) => v.to_string(),
+            Gen::Bin(l, "//", r) => format!("({}.div({}))", l.ruby(), r.ruby()),
+            Gen::Bin(l, "^", r) => format!("({} ** {})", l.ruby(), r.ruby()),
+            Gen::Bin(l, op, r) => format!("({} {op} {})", l.ruby(), r.ruby()),
+            Gen::Neg(e) => format!("(-{})", e.ruby()),
+        }
+    }
+}
+
+fn arb_gen() -> impl Strategy<Value = Gen> {
     let leaf = prop_oneof![
-        (0i64..=20i64).prop_map(|n| n.to_string()),
-        prop::sample::select(vec!["a", "b", "c"]).prop_map(|s| s.to_string()),
+        (0i64..=20i64).prop_map(Gen::Num),
+        prop::sample::select(vec!["a", "b", "c"]).prop_map(Gen::Var),
     ];
     // depth 6, max 48 nodes, ~2 children per branch.
     leaf.prop_recursive(6, 48, 2, |inner| {
@@ -40,10 +73,15 @@ fn arb_expr() -> impl Strategy<Value = String> {
                 prop::sample::select(vec!["+", "-", "*", "/", "//", "%", "^"]),
                 inner.clone(),
             )
-                .prop_map(|(l, op, r)| format!("({l} {op} {r})")),
-            inner.prop_map(|e| format!("(-{e})")),
+                .prop_map(|(l, op, r)| Gen::Bin(Box::new(l), op, Box::new(r))),
+            inner.prop_map(|e| Gen::Neg(Box::new(e))),
         ]
     })
+}
+
+/// A generated numeric expression, in Lua.
+fn arb_expr() -> impl Strategy<Value = String> {
+    arb_gen().prop_map(|g| g.lua())
 }
 
 /// Render the deterministic comparison string for a call result (Ok value by `Display`, or a
@@ -102,6 +140,58 @@ proptest! {
 
         prop_assert_eq!(&si, &sv, "AST vs IR mismatch:\n{}", src);
         prop_assert_eq!(&sv, &sj, "IR vs JIT mismatch:\n{}", src);
+    }
+}
+
+#[cfg(feature = "ruby")]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// The same generated expression written in Lua and in the Ruby surface (`SPEC-RUBY.md`)
+    /// gives the same result on every executor of both: AST == IR == JIT, and Lua == Ruby.
+    #[test]
+    fn surfaces_agree(
+        expr in arb_gen(),
+        a in -50.0f64..50.0,
+        b in -50.0f64..50.0,
+        c in -50.0f64..50.0,
+    ) {
+        use grindlang::ruby::{RubyConfig, parse_module};
+
+        // Annotated, so that a parameter the expression doesn't use still has a type.
+        let lua = format!(
+            "---@param a number\n---@param b number\n---@param c number\n\
+             function f(a, b, c)\n  return {}\nend\n",
+            expr.lua()
+        );
+        let rb = format!(
+            "# @param a number\n# @param b number\n# @param c number\n\
+             def f(a, b, c)\n  {}\nend\n",
+            expr.ruby()
+        );
+        let cfg = TypeConfig::default();
+        let from_lua = grindlang::parse(&lua).expect("parse Lua");
+        let from_ruby = parse_module(&rb, &RubyConfig::new(), &cfg)
+            .unwrap_or_else(|d| panic!("translate:\n{}", d.render(&rb)));
+
+        let args = vec![Value::Number(a), Value::Number(b), Value::Number(c)];
+        let mut results = Vec::new();
+        for (surface, module, src) in [("Lua", from_lua, &lua), ("Ruby", from_ruby, &rb)] {
+            let (res, info) = grindlang::analyze_module(&module, &cfg)
+                .unwrap_or_else(|d| panic!("analyze:\n{}", d.render(src)));
+            let program = grindlang::ir::lower(&module, &res, &info, &cfg).expect("lower");
+            grindlang::ir::verify(&program).expect("verify");
+            let mut interp = Interpreter::new(&module, &res).expect("interp");
+            let mut vm = Vm::new(&program);
+            let mut jit = JitModule::compile(&program).expect("jit compile");
+            results.push((format!("{surface} AST"), render(&interp.call("f", args.clone()))));
+            results.push((format!("{surface} IR"), render(&vm.call("f", args.clone()))));
+            results.push((format!("{surface} JIT"), render(&jit.call("f", args.clone()))));
+        }
+        let (first, want) = &results[0];
+        for (oracle, got) in &results[1..] {
+            prop_assert_eq!(got, want, "{} vs {}:\n{}\n{}", oracle, first, lua, rb);
+        }
     }
 }
 

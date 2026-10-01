@@ -5,7 +5,8 @@
 //!
 //! * [`Engine`] — the configuration stage. Register host functions (typed Rust closures or
 //!   a raw escape hatch) and declare the host **memory** schema, then [`Engine::compile`] a
-//!   script source into a [`Module`].
+//!   script source into a [`Module`] (or, with the `ruby` feature, `Engine::compile_ruby` one
+//!   written in the Ruby surface).
 //! * [`Module`] — a compiled script. Bind memory, [`call`](Module::call_typed) its exports
 //!   with typed Rust arguments, and introspect its export signature.
 //!
@@ -509,7 +510,8 @@ impl Engine {
 
     /// The [`TypeConfig`] implied by the registered host functions and memory: what another
     /// surface's front end translates a script against (the Ruby surface's
-    /// `ruby::parse_module`) before [`compile_module`](Engine::compile_module).
+    /// `ruby::parse_module`, which `compile_ruby` calls with it) before
+    /// [`compile_module`](Engine::compile_module).
     pub fn type_config(&self) -> TypeConfig {
         TypeConfig {
             host_functions: self
@@ -545,6 +547,31 @@ impl Engine {
     /// cache `Module`s by source as they see fit.
     pub fn compile(&self, src: &str) -> Result<Module, BuildError> {
         self.compile_module(&crate::parse(src)?)
+    }
+
+    /// [`compile`](Engine::compile) a script written in the Ruby surface (`SPEC-RUBY.md`),
+    /// translated with `ruby`, which designates the memory `@name` reads and declares the
+    /// script's DSL keywords. Translation errors are a [`BuildError::Check`], as the checker's
+    /// are.
+    ///
+    /// ```
+    /// use grindlang::api::Engine;
+    /// use grindlang::ruby::RubyConfig;
+    ///
+    /// let mut module = Engine::new()
+    ///     .compile_ruby("def double(x)\n  x * 2\nend\n", &RubyConfig::new())
+    ///     .unwrap();
+    /// let out: f64 = module.call_typed("double", (21.0,)).unwrap();
+    /// assert_eq!(out, 42.0);
+    /// ```
+    #[cfg(feature = "ruby")]
+    pub fn compile_ruby(
+        &self,
+        src: &str,
+        ruby: &crate::ruby::RubyConfig,
+    ) -> Result<Module, BuildError> {
+        let module = crate::ruby::parse_module(src, ruby, &self.type_config())?;
+        self.compile_module(&module)
     }
 
     /// [`compile`](Engine::compile) an already parsed [`ast::Module`](crate::ast::Module), which

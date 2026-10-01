@@ -10,6 +10,10 @@ exported functions and constants. The host compiles a script once and calls its 
 many times. The only state that persists between calls is host-provided memory, owned by
 Rust.
 
+A script can also be written in a second syntax, a strict subset of Ruby's, for game logic and
+dialog DSLs (the `ruby` feature; see [Ruby surface](#ruby-surface)). It means exactly what the
+same script in Lua syntax would.
+
 ## Design
 
 - **Statically typed, mostly inferred.** Every expression has a type known at compile
@@ -17,9 +21,9 @@ Rust.
   EmmyLua `---@` annotations pin types where inference is insufficient.
 - **One numeric type.** All numbers are `f64`. No integer subtype and no bitwise
   operations.
-- **Constrained top level.** The top level contains only export declarations — no
-  top-level locals, no free globals, no implicit `_G`, no ambient standard library, and no
-  executable statements at load time.
+- **Top-level code runs once.** Constants and top-level statements run once, when the
+  module initializes, and what they build is then frozen. There are no free globals, no
+  implicit `_G`, and no ambient standard library.
 - **Conditions must be `bool`.** Unlike Lua, there is no truthiness coercion; narrow an
   optional with an explicit comparison (`if v ~= nil then …`).
 - **Host-injected capabilities.** Randomness, game queries, and persistent state are not
@@ -76,6 +80,56 @@ A runnable version, including a dialog-tree decision driven against host memory,
 cargo run --example embed --features jit
 ```
 
+## Ruby surface
+
+With the `ruby` feature, the same module can be written in a strict subset of Ruby's syntax,
+specified in [`SPEC-RUBY.md`](SPEC-RUBY.md). The translator turns it into the same tree the Lua
+parser builds, so the checker, the IR, and all three executors are shared:
+
+```ruby
+ARMOR_K = 100
+
+# @param attack number
+# @param armor number
+# @return number
+def mitigated(attack, armor)
+  attack * (ARMOR_K / (ARMOR_K + armor))
+end
+
+def lethal(attack, armor, hp)
+  mitigated(attack, armor) >= hp
+end
+```
+
+Ruby's habits that Grindlang's types rule out — truthy objects, `"a" + "b"`, integer division —
+are rejected with a hint saying what to write instead, and indices start at 0, as in Ruby.
+
+The host can declare **DSL keywords**: a handler keyword collects blocks into a table of
+closures, and a data keyword builds records, such as a dialog tree's nodes and choices.
+`@name` reads a field of the host memory the host designates:
+
+```rust
+use grindlang::ruby::RubyConfig;
+use grindlang::{Type, Value};
+
+let mut ruby = RubyConfig::new().ivar_memory("mem");
+ruby.handler("on", "ON")
+    .block(&[Type::Number], Type::Unit)
+    .dispatch("on_event");
+
+// on :hit do |dmg|
+//   @hp -= dmg
+// end
+let mut module = engine.compile_ruby(src, &ruby).expect("compile module");
+module.call("on_event", vec![Value::string("hit".to_string()), Value::Number(7.0)])?;
+```
+
+[`examples/embed_ruby.rs`](examples/embed_ruby.rs) handles events and walks a dialog tree:
+
+```
+cargo run --example embed_ruby --features ruby
+```
+
 ## Command-line runner
 
 The `grindlang` binary compiles a script file and invokes one of its exports — `main` by
@@ -93,15 +147,25 @@ cargo run --features serde --bin grindlang -- --call total sums.lua  # run the `
 Given a script whose `main` returns `fib(10)`, it prints `55`. A missing or unsuitable entry
 export (absent, parameterized, or not a function) is reported to stderr with a non-zero exit.
 
+A `.rb` file is read as the Ruby surface, which needs the `ruby` feature too; `--surface lua`
+or `--surface ruby` names the syntax whatever the extension. `--print-lua` prints what a
+script becomes, as Lua, without checking or running it — for a Ruby script, its translation:
+
+```
+cargo run --features serde,ruby --bin grindlang -- script.rb               # run script.rb's `main`
+cargo run --features serde,ruby --bin grindlang -- --print-lua script.rb   # show its translation
+```
+
 ### Disk cache (pyc-style)
 
 The Cranelift JIT compiles into process memory and cannot be persisted, so there is no
 native-code cache. What the runner caches is the **lowered IR** (`ir::Program`), and — like
 Python's `*.pyc` — it does so **by default**: a normal run reads `<FILE>.glir` when it is present
 and current (deserializing the IR and skipping the front end, still JIT-compiling on load), and
-otherwise compiles the source and writes the cache. It is keyed by a source hash plus the
-identity of the `grindlang` executable that wrote it (version, size, and modification time), so
-editing the script or rebuilding `grindlang` invalidates it automatically.
+otherwise compiles the source and writes the cache. It is keyed by a source hash, the syntax
+the source was read in, and the identity of the `grindlang` executable that wrote it (version,
+size, and modification time), so editing the script or rebuilding `grindlang` invalidates it
+automatically.
 
 Two flags adjust this:
 
@@ -121,6 +185,8 @@ cargo run --features serde --bin grindlang -- --no-cache script.lua # run, ignor
 source (.lua-syntax text)
   └─ lexer        tokens (+ spans)              src/lexer.rs
   └─ parser       AST (Lua-subset grammar)      src/parser.rs, src/ast.rs
+source (.rb-syntax text), instead                                (feature: ruby)
+  └─ lexer, parser, translator → the same AST   src/ruby/
   └─ resolver     scopes + constraint contract  src/resolve.rs
   └─ type checker bidirectional inference       src/types.rs
   └─ lowering     typed mid-level IR            src/ir.rs
@@ -132,7 +198,8 @@ source (.lua-syntax text)
 ```
 
 Front-end entry points are always available regardless of backend: `parse`, `check`,
-`analyze`, and `compile`.
+`analyze`, and `compile`, and `analyze_module` and `compile_module` for a module parsed from
+either syntax. `unparse::to_lua` prints a module as Lua.
 
 ### Three-oracle correctness model
 
@@ -145,7 +212,8 @@ Correctness rests on three independent executors that must agree on every progra
 Values are compared by their deterministic `Display` form (sorted table keys,
 integer-formatted whole numbers). Any divergence is a bug, enforced by the differential
 (`tests/jit_differential.rs`), fuzz (`tests/jit_fuzz.rs`), and property
-(`tests/prop_differential.rs`) suites.
+(`tests/prop_differential.rs`) suites. The fuzz and property suites also hold Ruby-surface
+programs to the results of their Lua spellings.
 
 ### JIT value model
 
@@ -164,6 +232,7 @@ The crate is decoupled by backend. The default gives a fully usable JIT crate.
 | `jit` | yes | Cranelift JIT backend — the production execution path. Self-contained. |
 | `interp` | no | Tree-walking interpreter and IR VM — the semantics oracles and a debug execution mode. Independent of `jit`. |
 | `serde` | no | Serde marshaling of `Value` and export signatures, plus serde derives on the IR (`ir::Program`) so a compiled module can be cached to disk. Required by the `grindlang` CLI runner (its pyc-style IR cache is default-on). |
+| `ruby` | no | The Ruby surface: its parser and translator, and the DSL keywords. Front end only; with `jit` it adds `Engine::compile_ruby`, and the CLI reads `.rb` scripts. |
 
 ## Commands
 
@@ -173,7 +242,9 @@ cargo test                           # jit-only: unit + api + doctests + snapsho
 cargo test --features interp         # ALSO runs the interp-vs-jit differential/fuzz/property suites
 cargo test --all-features            # everything (interp + jit + serde)
 cargo bench                          # criterion: parse/compile/call, JIT vs interp, vs a Luau baseline
+cargo bench --features ruby          # ALSO the Ruby surface's front end, beside the Lua one's
 cargo run --features serde --bin grindlang -- FILE  # CLI runner (caches IR; needs serde)
+cargo run --features serde,ruby --bin grindlang -- FILE.rb  # a Ruby-surface script
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt
 ```
@@ -233,7 +304,9 @@ mid-level IR, shared runtime, Cranelift JIT, the host embedding API, and Phase 9
 (differential/fuzz/property tests, benchmarks, docs, the embedding example, and the CLI
 runner). Closures with upvalues and calling first-class function values are supported.
 Host-memory method calls (`mem:m(args)`) are supported; the full native arena remains deferred.
-See [`PLAN.md`](PLAN.md) for per-phase exit criteria and deferred work.
+Phase 10 added the Ruby surface, with host-declared DSL keywords; its open items are listed in
+[`SPEC-RUBY.md`](SPEC-RUBY.md). See [`PLAN.md`](PLAN.md) for per-phase exit criteria and
+deferred work.
 
 ## License
 

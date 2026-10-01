@@ -1,0 +1,46 @@
+---
+source: tests/unparse.rs
+expression: to_lua(&module)
+---
+-- Translated from Ruby (SPEC-RUBY.md).
+-- Parsed as Lua, this isn't the same program:
+-- - `(if c then a else b)` is a conditional expression (SPEC.md §3.5)
+-- - `xs[i --[[from 0]]]` counts from 0 when `xs` is an array (SPEC-RUBY.md §4.9)
+-- - a function returns nil where it falls off its end (SPEC-RUBY.md §4.2)
+-- - a name with a `#` is one the translator made up
+-- - `fn(T) -> R` in an annotation is a function type, which Lua can't write
+
+---@param p#1 fn(number) -> ()
+---@return fn(number) -> ()
+local function on#1(p#1)
+  return p#1
+end
+
+LIMIT = 3
+ON = {
+  ["hit"] = on#1(function(dmg)
+    mem.hp = mem.hp - dmg
+  end),
+}
+
+function grade(xs)
+  local select#2 = {}
+  for _, x in ipairs(xs) do
+    if x > LIMIT then
+      select#2[#select#2 + 1] = x
+    end
+  end
+  local big = select#2
+  local first = xs[0 --[[from 0]]]
+  local label = (if first == nil then "none" else tostring(first))
+  return tostring(label) .. ": " .. tostring(#big)
+end
+
+---@param id# string
+---@param arg#1 number
+function on_event(id#, arg#1)
+  local h# = ON[id#]
+  if h# ~= nil then
+    h#(arg#1)
+  end
+end

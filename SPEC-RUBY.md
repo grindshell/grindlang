@@ -1,16 +1,16 @@
-# Grindlang — Ruby Surface Specification (draft)
+# Grindlang — Ruby Surface Specification
 
 > Companion to [SPEC.md](SPEC.md) and [PLAN.md](PLAN.md) Phase 10. SPEC.md defines what a
 > Grindlang program **means**; this document defines only the **Ruby spelling** of it: which
 > Ruby forms are accepted and which SPEC.md construct each one becomes. Where this document is
 > silent, SPEC.md governs.
 >
-> Status: **draft, implemented.** Behind the `ruby` feature: the lexer and parser (§2, §3, and
-> the syntax rejections of §6; `grindlang::ruby::parse`), and the translation of §4 and the DSL
-> keywords of §5 into the shared tree (`grindlang::ruby::parse_module`). Next is integration
-> (R6): `Engine::compile_ruby`, the CLI, and this document out of draft. The decisions below
-> were confirmed with the stakeholder on 2026-09-30; details marked _(open)_ are still to
-> settle. Items that depend on a core change name it (C2–C10, PLAN.md Phase 10).
+> Status: **implemented**, behind the `ruby` feature: the lexer and parser (§2, §3, and the
+> syntax rejections of §6; `grindlang::ruby::parse`), the translation of §4 and the DSL keywords
+> of §5 into the shared tree (`grindlang::ruby::parse_module`), `Engine::compile_ruby`, and the
+> CLI (§1). The decisions below were confirmed with the stakeholder on 2026-09-30; details
+> marked _(open)_ are still to settle, and are listed under Open items. Items that depend on a
+> core change name it (C2–C10, PLAN.md Phase 10).
 
 ## 1. What a Ruby-surface script is
 
@@ -23,8 +23,14 @@ no objects, classes, or exceptions; types are static and inferred (SPEC.md §5);
 `f64`; conditions are `bool`. A construct outside this document is rejected with a
 "not supported in Grindlang" diagnostic that names it — never a generic parse error.
 
-The host picks the surface: `Engine::compile_ruby` in the embedding API, and in the CLI the
-`.rb` extension (overridden by `--surface`). The IR cache key includes the surface.
+The host picks the surface: `Engine::compile_ruby(src, &RubyConfig)` in the embedding API
+(§4.1, §5.4), and in the `grindlang` CLI the `.rb` extension, overridden by
+`--surface lua|ruby`. The CLI's IR cache key includes the surface. The CLI declares no DSL
+keywords and designates no memory for `@name`, since it binds no memory at all.
+`grindlang --print-lua script.rb` prints what a script translates into, as Lua, without
+checking or running it (`grindlang::unparse::to_lua`). Lua can't write everything a translation
+holds — a conditional expression, an index counting from 0, a name the translator made up — so
+those print in a form a reader can follow, with a comment at the top saying how.
 
 ### 1.1 Differences from Ruby
 
@@ -275,8 +281,10 @@ about top-level code is SPEC.md's: it may loop, branch, and call host functions;
 A constant is assigned only directly at the top level, once, with one value: `X = 1` in a
 `def`, a block, or a branch, `A, B = 1, 2`, and `X = 1, 2` are `E0604`.
 
-The host translates a script with `ruby::parse_module(src, &RubyConfig, &TypeConfig)`, which
-returns the shared `ast::Module` that `analyze_module` and `compile_module` take with the same
+The host compiles a script with `Engine::compile_ruby(src, &RubyConfig)`, which translates it
+against the engine's host functions and memory and compiles the result as `Engine::compile`
+does a Lua script. Underneath, `ruby::parse_module(src, &RubyConfig, &TypeConfig)` returns the
+shared `ast::Module` that `analyze_module` and `compile_module` take with the same
 `TypeConfig`: the translator reads the memory bindings and memory methods from it (§4.10).
 
 ### 4.2 Methods and implicit return
@@ -690,8 +698,7 @@ ruby.data("node", "NODES")
             .block("effect", &[], Type::Unit)
             .optional()
     });
-let module = ruby::parse_module(src, &ruby, &engine.type_config())?;
-let mut game = engine.compile_module(&module)?;
+let mut game = engine.compile_ruby(src, &ruby)?;
 ```
 
 - `handler(keyword, table)` declares a handler keyword. `block(params, ret)` sets the
@@ -709,9 +716,9 @@ let mut game = engine.compile_module(&module)?;
   a keyword, table, or dispatch name another keyword already takes; a type a script can't write
   (a tuple, host userdata, or `()` other than as what a function gives); a block that fills two
   fields, or a field and nested keywords; or a default that doesn't fit.
-- `Engine::type_config` is the `TypeConfig` an engine checks scripts against, which the
-  translator reads memory from. `Engine::compile_ruby` (PLAN.md Phase 10, R6) will take the
-  `RubyConfig` directly.
+- `Engine::compile_ruby` translates with the `RubyConfig` against the engine's own
+  `TypeConfig`, which `Engine::type_config` returns for a host translating with
+  `ruby::parse_module` itself.
 
 ## 6. Rejected constructs
 

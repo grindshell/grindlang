@@ -35,8 +35,10 @@ fuzz + property tests, criterion benchmarks with a rough Luau baseline, this `CL
 `SPEC.md`, the `embed` example, and the `grindlang` CLI runner). Closures with upvalues,
 calling first-class function values (see `src/capture.rs`), host-memory method calls
 (`mem:m(args)`, `SPEC.md` §7), and top-level code (run once, then frozen — `SPEC.md` §3.1) have
-landed since the original Phase 7 cut. See `PLAN.md` §4 for per-phase notes and what remains
-deferred (the full native arena, portable closures).
+landed since the original Phase 7 cut. Phase 10 added a second surface syntax, a subset of
+Ruby's (`SPEC-RUBY.md`, the `ruby` feature), translated into the shared AST. See `PLAN.md` §4
+for per-phase notes and what remains deferred (the full native arena, portable closures, and
+`SPEC-RUBY.md`'s open items).
 
 ## 3. Tech stack
 
@@ -69,7 +71,8 @@ other feature required.
   parser (`ruby::parse`, to a Ruby-shaped tree) and the translation into the shared
   `ast::Module` (`ruby::parse_module`), which then runs through the Lua pipeline unchanged,
   including the DSL keywords a host declares on `RubyConfig` (`SPEC-RUBY.md` §5). Front end
-  only; needs no backend feature.
+  only; needs no backend feature. With `jit` it adds `Engine::compile_ruby`, and with `jit` and
+  `serde` the CLI runs `.rb` scripts.
 
 **Gating rule:** items needed by *any* execution backend (the runtime `Value` reference
 variants `Cell`/`Closure`, `NativeFn`, `ClosureObj`, and the builtin reference impls in
@@ -88,6 +91,7 @@ cargo test --features interp         # ALSO runs the interp-vs-jit differential/
 cargo test --all-features            # everything (interp + jit + serde)
 cargo bench                          # criterion: parse/compile/call, JIT vs interp, vs Luau
 cargo run --features serde --bin grindlang -- FILE  # CLI: run FILE's `main` (pyc-style IR cache)
+cargo run --features serde,ruby --bin grindlang -- --print-lua FILE.rb  # what a Ruby script becomes
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt
 ```
@@ -106,6 +110,10 @@ source (.lua-syntax text)
   └─ lexer        tokens (+ spans) + ---@ docs   src/lexer.rs
   └─ parser       AST (Lua-subset grammar)      src/parser.rs, src/ast.rs
        └─ annotations  ---@param/---@return EmmyLua types   src/annotations.rs
+source (.rb-syntax text), instead                                     (feature: ruby)
+  └─ lexer, parser   Ruby-shaped tree            src/ruby/{lexer,parser,ast}.rs
+  └─ translator      the same AST                src/ruby/{scope,desugar,methods,collect,dsl}.rs
+(AST → Lua text, to read what a module became)  src/unparse.rs
   └─ resolver     scopes + CONSTRAINT contract  src/resolve.rs
   └─ type checker bidirectional inference       src/types.rs
   └─ lowering     typed mid-level SSA-ish IR     src/ir.rs
@@ -132,7 +140,10 @@ that set — keep all three doing the same.
 Front-end entry points in `lib.rs` are always available: `parse` (→ AST), `check` (+ resolve),
 `analyze` (+ typecheck → export signature), `compile` (+ lower → verified IR).
 `analyze_module` and `compile_module` (and `Engine::compile_module`) do the same from an
-already parsed `ast::Module`, so another surface syntax can feed the shared pipeline.
+already parsed `ast::Module`, so another surface syntax can feed the shared pipeline;
+`Engine::compile_ruby` does it for the Ruby surface. `unparse::to_lua` prints a module from
+either surface as Lua (the CLI's `--print-lua`): Lua source prints back as the same tree, and
+what a translation holds that Lua can't write prints readably, explained in a comment.
 
 **Surfaces.** `ast::Module::surface` records which syntax a module was parsed from
 (`src/surface.rs`: Lua, or Ruby, whose front end is `PLAN.md` Phase 10). It never changes what
@@ -153,7 +164,9 @@ Correctness rests on **three independent executors that must agree** on every pr
 Values are compared by their `Display` form (deterministic: sorted table keys,
 integer-formatted whole numbers). Any divergence is a bug. This is enforced by
 `tests/jit_differential.rs` (curated corpus), `tests/jit_fuzz.rs` (deterministic LCG),
-and `tests/prop_differential.rs` (proptest-generated expressions). `tests/common` holds a shared
+and `tests/prop_differential.rs` (proptest-generated expressions); with the `ruby` feature, the
+last two also hold Ruby-surface programs to the same results as their Lua spellings, across
+surfaces as well as backends. `tests/common` holds a shared
 harness, `Executors`, that builds all of them (plus an eagerly compacting JIT) from source or
 from an `ast::Module`; new suites should use it.
 
@@ -171,6 +184,11 @@ the `codegen` and `runtime` module rustdoc for the ABI contract.
 - **SPEC.md is the contract.** A behavior change to the language must be reflected in
   `SPEC.md`. If a question isn't answered there, it's a design decision — resolve and record
   it (and check `PLAN.md`'s locked decisions) before implementing.
+- **Two syntaxes, one language.** A language change needs a Ruby spelling — in
+  `SPEC-RUBY.md`, in the translator (`src/ruby/`), and in a Ruby test (`tests/ruby_twins/`,
+  `tests/ruby_corpus.rs`) — or an explicit "Lua only" in `SPEC-RUBY.md` saying why. A
+  diagnostic that quotes code goes through the module's `Surface` (§5), and a new AST node gets
+  a spelling in `src/unparse.rs`.
 - **Keep the three oracles in agreement.** Any change to semantics, lowering, or codegen must
   keep `Interpreter == Vm == JitModule`. Add/extend cases in the differential, fuzz, or
   property suites; never make a backend pass by special-casing it.
@@ -188,8 +206,8 @@ the `codegen` and `runtime` module rustdoc for the ABI contract.
   rest of the crate is insulated from cranelift churn. Pin cranelift versions.
 - **Respect the feature gating** (see §3). Shared-runtime items → `any(interp, jit)`;
   interpreter-only items → `interp`. Verify changes with `cargo check --no-default-features`,
-  `--no-default-features --features interp`, `--no-default-features --features ruby`, and
-  default before committing.
+  `--no-default-features --features interp`, `--no-default-features --features ruby`,
+  `--features serde` (the CLI without the Ruby surface), and default before committing.
 - **Diagnostics carry codes + spans.** Every user-facing error is a `Diagnostic` with a stable
   `code` (e.g. `E0001`) and a `Span`; tests match on codes, snapshots on the rendered output.
   Reject unsupported Lua constructs with a clear "not supported in Grindlang" diagnostic, never
@@ -200,6 +218,6 @@ the `codegen` and `runtime` module rustdoc for the ABI contract.
   --all-features -- -D warnings`.** Keep it green; the crate is warning-clean. CI
   (`.github/workflows/ci.yml`) runs it on every push to `master` and every pull request, with the
   tests on Linux, Windows and macOS (each has its own native calling convention for the JIT), plus
-  `cargo fmt --check` and the three feature checks above. It uses the latest stable toolchain, so
+  `cargo fmt --check` and the feature checks above. It uses the latest stable toolchain, so
   a new Rust release can bring clippy lints the crate doesn't pass yet.
 - Edition `2024`. Match the pinned dependency versions unless there's a concrete reason to bump.

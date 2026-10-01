@@ -7,6 +7,9 @@
 //! [`translate`] turns that into the shared [`crate::ast::Module`], which the resolver, checker,
 //! lowering, and all three backends then run as they would a Lua module; [`parse_module`] does
 //! both. Translation rejects what needs more than syntax to rule out (`E052x`, `E06xx`).
+//!
+//! A host compiles a script with `Engine::compile_ruby` (with the `jit` feature), and
+//! [`crate::unparse::to_lua`] prints what a script translated into.
 
 pub mod ast;
 mod collect;

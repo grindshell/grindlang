@@ -10,8 +10,8 @@
 fn main() {
     use std::collections::BTreeMap;
 
-    use grindlang::api::{Engine, Module};
-    use grindlang::ruby::{RubyConfig, parse_module};
+    use grindlang::api::{BuildError, Engine, Module};
+    use grindlang::ruby::RubyConfig;
     use grindlang::{Type, Value};
 
     let mut engine = Engine::new();
@@ -67,9 +67,11 @@ node :credit do
   choice "Back", goto: "shop"
 end
 "#;
-    let module = parse_module(src, &ruby, &engine.type_config())
-        .unwrap_or_else(|d| panic!("{}", d.render(src)));
-    let mut game = engine.compile_module(&module).expect("compile");
+    let mut game = match engine.compile_ruby(src, &ruby) {
+        Ok(game) => game,
+        Err(BuildError::Check(d)) => panic!("{}", d.render(src)),
+        Err(e) => panic!("{e}"),
+    };
     let mut mem = BTreeMap::new();
     mem.insert("hp".to_string(), Value::Number(60.0));
     mem.insert("gold".to_string(), Value::Number(7.0));
