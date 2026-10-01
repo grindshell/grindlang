@@ -69,6 +69,10 @@ required-features = ["jit", "serde"]
 name = "embed"
 required-features = ["jit"]
 
+[[example]]
+name = "embed_ruby"
+required-features = ["jit", "ruby"]
+
 # Phase 9 benchmarks. The interp-vs-jit comparison inside is `#[cfg(feature = "interp")]`;
 # run `cargo bench --features interp` to include it. The Luau baseline always runs.
 [[bench]]

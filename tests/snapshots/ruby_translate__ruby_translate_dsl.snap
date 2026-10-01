@@ -1,0 +1,219 @@
+---
+source: tests/ruby_translate.rs
+expression: rendered
+---
+error[E0612]: `on` is a keyword, which is written only as a statement directly at the top level
+  --> 2:3
+   |
+  2|   on :hit do end
+   |   ^^
+
+error[E0612]: `on` is a keyword, which is written only as a statement directly at the top level
+  --> 1:1
+   |
+  1| on :hit do end if true
+   | ^^
+
+error[E0612]: `say` is a keyword of `node`'s block, which is written only as a statement directly in it
+  --> 1:1
+   |
+  1| say "hi"
+   | ^^^
+
+error[E0612]: `node` is a keyword, which is written only as a statement directly at the top level
+  --> 2:3
+   |
+  2|   node
+   |   ^^^^
+
+error[E0612]: `on_event` is the function the host's `on` keyword generates, so no `def` or constant can take its name
+  --> 1:5
+   |
+  1| def on_event(id, x)
+   |     ^^^^^^^^
+
+error[E0612]: `node` is a keyword the host declared, so no `def` or constant can take its name
+  --> 1:5
+   |
+  1| def node
+   |     ^^^^
+
+error[E0612]: `ON` is the table the host's `on` keyword builds, so no `def` or constant can take its name
+  --> 1:1
+   |
+  1| ON = 1
+   | ^^
+
+error[E0613]: only `say` and `choice` can be written in `node`'s block
+  --> 2:3
+   |
+  2|   x = 1
+   |   ^^^^^
+
+error[E0613]: only `say` and `choice` can be written in `node`'s block
+  --> 2:3
+   |
+  2|   on :hit do end
+   |   ^^^^^^^^^^^^^^
+
+error[E0613]: `choice` has no `when:` argument; its named arguments: `if:`
+  --> 2:15
+   |
+  2|   choice "x", when: 1
+   |               ^^^^^
+
+error[E0613]: `on` has no `if:` argument: it takes an id and a block
+  --> 1:10
+   |
+  1| on :hit, if: 1 do |d| end
+   |          ^^^
+
+error[E0613]: `say` has no `loud:` argument: it takes one value
+  --> 2:12
+   |
+  2|   say "x", loud: true
+   |            ^^^^^
+
+error[E0614]: `on`'s first argument is its id, a symbol or string written out: `on :name …`
+  --> 1:4
+   |
+  1| on hit do |d| end
+   |    ^^^
+
+error[E0614]: `on`'s first argument is its id, a symbol or string written out: `on :name …`
+  --> 1:4
+   |
+  1| on "#{1}" do |d| end
+   |    ^^^^^^
+
+error[E0614]: `on` takes one argument, the handler's id
+  --> 1:10
+   |
+  1| on :hit, 2 do |d| end
+   |          ^
+
+error[E0614]: `on` calls this with 1 argument, so it takes at most 1 parameter
+  --> 1:16
+   |
+  1| on :hit do |a, b| end
+   |                ^
+
+error[E0614]: `node` takes no arguments after its id
+  --> 1:10
+   |
+  1| node :a, "x"
+   |          ^^^
+
+error[E0614]: `say` takes one value
+  --> 2:12
+   |
+  2|   say "x", "y"
+   |            ^^^
+
+error[E0614]: `say` takes no block
+  --> 2:11
+   |
+  2|   say "x" do end
+   |           ^^^^^^
+
+error[E0614]: `node`'s block takes no parameters: it holds `node`'s keywords
+  --> 1:13
+   |
+  1| node :a do |x|
+   |             ^
+
+error[E0614]: `if:` is given twice
+  --> 2:32
+   |
+  2|   choice "x", if: -> { true }, if: -> { false }
+   |                                ^^^
+
+error[E0614]: `choice` calls this with no arguments, so it takes none
+  --> 2:22
+   |
+  2|   choice "x", if: ->(a) { true }
+   |                      ^
+
+error[E0615]: `on` needs an id first: `on :name …`
+  --> 1:1
+   |
+  1| on do |d| end
+   | ^^
+
+error[E0615]: `on` needs a block, the handler: `on … do … end`
+  --> 1:1
+   |
+  1| on :hit
+   | ^^
+
+error[E0615]: `choice` needs its `text` argument
+  --> 2:3
+   |
+  2|   choice
+   |   ^^^^^^
+
+error[E0615]: `say` needs a value: `say …`
+  --> 2:3
+   |
+  2|   say
+   |   ^^^
+
+error[E0615]: `item` needs `cost:`
+  --> 1:1
+   |
+  1| item :a, "Sword" do |n| true end
+   | ^^^^
+
+error[E0615]: `item` needs a block, its `use`
+  --> 1:1
+   |
+  1| item :a, "Sword", cost: 1
+   | ^^^^
+
+error[E0614]: `item` calls this with 1 argument, so it takes at most 1 parameter
+  --> 1:34
+   |
+  1| item :a, "Sword", cost: 1 do |n, m| true end
+   |                                  ^
+
+error[E0616]: `on` already has the id `hit`: each id names one entry
+  --> 2:4
+   |
+  2| on :hit do end
+   |    ^^^^
+
+error[E0616]: `node` already has the id `a`: each id names one entry
+  --> 2:6
+   |
+  2| node "a"
+   |      ^^^
+
+error[E0402]: assignment type mismatch: expected string, found number
+  --> 2:3
+   |
+  2|   @name = d
+   |   ^^^^^
+
+error[E0402]: argument type mismatch: expected string, found number
+  --> 2:7
+   |
+  2|   say 5
+   |       ^
+
+error[E0413]: return type mismatch: expected bool, found number
+  --> 2:24
+   |
+  2|   choice "x", if: -> { 1 }
+   |                        ^
+
+error[E0413]: return type mismatch: expected bool, found number
+  --> 2:3
+   |
+  2|   n
+   |   ^
+
+error[E0310]: top-level code cannot use host memory `mem`: it runs once, when the module initializes, before any memory is bound. Read memory inside a function.
+  --> 2:7
+   |
+  2|   say @name
+   |       ^

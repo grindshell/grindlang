@@ -173,6 +173,154 @@ fn snapshot_translation_diagnostics() {
     }
 }
 
+/// The keywords the `dsl` cases use, with `@name` the memory `mem`.
+fn dsl_config() -> (TypeConfig, RubyConfig) {
+    let mut cfg = TypeConfig::default();
+    let mut fields = BTreeMap::new();
+    fields.insert("hp".to_string(), Type::Number);
+    fields.insert("name".to_string(), Type::String);
+    cfg.memory.insert("mem".to_string(), Type::Record(fields));
+    let mut ruby = RubyConfig::new().ivar_memory("mem");
+    ruby.handler("on", "ON")
+        .block(&[Type::Number], Type::Unit)
+        .dispatch("on_event");
+    ruby.data("node", "NODES")
+        .list("say", "lines", Type::String)
+        .child("choice", "choices", |c| {
+            c.positional("text", Type::String).keyword(
+                "if",
+                "cond",
+                Type::optional(Type::function(vec![], Type::Bool)),
+            )
+        });
+    ruby.data("item", "ITEMS")
+        .positional("name", Type::String)
+        .keyword("cost", "cost", Type::Number)
+        .block("use", &[Type::Number], Type::Bool);
+    (cfg, ruby)
+}
+
+fn diagnose_dsl(src: &str) -> Result<grindlang::ast::Module, Diagnostics> {
+    let (cfg, ruby) = dsl_config();
+    let module = parse_module(src, &ruby, &cfg)?;
+    grindlang::analyze_module(&module, &cfg)?;
+    Ok(module)
+}
+
+/// Each source using the keywords of [`dsl_config`] wrongly, with the code its first diagnostic
+/// has.
+const DSL: &[(&str, &str)] = &[
+    // A keyword where it can't be, or a name a keyword takes.
+    ("def f\n  on :hit do end\nend\n", "E0612"),
+    ("on :hit do end if true\n", "E0612"),
+    ("say \"hi\"\n", "E0612"),
+    ("def f\n  node\nend\n", "E0612"),
+    ("def on_event(id, x)\n  x\nend\n", "E0612"),
+    ("def node\n  1\nend\n", "E0612"),
+    ("ON = 1\n", "E0612"),
+    // Unknown keywords and named arguments.
+    ("node :a do\n  x = 1\nend\n", "E0613"),
+    ("node :a do\n  on :hit do end\nend\n", "E0613"),
+    ("node :a do\n  choice \"x\", when: 1\nend\n", "E0613"),
+    ("on :hit, if: 1 do |d| end\n", "E0613"),
+    ("node :a do\n  say \"x\", loud: true\nend\n", "E0613"),
+    // Arguments that don't fit.
+    ("on hit do |d| end\n", "E0614"),
+    ("on \"#{1}\" do |d| end\n", "E0614"),
+    ("on :hit, 2 do |d| end\n", "E0614"),
+    ("on :hit do |a, b| end\n", "E0614"),
+    ("node :a, \"x\"\n", "E0614"),
+    ("node :a do\n  say \"x\", \"y\"\nend\n", "E0614"),
+    ("node :a do\n  say \"x\" do end\nend\n", "E0614"),
+    ("node :a do |x|\n  say \"x\"\nend\n", "E0614"),
+    (
+        "node :a do\n  choice \"x\", if: -> { true }, if: -> { false }\nend\n",
+        "E0614",
+    ),
+    (
+        "node :a do\n  choice \"x\", if: ->(a) { true }\nend\n",
+        "E0614",
+    ),
+    // Missing ids and fields.
+    ("on do |d| end\n", "E0615"),
+    ("on :hit\n", "E0615"),
+    ("node :a do\n  choice\nend\n", "E0615"),
+    ("node :a do\n  say\nend\n", "E0615"),
+    ("item :a, \"Sword\" do |n| true end\n", "E0615"),
+    ("item :a, \"Sword\", cost: 1\n", "E0615"),
+    // A block that doesn't fit is reported once, not as missing too.
+    ("item :a, \"Sword\", cost: 1 do |n, m| true end\n", "E0614"),
+    // Repeated ids.
+    ("on :hit do end\non :hit do end\n", "E0616"),
+    ("node :a\nnode \"a\"\n", "E0616"),
+    // The checker, against the declared types, where the script wrote the mistake.
+    ("on :hit do |d|\n  @name = d\nend\n", "E0402"),
+    ("node :a do\n  say 5\nend\n", "E0402"),
+    ("node :a do\n  choice \"x\", if: -> { 1 }\nend\n", "E0413"),
+    ("item :a, \"Sword\", cost: 1 do |n|\n  n\nend\n", "E0413"),
+    // A keyword's arguments are top-level code; its blocks run later.
+    ("node :a do\n  say @name\nend\n", "E0310"),
+];
+
+#[test]
+fn keyword_misuse_reports_its_codes() {
+    for (src, code) in DSL {
+        let diags = diagnose_dsl(src)
+            .err()
+            .unwrap_or_else(|| panic!("expected {code}, but this translated and checked:\n{src}"));
+        let first = diags.iter().next().expect("a diagnostic").code;
+        assert_eq!(first, *code, "{src}\n{}", diags.render(src));
+    }
+    let rendered = DSL
+        .iter()
+        .map(|(src, _)| match diagnose_dsl(src) {
+            Ok(_) => format!("{src}\n(translated and checked with no diagnostics)"),
+            Err(d) => d.render(src),
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    insta::assert_snapshot!("ruby_translate_dsl", rendered);
+}
+
+#[test]
+fn keywords_export_their_tables_and_dispatch_functions() {
+    let src = "on :hit do |d| @hp -= d end\nnode :a do\n  say \"hi\"\n  choice \"x\"\nend\n\
+               item :s, \"Sword\", cost: 2 do |n| n > 1 end\n";
+    let (cfg, ruby) = dsl_config();
+    let module = parse_module(src, &ruby, &cfg).unwrap_or_else(|d| panic!("{}", d.render(src)));
+    let (_, info) =
+        grindlang::analyze_module(&module, &cfg).unwrap_or_else(|d| panic!("{}", d.render(src)));
+    let exports: Vec<String> = info
+        .exports
+        .iter()
+        .map(|(name, ty)| format!("{name}: {ty}"))
+        .collect();
+    assert_eq!(
+        exports,
+        [
+            "ITEMS: map<string, record { cost: number, name: string, use: fn(number) -> bool }>",
+            "NODES: map<string, record { choices: array<record { cond: fn() -> bool?, text: \
+             string }>, lines: array<string> }>",
+            "ON: map<string, fn(number) -> ()>",
+            "on_event: fn(string, number) -> ()",
+        ]
+    );
+    // A private `def` makes the module list its exports, which keep the keywords'.
+    let private = format!("{src}private def helper\n  1\nend\n");
+    let module = parse_module(&private, &ruby, &cfg).unwrap();
+    let (_, info) = grindlang::analyze_module(&module, &cfg).unwrap();
+    let names: Vec<&str> = info.exports.keys().map(String::as_str).collect();
+    assert_eq!(names, ["ITEMS", "NODES", "ON", "on_event"]);
+    // With no handler, the dispatch function does nothing, and there is no table.
+    let module = parse_module("", &ruby, &cfg).unwrap();
+    let (_, info) = grindlang::analyze_module(&module, &cfg).unwrap();
+    assert_eq!(
+        info.exports["on_event"].to_string(),
+        "fn(string, number) -> ()"
+    );
+    assert!(!info.exports.contains_key("ON"));
+}
+
 #[test]
 fn the_worked_example_translates_and_checks() {
     let path = concat!(

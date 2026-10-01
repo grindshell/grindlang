@@ -521,6 +521,9 @@ struct Checker<'a> {
     narrowed_reads: HashMap<Span, Type>,
     /// Top-level function signatures, by name.
     func_sigs: BTreeMap<String, FnType>,
+    /// Which parameters of each top-level function a `---@param` declares, by name: a function
+    /// literal passed for one takes its type ([`Self::check_arg`]).
+    declared_params: HashMap<String, Vec<bool>>,
     /// Top-level constant types, by name.
     const_types: BTreeMap<String, Type>,
     /// Nested function-literal signatures, by [`FuncBody`] span (deep-resolved at the end).
@@ -557,6 +560,7 @@ impl<'a> Checker<'a> {
             narrowed: BTreeMap::new(),
             narrowed_reads: HashMap::new(),
             func_sigs: BTreeMap::new(),
+            declared_params: HashMap::new(),
             const_types: BTreeMap::new(),
             func_literals: HashMap::new(),
             return_stack: Vec::new(),
@@ -590,6 +594,13 @@ impl<'a> Checker<'a> {
                     if !f.annotations.is_empty() {
                         self.apply_fn_annotations(f, &sig);
                     }
+                    let declared = f
+                        .body
+                        .params
+                        .iter()
+                        .map(|p| f.annotations.params.iter().any(|a| a.name.node == p.node))
+                        .collect();
+                    self.declared_params.insert(f.name.node.clone(), declared);
                     // A declared return type is the author's to give; `nil` against a
                     // non-optional one is then reported at the `return`, and a missing value
                     // at the exit that gives none (`E0480`).
@@ -834,6 +845,14 @@ impl<'a> Checker<'a> {
                     m.insert(k.clone(), self.ann_to_type(v, span));
                 }
                 Type::Record(m)
+            }
+            TypeAnn::Function { params, ret } => {
+                let params = params.iter().map(|p| self.ann_to_type(p, span)).collect();
+                let ret = match ret {
+                    Some(r) => self.ann_to_type(r, span),
+                    None => Type::Unit,
+                };
+                Type::function(params, ret)
             }
         }
     }
@@ -1552,13 +1571,7 @@ impl<'a> Checker<'a> {
             ExprKind::Paren(inner) => self.check_expr_multi(inner),
             ExprKind::Cond { cond, then, els } => self.check_cond(expr, cond, then, els),
             ExprKind::Name(_) => self.check_name(expr),
-            ExprKind::Function(body) => {
-                let sig = self.make_sig(&body.params);
-                self.infer_return_up_front(body, &sig);
-                self.func_literals.insert(body.span, sig.clone());
-                self.check_func_body(body, &sig);
-                Type::Function(sig)
-            }
+            ExprKind::Function(body) => self.check_function(body, None),
             ExprKind::Field { base, name } => self.check_field(base, name, expr.span),
             ExprKind::Index { base, index, .. } => self.check_index(base, index),
             ExprKind::Call { callee, args } => self.check_call(callee, args, expr.span),
@@ -1772,9 +1785,22 @@ impl<'a> Checker<'a> {
         }
 
         // A named top-level or host function is called directly; it is not a value.
-        let direct = match (&callee.kind, self.res.binding(callee.span)) {
-            (ExprKind::Name(_), Some(b)) => self.named_fn_type(b),
+        let binding = match &callee.kind {
+            ExprKind::Name(_) => self.res.binding(callee.span),
             _ => None,
+        };
+        let direct = binding.and_then(|b| self.named_fn_type(b));
+        // The parameters whose types are declared, which a function literal passed takes: all of
+        // a host function's (`None`).
+        let declared: Option<Vec<bool>> = match binding {
+            Some(Binding::HostFunction(_)) => None,
+            Some(Binding::TopFunction(f)) => Some(self.declared_params[f].clone()),
+            _ => Some(Vec::new()),
+        };
+        let declared = |i: usize| {
+            declared
+                .as_ref()
+                .is_none_or(|d| d.get(i).copied().unwrap_or(false))
         };
         let ct = match direct {
             Some(t) => t,
@@ -1793,8 +1819,13 @@ impl<'a> Checker<'a> {
                         span,
                     );
                 }
-                for (arg, pt) in args.iter().zip(&ft.params) {
-                    let at = self.check_expr(arg);
+                let declared: Vec<bool> = (0..ft.params.len()).map(declared).collect();
+                for ((arg, pt), declared) in args.iter().zip(&ft.params).zip(declared) {
+                    let at = if declared {
+                        self.check_arg(arg, pt)
+                    } else {
+                        self.check_expr(arg)
+                    };
                     self.require_assignable(arg.span, &at, pt, "argument type mismatch");
                 }
                 // Check any surplus args so their own errors still surface.
@@ -1904,7 +1935,7 @@ impl<'a> Checker<'a> {
             );
         }
         for (arg, pt) in args.iter().zip(&sig.params) {
-            let at = self.check_expr(arg);
+            let at = self.check_arg(arg, pt);
             self.require_assignable(arg.span, &at, pt, "argument type mismatch");
         }
         // Check any surplus args so their own errors still surface.
@@ -1912,6 +1943,50 @@ impl<'a> Checker<'a> {
             self.check_expr(arg);
         }
         (*sig.ret).clone()
+    }
+
+    /// An argument for a parameter whose type, `expected`, is declared: by the host, a memory
+    /// method, or a `---@param`, so known before any body is checked. A function literal there
+    /// takes its parameter and return types from `expected` before its body is checked, so a
+    /// misuse inside is reported where it is (`SPEC.md` §5.5). Only a declared type counts:
+    /// one inferred by the time the call is checked would make the outcome depend on the order
+    /// of the code, since a literal returning `T` is accepted for a `T?`.
+    fn check_arg(&mut self, arg: &Expr, expected: &Type) -> Type {
+        let ExprKind::Function(body) = &arg.kind else {
+            return self.check_expr(arg);
+        };
+        let expected = match self.u.shallow(expected) {
+            Type::Optional(inner) => self.u.shallow(&inner),
+            t => t,
+        };
+        match expected {
+            Type::Function(ft) if ft.params.len() == body.params.len() => {
+                self.check_function(body, Some(&ft))
+            }
+            _ => self.check_expr(arg),
+        }
+    }
+
+    /// A function literal, typed as `expected` when it is passed where that is known
+    /// ([`Self::check_arg`]).
+    fn check_function(&mut self, body: &FuncBody, expected: Option<&FnType>) -> Type {
+        let sig = self.make_sig(&body.params);
+        let mut ret_known = false;
+        if let Some(ft) = expected {
+            for (p, want) in sig.params.iter().zip(&ft.params) {
+                let _ = self.u.unify(p, want);
+            }
+            // A known return type is the caller's to give, as a `---@return` is the author's.
+            if !matches!(self.u.shallow(&ft.ret), Type::Var(_)) {
+                ret_known = self.u.unify(&sig.ret, &ft.ret).is_ok();
+            }
+        }
+        if !ret_known {
+            self.infer_return_up_front(body, &sig);
+        }
+        self.func_literals.insert(body.span, sig.clone());
+        self.check_func_body(body, &sig);
+        Type::Function(sig)
     }
 
     fn check_table(&mut self, fields: &[Field], span: Span) -> Type {

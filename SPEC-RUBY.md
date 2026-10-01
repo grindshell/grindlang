@@ -5,12 +5,12 @@
 > Ruby forms are accepted and which SPEC.md construct each one becomes. Where this document is
 > silent, SPEC.md governs.
 >
-> Status: **draft, partly implemented.** Behind the `ruby` feature: the lexer and parser (§2,
-> §3, and the syntax rejections of §6; `grindlang::ruby::parse`), and the translation of §4
-> into the shared tree (`grindlang::ruby::parse_module`). The DSL keywords of §5 are next
-> (R5). The decisions below were confirmed with the stakeholder on 2026-09-30; details marked
-> _(open)_ are still to settle. Items that depend on a core change name it (C2–C9, PLAN.md
-> Phase 10).
+> Status: **draft, implemented.** Behind the `ruby` feature: the lexer and parser (§2, §3, and
+> the syntax rejections of §6; `grindlang::ruby::parse`), and the translation of §4 and the DSL
+> keywords of §5 into the shared tree (`grindlang::ruby::parse_module`). Next is integration
+> (R6): `Engine::compile_ruby`, the CLI, and this document out of draft. The decisions below
+> were confirmed with the stakeholder on 2026-09-30; details marked _(open)_ are still to
+> settle. Items that depend on a core change name it (C2–C10, PLAN.md Phase 10).
 
 ## 1. What a Ruby-surface script is
 
@@ -298,8 +298,8 @@ A declared `# @return number` keeps its type, so reaching the end is then an err
 as is reaching it in a `def` that returns several values (`return a, b`) on another path.
 Explicit `return` otherwise works as in SPEC.md.
 
-A DSL block's return follows its declared signature instead (§5): a block declared to return
-nothing never gets an implicit `return`.
+A DSL keyword's block returns as its declared signature says instead (§5.3): a block declared
+to return nothing never gets an implicit `return`.
 
 ### 4.3 Local variables
 A Ruby local is declared by its first assignment, as Ruby's parser sees it: a name is a local
@@ -546,9 +546,24 @@ parallel. SPEC.md §5.5's exact-arity rules apply.
 
 ## 5. DSL keywords
 
-The host may declare **keywords** in `RubyConfig`. A keyword is written as a call without
-parentheses at the start of a statement (§3.4). There are two kinds, both built by top-level
-code, so what they build is frozen once the module has initialized.
+The host may declare **keywords** on `RubyConfig` (§5.4). There are two kinds: a **handler**
+keyword gathers blocks into a table of closures, and a **data** keyword builds a table of
+records. A keyword is written as a call without parentheses (§3.4), as a statement of its own
+directly at the top level, and a data keyword's **nested** keywords directly in its block.
+Anywhere else — in a `def`, a block, a branch, or a loop, or under a modifier — a keyword is
+`E0612`, as is a `def` or constant taking the name of a keyword, its table, or its dispatch
+function. A nested keyword's name means nothing special outside its parent's block, so a `def`
+or host function may have it.
+
+Each use is ordinary top-level code that runs where it is written. The first use of a keyword
+declares its **table**, an exported constant mapping each id to an entry, and each later use
+adds to it, so what the keywords build is frozen once the module has initialized, and a table
+read before its first use has run is a runtime error, as for any constant (SPEC.md §3.1). A
+script that never uses a keyword has no table for it, since SPEC.md has no empty map (§4.6).
+
+Every top-level use starts with its **id**: a symbol or a string written out, `:hit` or
+`"hit"` (`E0614` otherwise, `E0615` without one). An id names one entry of its keyword
+(`E0616`), and `:hit` and `"hit"` are the same id.
 
 ### 5.1 Handler keywords
 ```ruby
@@ -563,16 +578,13 @@ on :heal do |amount|
 end
 ```
 
-The host declares the keyword's name, its block's signature (here `fn(number)`), the constant
-that collects the blocks, and the name of a generated dispatch function. The script above
-becomes:
+The host declares the keyword's name, its table, the signature every block must fit (here
+`fn(number)`), and optionally a **dispatch function** (here `on_event`). The script above
+becomes, in effect:
 
 ```lua
 MAX_HP = 100
-ON = {}
-ON["hit"] = function(dmg)
-  mem.hp = mem.hp - dmg
-end
+ON = { ["hit"] = function(dmg) mem.hp = mem.hp - dmg end }
 ON["heal"] = function(amount)
   mem.hp = math.min(math.max(mem.hp + amount, 0), MAX_HP)
 end
@@ -583,13 +595,17 @@ function on_event(id, arg)
 end
 ```
 
-- The first argument is the handler's id: a symbol or string literal. A repeated id is an
-  error.
-- Every block must fit the declared signature, since one table holds them all.
-- A handler body may use host memory: it runs when called, after memory is bound. The table
-  itself is frozen, so a handler can't replace another.
+- A use takes its id and a block, nothing else: a `key:` argument is `E0613`, another argument
+  `E0614`, and a use without a block `E0615`. The block is a function of the declared
+  signature (§5.3).
+- The dispatch function takes the id and the block's arguments, and runs the handler for that
+  id, giving what it gives; for an id with no handler it does nothing and gives `nil`, so it
+  returns the block's type made optional. With no handler at all, it does nothing.
+- A handler may use host memory: it runs when called, after memory is bound. The table is
+  frozen, so a handler can't replace another.
 - The host calls `on_event("hit", 7.0)`, or reads the table with `Module::call("ON", vec![])`
-  (SPEC.md §7.1) and invokes entries with `Module::call_value`.
+  (SPEC.md §7.1) and invokes an entry with `Module::call_value`. Scripts may call the
+  dispatch function too.
 
 ### 5.2 Data keywords
 ```ruby
@@ -602,50 +618,99 @@ node :shop do
 end
 ```
 
-The host declares a schema: the record each keyword builds, which arguments fill which fields
-(positional arguments, `key:` arguments, and the block), which nested keywords append to which
-array fields, and where top-level records go (here, a constant map `NODES` keyed by id). Every
-field has a type and, unless required, a default, so every record of one keyword has the same
-shape. With `if:` defaulting to `-> { true }` and the block to `-> {}`, the script becomes:
+The host declares the record each keyword builds, field by field: a field is filled by a
+positional argument, a named argument (`if:`), the keyword's block, or the nested keywords in
+its block, each of which adds to an array. Every field has a type, and every record of one
+keyword has every field. With `choice`'s `if:` and block optional, the script becomes, in
+effect:
 
 ```lua
-NODES = {}
-NODES["shop"] = {
-  lines = { "What'll it be?" },
-  choices = {
-    { text = "Buy a potion",
-      cond = function() return mem.gold >= 5 end,
-      effect = function() mem.gold = mem.gold - 5 end },
-    { text = "Leave",
-      cond = function() return true end,
-      effect = function() end },
+NODES = {
+  ["shop"] = {
+    lines = { "What'll it be?" },
+    choices = {
+      { text = "Buy a potion",
+        cond = function() return mem.gold >= 5 end,
+        effect = function() mem.gold = mem.gold - 5 end },
+      { text = "Leave", cond = nil, effect = nil },
+    },
   },
 }
 ```
 
-Unknown keywords, unknown `key:` arguments, missing required fields, and repeated ids are
-errors. The host reads `NODES` through `Module::call` and runs `cond` and `effect` with
+- Positional arguments fill the positional fields in order, after the id at the top level;
+  more than there are fields is `E0614`. A named argument fills its field: one the keyword
+  doesn't have is `E0613`, and one given twice `E0614`.
+- The block either fills a field, as a function (§5.3), or holds nested keywords and nothing
+  else (`E0613`), taking no parameters (`E0614`). A **list** keyword (`say`) takes one value,
+  and a **nested data** keyword (`choice`) builds a record as a top-level one does, without an
+  id. Each adds to its array in the order written.
+- A field a use leaves out takes its default: `nil` for an optional one, the literal the host
+  gave, or an empty array for nested keywords. Leaving out any other is `E0615`.
+- The arguments are top-level code, evaluated when the use runs, so they can't use host
+  memory (`E0310`); blocks and lambdas are functions, which may, when the host calls them. A
+  use's arguments are evaluated in the order the host declared its fields, not the order they
+  are written, which only a host function with side effects could tell.
+
+The host reads `NODES` through `Module::call` and runs `cond` and `effect` with
 `Module::call_value`.
 
-### 5.3 Declaring keywords _(open: final API)_
-A sketch of the embedding side; the names are illustrative:
+### 5.3 Blocks and types
+A keyword's block, and a lambda written as an argument for a field of function type, become
+functions of the declared type:
 
+- It may leave out parameters at the end that it doesn't use; more than the type has is
+  `E0614`.
+- Its last expression gives its value only if the type gives one (§4.2): a block that gives
+  nothing never gets an implicit return, so `on :hit do |d| log(d) end` doesn't return what
+  `log` does.
+- Its parameters and return type are the declared ones before its body is checked (SPEC.md
+  §5.5, C10), so a mistake inside is reported where it is: `@name = d` for a `number` `d` is
+  an assignment mismatch at `@name`.
+
+Every argument is checked against its field's declared type where it is written. To do it, the
+translator declares one private function per keyword, before any other code, whose parameters
+are annotated with the declared types, and each use calls it: a record's builds the record,
+and a handler's or list keyword's gives back its argument. They and the dispatch functions
+have names no Ruby name can be (`choice#3`).
+
+### 5.4 Declaring keywords
 ```rust
 let mut ruby = RubyConfig::new().ivar_memory("mem");
-ruby.handler("on")
+ruby.handler("on", "ON")
     .block(&[Type::Number], Type::Unit)
-    .table("ON")
     .dispatch("on_event");
-ruby.data("node")
-    .keyed_into("NODES")
+ruby.data("node", "NODES")
     .list("say", "lines", Type::String)
     .child("choice", "choices", |c| {
         c.positional("text", Type::String)
-            .keyword("if", "cond", &[], Type::Bool, "-> { true }")
-            .block("effect", &[], Type::Unit, "-> {}")
+            .keyword("if", "cond", Type::function(vec![], Type::Bool))
+            .optional()
+            .block("effect", &[], Type::Unit)
+            .optional()
     });
-let module = engine.compile_ruby(src, &ruby)?;
+let module = ruby::parse_module(src, &ruby, &engine.type_config())?;
+let mut game = engine.compile_module(&module)?;
 ```
+
+- `handler(keyword, table)` declares a handler keyword. `block(params, ret)` sets the
+  signature its blocks fit, `ret` `Type::Unit` for none, and without it a block takes and gives
+  nothing; `dispatch(name)` adds the dispatch function.
+- `data(keyword, table)` declares a data keyword and returns its `Schema`, on which fields are
+  declared in order: `positional(field, ty)`; `keyword(label, field, ty)`, whose label may be a
+  Ruby keyword (`if:`); `block(field, params, ret)`; `list(keyword, field, ty)`, an array of
+  `ty`; and `child(keyword, field, |schema| …)`, an array of records. `optional()` lets a use
+  leave out the field declared last, which is then `nil`, making its type optional, and
+  `default(value)` gives it a literal default: `nil`, a bool, a number, or a string of its type.
+  A field whose type is optional is optional already.
+- The declarations panic on what no script could use: a name that isn't one; a keyword name
+  that is a Ruby keyword or that the translator gives a meaning (`lambda`, `format`, `math`, …);
+  a keyword, table, or dispatch name another keyword already takes; a type a script can't write
+  (a tuple, host userdata, or `()` other than as what a function gives); a block that fills two
+  fields, or a field and nested keywords; or a default that doesn't fit.
+- `Engine::type_config` is the `TypeConfig` an engine checks scripts against, which the
+  translator reads memory from. `Engine::compile_ruby` (PLAN.md Phase 10, R6) will take the
+  `RubyConfig` directly.
 
 ## 6. Rejected constructs
 
@@ -712,6 +777,18 @@ once for its branches.
     a block, a loop's receiver, a `case`'s subject, or the start of a method chain in one.
   - `E0611`: a collection method's block that gives no value — empty, or ending in a statement
     with no value — or with `next` or `break` directly in it.
+- **DSL keywords** (E06xx, §5):
+  - `E0612`: a keyword anywhere but as a statement directly at the top level, or for a nested
+    keyword, directly in its parent's block; a `def` or constant named after a keyword, its
+    table, or its dispatch function.
+  - `E0613`: an unknown keyword — a statement in a data keyword's block that isn't one of its
+    nested keywords — or a named argument the keyword doesn't have.
+  - `E0614`: arguments that don't fit: an id that isn't a symbol or string written out, more
+    positional arguments than the keyword takes, a named argument given twice, a block the
+    keyword doesn't take, block parameters where the block holds nested keywords, or a block
+    or lambda with more parameters than its declared type.
+  - `E0615`: something missing: an id, a block a handler needs, or a required field.
+  - `E0616`: an id already used by the same keyword.
 
 ## 7. Worked example
 
@@ -786,11 +863,15 @@ return { XP_BASE = XP_BASE, xp_for = xp_for, best_name = best_name }
   index needs the zero-based flag (C9) carried into the runtime error.
 - **`::` for `Math::PI`.** Accept `Math::PI` and `Math.sqrt` as spellings of `math.*`, or only
   the latter.
-- **The keyword declaration API** (§5.3), settled in PLAN.md Phase 10, step R5.
 - **Empty hashes.** SPEC.md types `{}` as an empty array and has no way to write an empty map,
-  so a hash needs at least one entry for now (`E0608`). Options: type `{}` by its uses in the
-  checker (the interpreter, which has no types, then needs to know which one it built), or an
-  empty-map node only the Ruby translator makes. Either is a core change.
+  so a hash needs at least one entry for now (`E0608`), and a keyword a script never uses has
+  no table (§5). Options: type `{}` by its uses in the checker (the interpreter, which has no
+  types, then needs to know which one it built), or an empty-map node only the Ruby translator
+  makes. Either is a core change.
+- **Defaults beyond literals.** A keyword's field defaults to `nil` or a literal (§5.4). A
+  default function, such as `-> { true }` for a condition, would let the host call a field
+  without checking for `nil`; it needs a default written in Ruby, which has no place in the
+  script's source to point a diagnostic at.
 - **Guard clauses.** `return 0 if x.nil?` narrows nothing after it (SPEC.md §5.3), which rules
   out a common Ruby idiom; narrowing after an early return is a core change that would serve
   Lua scripts equally.

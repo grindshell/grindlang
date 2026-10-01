@@ -108,6 +108,58 @@ impl Executors {
         ]
     }
 
+    /// Call, on every executor, the closure found at `path` in the value of the export `name`:
+    /// each step is a table's key, or a 1-based position in an array.
+    pub fn call_entry(
+        &mut self,
+        name: &str,
+        path: &[&str],
+        args: Vec<Value>,
+    ) -> [(&'static str, Result<Value, RunError>); 4] {
+        let find = |got: Result<Value, RunError>| -> Value {
+            let root = got.unwrap_or_else(|e| panic!("reading `{name}`: {e}"));
+            path.iter()
+                .fold(root, |v, step| match step.parse::<usize>() {
+                    Ok(i) => v.as_array().expect("an array")[i - 1].clone(),
+                    Err(_) => v
+                        .field(step)
+                        .unwrap_or_else(|| panic!("no `{step}` in {v}")),
+                })
+        };
+        let f = find(self.interp.call(name, vec![]));
+        let interp = self.interp.call_value_public(f, args.clone());
+        let f = find(self.vm.call(name, vec![]));
+        let vm = self.vm.call_value(f, args.clone());
+        let f = find(self.jit.call(name, vec![]));
+        let jit = self.jit.call_value(f, args.clone());
+        let f = find(self.eager.call(name, vec![]));
+        let eager = self.eager.call_value(f, args);
+        [
+            ("AST", interp),
+            ("IR", vm),
+            ("JIT", jit),
+            ("eager JIT", eager),
+        ]
+    }
+
+    /// Assert every executor's closure at `path` in the export `name` returns `want`
+    /// ([`Self::call_entry`]).
+    #[track_caller]
+    pub fn assert_entry_returns(
+        &mut self,
+        name: &str,
+        path: &[&str],
+        args: Vec<Value>,
+        want: &str,
+    ) {
+        for (oracle, got) in self.call_entry(name, path, args) {
+            match got {
+                Ok(v) => assert_eq!(v.to_string(), want, "{oracle}: `{name}` at {path:?}"),
+                Err(e) => panic!("{oracle} failed on `{name}` at {path:?}: {e}"),
+            }
+        }
+    }
+
     /// Assert every executor returns `want` (by `Display`) from `func(args)`.
     #[track_caller]
     pub fn assert_returns(&mut self, func: &str, args: Vec<Value>, want: &str) {

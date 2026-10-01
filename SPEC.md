@@ -557,6 +557,14 @@ it.
   sibling closures. A module variable is not captured — every function reads it directly — and
   a closure kept in a module value is frozen with it: it may read what it captured, but
   assigning it is a runtime error (§3.1).
+- A function literal passed as an argument whose parameter has a **declared** function type — in
+  a host function's or memory method's signature, or a `---@param` — takes that type before its
+  body is checked, as a `---@param`/`---@return` gives a top-level function its type: its
+  parameters are typed by it, and its `return`s are checked against its return type, so a
+  literal returning a `number` is accepted where a `fn() -> number?` is declared. A mistake in
+  its body is then reported where it is, rather than as an argument mismatch. Anywhere else,
+  including for a parameter whose type is only inferred, a literal is typed by its body and then
+  matched, so whether a program checks never depends on which code is checked first.
 - A closure is a **first-class value**: it may be returned (including across the host
   boundary) and held by the host, which can re-invoke it later — multiple times, observing
   mutations to its upvalues between calls (`Module::call_value`). A returned closure keeps its
@@ -607,7 +615,9 @@ field   ::= Name ':' type
 
 Postfix binds left-to-right: `number[]?` is an optional array; `number?[]` is an array of
 optionals. Record and map literals may nest. Function types (`fn(...)->...`) and host
-`userdata` are **not** yet spellable in an annotation.
+`userdata` are **not** yet spellable in an annotation. (The tree has a function-type
+annotation, which only another surface's translator writes: SPEC-RUBY.md §5 annotates the
+functions its keywords generate with it.)
 
 An annotation is applied **before** the body is checked, so a record/array parameter's shape
 is visible to the body. An annotation that **contradicts** how the body uses the value is a

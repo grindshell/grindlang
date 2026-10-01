@@ -42,6 +42,7 @@ use std::collections::HashSet;
 
 use super::RubyConfig;
 use super::ast as rb;
+use super::dsl::Dsl;
 use super::scope::{self, Scopes};
 use crate::ast::{
     self, BinOp, Block, ConstDecl, Expr, ExprKind, Fallthrough, Field, FuncBody, FuncDecl, Ident,
@@ -84,6 +85,7 @@ pub(super) fn translate(
         chain: Vec::new(),
         loops: Vec::new(),
         collecting: None,
+        dsl: Dsl::new(program.span.end),
     };
     let module = t.program(program);
     if t.diags.has_errors() {
@@ -124,6 +126,8 @@ pub(super) struct Translator<'a> {
     /// The collection method whose block is the innermost loop being translated, if it is one:
     /// `next` and `break` directly in it are `E0611`.
     pub(super) collecting: Option<&'static str>,
+    /// The DSL keywords' builders, tables, and ids so far (`dsl.rs`).
+    pub(super) dsl: Dsl,
 }
 
 // ---- building nodes ------------------------------------------------------------------------
@@ -312,7 +316,7 @@ impl<'a> Translator<'a> {
         self.diags.push(Diagnostic::error(code, msg, span));
     }
 
-    fn error_count(&self) -> usize {
+    pub(super) fn error_count(&self) -> usize {
         self.diags.iter().count()
     }
 
@@ -348,6 +352,9 @@ impl<'a> Translator<'a> {
         for item in &p.items {
             match item {
                 rb::Item::Def(d) => {
+                    if let Some(msg) = self.keyword_claims(&d.name.node) {
+                        self.error("E0612", msg, d.name.span);
+                    }
                     if d.visibility.unwrap_or(visibility) == rb::Visibility::Public {
                         exports.push(d.name.clone());
                     } else {
@@ -356,9 +363,14 @@ impl<'a> Translator<'a> {
                     decls.push(TopDecl::Function(self.def(d)));
                 }
                 rb::Item::Visibility(v) => visibility = v.node,
-                rb::Item::Stmt(s) => self.top_stmt(s, &mut decls, &mut exports),
+                rb::Item::Stmt(s) => {
+                    if !self.top_keyword(s, &mut decls, &mut exports) {
+                        self.top_stmt(s, &mut decls, &mut exports);
+                    }
+                }
             }
         }
+        self.finish_keywords(&mut decls, &mut exports);
         // Private `def`s are plain functions, visible to the whole file as Ruby methods are, so
         // an export table leaves them out (`SPEC-RUBY.md` §4.1).
         let export = private.then(|| {
@@ -385,6 +397,10 @@ impl<'a> Translator<'a> {
             && let [target] = targets.as_slice()
             && let rb::ExprKind::Const(c) = &target.kind
         {
+            if let Some(msg) = self.keyword_claims(c) {
+                self.error("E0612", msg, target.span);
+                return;
+            }
             if values.len() != 1 {
                 self.error(
                     "E0604",
@@ -1462,6 +1478,10 @@ impl<'a> Translator<'a> {
             );
             return expr(ExprKind::Nil, span);
         }
+        if let Some(msg) = self.misplaced_keyword(n) {
+            self.error("E0612", msg, span);
+            return expr(ExprKind::Nil, span);
+        }
         call(name(n, span), Vec::new(), span)
     }
 
@@ -1602,6 +1622,12 @@ impl<'a> Translator<'a> {
         span: Span,
     ) -> Expr {
         let n = callee.node.as_str();
+        if !self.scopes.locals.contains(&callee.span)
+            && let Some(msg) = self.misplaced_keyword(n)
+        {
+            self.error("E0612", msg, callee.span);
+            return expr(ExprKind::Nil, span);
+        }
         if let Some(b) = block {
             self.error(
                 "E0521",

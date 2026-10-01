@@ -423,7 +423,7 @@ history before the commit that deleted it.
 
 A second syntax for the same language: a strict subset of Ruby's syntax aimed at game logic and
 dialog DSLs. [`SPEC-RUBY.md`](SPEC-RUBY.md) (draft) is its authoring contract; this section is
-why it is built the way it is. R0–R4 are done; the rest is not implemented yet.
+why it is built the way it is. R0–R5 are done; R6, integration, remains.
 
 **Approach: translate into the shared AST.** The backends only see `ir::Program`, and
 everything above the IR sees `ast::Module`. A Ruby frontend that translates into `ast::Module`
@@ -543,6 +543,18 @@ differential cases (AGENTS.md §6).
   `a[i + 1]` gives) and the interpreter add 1 before the element read or write; a map or record
   key is used as written. No IR op, runtime, or backend change. `tests/core_changes.rs` holds
   both changes to all three oracles, C9 through Lua marked zero-based.
+- **C10 — a function literal takes a declared parameter's type.** ✅ Done, with R5, which needs
+  it so a mistake in a keyword's block is reported where it is. A function literal passed for a
+  parameter whose function type is declared (a host function's or memory method's signature, or
+  a `---@param`) is typed by it before its body is checked (`types.rs` `check_arg`), as a
+  top-level function is by its annotations; elsewhere it is typed by its body and then matched,
+  as before. A known return type is taken as given, so a literal returning `T` is now accepted
+  for a declared `fn() -> T?`. Only a declared type counts: one inferred by the time the call
+  is checked would make that acceptance depend on the order of the code. The checker also
+  converts a new `TypeAnn::Function`, which no source spells (function types in annotations
+  stay deferred); the Ruby keywords annotate their generated functions with it. Checker only;
+  SPEC.md §5.5 records it, and `tests/core_changes.rs` holds it to all three oracles through a
+  host function that takes a callback.
 
 #### Steps
 
@@ -646,9 +658,38 @@ counts exclude tests; the total is about 6k.
   `tests/ruby_twins/collect` pins each method's loop to its Lua spelling; and
   `tests/ruby_translate.rs` covers `E0602`, `E0610`, `E0611`, and `E0412`. (~450 lines without
   tests, against the ~400 estimated.)
-- **R5 — DSL layer.** The keyword declaration API, handler and data keywords, E06xx for unknown
-  keywords, repeated ids, and missing fields, and `examples/embed_ruby.rs` with event handlers
-  and a small dialog tree. (~700 lines)
+- **R5 — DSL layer.** ✅ Done, in `ruby/dsl.rs`, with C10 (above) and `Engine::type_config`
+  made public, which a host translating a Ruby script needs until R6's `compile_ruby`. What
+  settling it took, recorded in SPEC-RUBY.md §5 and §6:
+  - The declaration API: `RubyConfig::handler(keyword, table)`, with `block(params, ret)` and
+    `dispatch(name)`, and `RubyConfig::data(keyword, table)`, returning a `Schema` with
+    `positional`, `keyword`, `block`, `list`, `child`, `optional`, and `default`. A declaration
+    panics on what no script could use: a name that isn't one or that Ruby or the translator
+    already gives a meaning, a name another keyword takes, a type a script can't write, or a
+    default that doesn't fit.
+  - Defaults are `nil` or a literal, not Ruby code as sketched (`-> { true }`): a default
+    written in Ruby has no place in the script to point a diagnostic at. An open item.
+  - Keywords are written only as statements directly at the top level, and nested keywords
+    directly in their parent's block (`E0612`), so ids are literals, checked for repeats when
+    translating (`E0616`). Each use is top-level code where it is written: the first declares
+    the table, an exported constant map, and later ones assign into it. A keyword never used
+    has no table, since SPEC.md has no empty map; its dispatch function still exists, doing
+    nothing.
+  - Declared types are enforced with no change to the checker beyond C10: each keyword gets a
+    *builder*, a private function declared before any other code whose parameters carry the
+    declared types as annotations, and each use calls it, so the checker checks every argument
+    where it is written. A use's arguments are therefore evaluated in the order of the
+    declared fields. Generated names take spans past the end of the source, which no node of
+    the script has.
+  - A block, or a lambda for a field of function type, may leave out trailing parameters, and
+    gives a value only if its declared type does.
+  Tests: `tests/ruby_corpus.rs` drives handlers, dispatch functions, and a dialog tree's records
+  and closures on all four executors (`Executors::call_entry` calls a closure found inside an
+  export); `tests/ruby_translate.rs` pins `E0612`–`E0616`, checker errors inside blocks, and
+  `E0310` in arguments in a snapshot, and checks the exported signatures; unit tests cover the
+  declaration panics; and `examples/embed_ruby.rs` runs events and walks a dialog. (~1.4k lines
+  without tests, twice the ~700 estimated: the declaration API and its checks are about 600 of
+  them, and many messages name exactly what a use is missing.)
 - **R6 — integration.** `Engine::compile_ruby`; the CLI's `.rb` detection, `--surface`, the
   surface in the cache key, and an option to print the translated module as Lua for debugging;
   Ruby programs in the fuzz corpus; a parse-and-translate benchmark beside the Lua one; docs

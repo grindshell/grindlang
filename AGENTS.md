@@ -67,8 +67,9 @@ other feature required.
   pyc-style IR cache is default-on; the library itself keeps `serde` optional.
 - `ruby` — the Ruby surface (`src/ruby/`, `SPEC-RUBY.md`, `PLAN.md` Phase 10): its lexer and
   parser (`ruby::parse`, to a Ruby-shaped tree) and the translation into the shared
-  `ast::Module` (`ruby::parse_module`), which then runs through the Lua pipeline unchanged.
-  Front end only; needs no backend feature.
+  `ast::Module` (`ruby::parse_module`), which then runs through the Lua pipeline unchanged,
+  including the DSL keywords a host declares on `RubyConfig` (`SPEC-RUBY.md` §5). Front end
+  only; needs no backend feature.
 
 **Gating rule:** items needed by *any* execution backend (the runtime `Value` reference
 variants `Cell`/`Closure`, `NativeFn`, `ClosureObj`, and the builtin reference impls in

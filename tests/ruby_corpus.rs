@@ -1032,6 +1032,150 @@ end
     ex.assert_returns("status", vec![], "100 hp, 0 gold");
 }
 
+/// The DSL keywords (`SPEC-RUBY.md` §5): handler tables and their dispatch functions, and records
+/// built from arguments, defaults, blocks, and nested keywords.
+#[test]
+fn dsl_keywords() {
+    let (cfg, mut rb) = memory_cfg();
+    rb.handler("on", "ON")
+        .block(&[Type::Number], Type::Unit)
+        .dispatch("on_event");
+    rb.handler("check", "CHECKS")
+        .block(&[Type::Number, Type::Number], Type::Bool)
+        .dispatch("run_check");
+    rb.data("node", "NODES")
+        .keyword("title", "title", Type::String)
+        .default(string("untitled"))
+        .list("say", "lines", Type::String)
+        .child("choice", "choices", |c| {
+            c.positional("text", Type::String)
+                .keyword(
+                    "if",
+                    "cond",
+                    Type::optional(Type::function(vec![], Type::Bool)),
+                )
+                .keyword("weight", "weight", Type::Number)
+                .default(num(1.0))
+                .block("effect", &[], Type::Unit)
+                .optional()
+        });
+    let mut ex = ruby_with(
+        r##"
+MAX_HP = 100
+
+on :hit do |dmg|
+  @hp -= dmg
+  @hp = 0 if @hp < 0
+end
+
+on :heal do |amount|
+  @hp = (@hp + amount).clamp(0, MAX_HP)
+end
+
+# Leaves out the parameter it doesn't use.
+on "reset" do
+  @hp = MAX_HP
+end
+
+check :rich do |n, times|
+  total = n * times
+  @gold >= total
+end
+
+check :any do
+  true
+end
+
+check :in_range do |lo, hi|
+  n = [lo, hi].select { |x| x <= @hp }.count { |x| x >= 0 }
+  n == 2
+end
+
+node :shop, title: "Shop" do
+  say "What'll it be?"
+  choice "Buy a potion", if: -> { @gold >= 5 } do
+    @gold -= 5
+    @hp += 10
+  end
+  say "Anything #{"else"}?"
+  choice "Leave", weight: 2
+end
+
+node :empty
+
+def hit_twice(n)
+  on_event("hit", n)
+  on_event("hit", n)
+end
+"##,
+        &cfg,
+        &rb,
+    );
+    let make = || {
+        let mut m = BTreeMap::new();
+        m.insert("hp".to_string(), num(50.0));
+        m.insert("gold".to_string(), num(7.0));
+        Value::table(m)
+    };
+    ex.set_memory("mem", make);
+
+    ex.assert_returns("on_event", vec![string("hit"), num(20.0)], "nil");
+    ex.assert_memory("mem", "{gold = 7, hp = 30}");
+    ex.assert_returns("hit_twice", vec![num(20.0)], "nil");
+    ex.assert_memory("mem", "{gold = 7, hp = 0}");
+    ex.assert_returns("on_event", vec![string("heal"), num(500.0)], "nil");
+    ex.assert_memory("mem", "{gold = 7, hp = 100}");
+    ex.assert_returns("on_event", vec![string("hit"), num(1.0)], "nil");
+    ex.assert_returns("on_event", vec![string("reset"), num(0.0)], "nil");
+    // An id with no handler does nothing.
+    ex.assert_returns("on_event", vec![string("nope"), num(1.0)], "nil");
+    ex.assert_memory("mem", "{gold = 7, hp = 100}");
+
+    ex.assert_returns(
+        "run_check",
+        vec![string("rich"), num(2.0), num(3.0)],
+        "true",
+    );
+    ex.assert_returns(
+        "run_check",
+        vec![string("rich"), num(2.0), num(4.0)],
+        "false",
+    );
+    ex.assert_returns("run_check", vec![string("any"), num(0.0), num(0.0)], "true");
+    ex.assert_returns(
+        "run_check",
+        vec![string("in_range"), num(0.0), num(100.0)],
+        "true",
+    );
+    ex.assert_returns(
+        "run_check",
+        vec![string("in_range"), num(-1.0), num(100.0)],
+        "false",
+    );
+    ex.assert_returns("run_check", vec![string("nope"), num(0.0), num(0.0)], "nil");
+    ex.assert_returns(
+        "ON",
+        vec![],
+        "{heal = function, hit = function, reset = function}",
+    );
+
+    ex.assert_returns(
+        "NODES",
+        vec![],
+        "{empty = {choices = [], lines = [], title = untitled}, shop = {choices = [{cond = \
+         function, effect = function, text = Buy a potion, weight = 1}, {cond = nil, effect = \
+         nil, text = Leave, weight = 2}], lines = [What'll it be?, Anything else?], title = Shop}}",
+    );
+    // The host runs a choice's condition and effect.
+    let potion = ["shop", "choices", "1"];
+    ex.assert_entry_returns("NODES", &[&potion[..], &["cond"]].concat(), vec![], "true");
+    ex.assert_entry_returns("NODES", &[&potion[..], &["effect"]].concat(), vec![], "nil");
+    ex.assert_memory("mem", "{gold = 2, hp = 110}");
+    ex.assert_entry_returns("NODES", &[&potion[..], &["cond"]].concat(), vec![], "false");
+    ex.assert_entry_returns("ON", &["hit"], vec![num(10.0)], "nil");
+    ex.assert_memory("mem", "{gold = 2, hp = 100}");
+}
+
 #[test]
 fn best_name_from_the_worked_example() {
     // SPEC-RUBY.md §7.

@@ -1,4 +1,4 @@
-//! The core changes the Ruby surface needs (`PLAN.md` Phase 10, C2–C4, C8, and C9), held to all
+//! The core changes the Ruby surface needs (`PLAN.md` Phase 10, C2–C4 and C8–C10), held to all
 //! three oracles. They are part of the core language, so these run without the `ruby` feature.
 
 #![cfg(all(feature = "interp", feature = "jit"))]
@@ -9,7 +9,7 @@ use common::Executors;
 use grindlang::ast::{
     Block, Expr, ExprKind, Fallthrough, Field, FuncBody, IterExpr, Module, Stat, StatKind, TopDecl,
 };
-use grindlang::{Diagnostics, TypeConfig, Value};
+use grindlang::{Diagnostics, FnType, Type, TypeConfig, Value};
 
 fn num(n: f64) -> Value {
     Value::Number(n)
@@ -584,6 +584,45 @@ fn a_path_without_a_value_returns_nil() {
     ex.assert_returns("mixed", vec![Value::Bool(false)], "nil");
     ex.assert_returns("closure", vec![num(3.0)], "3");
     ex.assert_returns("closure", vec![num(-3.0)], "-1");
+}
+
+// ---- C10: a function literal takes a declared parameter's type ---------------------------------
+
+/// A host function `keep` of type `fn(ty) -> ty`, which gives back the function it is passed.
+fn keeping(ty: Type) -> TypeConfig {
+    let mut cfg = TypeConfig::default();
+    cfg.host_functions.insert(
+        "keep".to_string(),
+        FnType {
+            params: vec![ty.clone()],
+            ret: Box::new(ty),
+        },
+    );
+    cfg
+}
+
+#[test]
+fn a_function_literal_takes_a_declared_parameters_type() {
+    // `keep` takes a `fn() -> number?`, which a literal giving a `number` now is.
+    let cfg = keeping(Type::function(vec![], Type::optional(Type::Number)));
+    let src = "function one()\n  local f = keep(function() return 1 end)\n  return f()\nend\n\
+               function none()\n  local f = keep(function() return nil end)\n  return f()\nend\n";
+    let mut ex = Executors::new(src, &cfg);
+    ex.set_host_function("keep", |args: &[Value]| Ok(args[0].clone()));
+    ex.assert_returns("one", vec![], "1");
+    ex.assert_returns("none", vec![], "nil");
+
+    // Its parameter is typed before its body is checked, so a misuse is reported where it is.
+    let cfg = keeping(Type::function(vec![Type::Number], Type::Number));
+    let src = "function f()\n  return keep(function(n) return not n end)\nend\n";
+    let d = grindlang::analyze(src, &cfg).unwrap_err();
+    let first = d.iter().next().unwrap();
+    assert_eq!((first.code, first.span.slice(src)), ("E0450", "n"));
+    // And its returns are checked against the declared type.
+    let src = "function f()\n  return keep(function(n) return n > 1 end)\nend\n";
+    let d = grindlang::analyze(src, &cfg).unwrap_err();
+    let first = d.iter().next().unwrap();
+    assert_eq!((first.code, first.span.slice(src)), ("E0413", "n > 1"));
 }
 
 #[test]

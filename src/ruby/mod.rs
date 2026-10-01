@@ -11,10 +11,13 @@
 pub mod ast;
 mod collect;
 mod desugar;
+mod dsl;
 pub mod lexer;
 mod methods;
 mod parser;
 mod scope;
+
+pub use dsl::{HandlerKeyword, Schema};
 
 use crate::diagnostics::Diagnostics;
 use crate::types::TypeConfig;
@@ -25,6 +28,9 @@ pub struct RubyConfig {
     /// The host memory binding `@name` is a field of (`SPEC-RUBY.md` §4.10). Without one,
     /// `@name` is an error.
     pub ivar_memory: Option<String>,
+    /// The DSL keywords (§5), declared with [`handler`](Self::handler) and
+    /// [`data`](Self::data).
+    keywords: Vec<dsl::Keyword>,
 }
 
 impl RubyConfig {

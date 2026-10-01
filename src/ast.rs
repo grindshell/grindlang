@@ -78,6 +78,13 @@ pub enum TypeAnn {
     Map(Box<TypeAnn>),
     /// `{ k1: T1, k2: T2 }`
     Record(Vec<(String, TypeAnn)>),
+    /// A function type, `ret` `None` for one that returns nothing. No source spelling yet
+    /// (`SPEC.md` §5.6 defers function types); the Ruby surface's keywords annotate the functions
+    /// they generate with it (`SPEC-RUBY.md` §5).
+    Function {
+        params: Vec<TypeAnn>,
+        ret: Option<Box<TypeAnn>>,
+    },
 }
 
 /// Type annotations attached to a [`FuncDecl`] from its `---@` doc-comment block.

@@ -303,6 +303,11 @@ const RESERVED: &[&str] = &[
     "__END__",
 ];
 
+/// Whether `word` is a keyword of the Ruby surface or a word it reserves.
+pub(super) fn is_reserved(word: &str) -> bool {
+    keyword(word).is_some() || RESERVED.contains(&word)
+}
+
 /// Lex `src` into a token stream ending in [`TokenKind::Eof`], plus every `#` comment, which the
 /// parser searches for the annotations above a `def`.
 ///

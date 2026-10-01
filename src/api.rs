@@ -507,8 +507,10 @@ impl Engine {
         self
     }
 
-    /// The [`TypeConfig`] implied by the registered host functions and memory.
-    fn type_config(&self) -> TypeConfig {
+    /// The [`TypeConfig`] implied by the registered host functions and memory: what another
+    /// surface's front end translates a script against (the Ruby surface's
+    /// `ruby::parse_module`) before [`compile_module`](Engine::compile_module).
+    pub fn type_config(&self) -> TypeConfig {
         TypeConfig {
             host_functions: self
                 .host_fns
