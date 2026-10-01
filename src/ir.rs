@@ -969,9 +969,18 @@ impl<'a> FnLowerer<'a> {
                         self.emit_stmt(Op::ArraySet(b, idx, v))
                     }
                     Type::Map(_) => self.emit_stmt(Op::MapSet(b, idx, v)),
+                    // A record written by a string literal key — set the field.
+                    Type::Record(_) => match &index.kind {
+                        ExprKind::Str(key) => self.emit_stmt(Op::FieldSet(b, key.clone(), v)),
+                        _ => {
+                            return Err(LowerError::Internal(
+                                "record index-assigned by a non-literal key".into(),
+                            ));
+                        }
+                    },
                     other => {
                         return Err(LowerError::Internal(format!(
-                            "index-assign to a non-array/map type {other}"
+                            "index-assign to a non-array/map/record type {other}"
                         )));
                     }
                 }
@@ -1310,7 +1319,7 @@ impl<'a> FnLowerer<'a> {
                 base,
                 index,
                 zero_based,
-            } => self.lower_index(base, index, *zero_based),
+            } => self.lower_index(base, index, *zero_based, expr.span),
             ExprKind::Call { callee, args } => self.lower_call(callee, args),
             ExprKind::MethodCall {
                 receiver,
@@ -1402,6 +1411,7 @@ impl<'a> FnLowerer<'a> {
         base: &Expr,
         index: &Expr,
         zero_based: bool,
+        span: crate::diagnostics::Span,
     ) -> Result<ValueId, LowerError> {
         let b = self.lower_expr(base)?;
         let idx = self.lower_expr(index)?;
@@ -1412,10 +1422,11 @@ impl<'a> FnLowerer<'a> {
             }
             Type::Map(v) => Ok(self.emit_value(Op::MapGet(b, idx), Type::optional(*v))),
             Type::Record(fields) => {
-                // A record indexed by a string literal — read the field.
+                // A record indexed by a string literal — read the field, narrowed as `t.k` is.
                 if let ExprKind::Str(key) = &index.kind {
                     let ty = fields.get(key).cloned().unwrap_or(Type::Error);
-                    Ok(self.emit_value(Op::FieldGet(b, key.clone()), ty))
+                    let v = self.emit_value(Op::FieldGet(b, key.clone()), ty);
+                    Ok(self.narrow(span, v))
                 } else {
                     Err(LowerError::Internal(
                         "record indexed by a non-literal key".into(),

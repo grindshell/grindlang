@@ -493,8 +493,10 @@ it.
 
 ### 5.4 Records, arrays, maps
 
-- **record** keys are known at compile time; `t.k`/`t["k"]` with a literal key are
-  checked against the record's fields. Unknown field ⇒ error.
+- **record** keys are known at compile time; `t.k` and `t["k"]` with a literal key name the
+  same field, to read or assign, and are checked against the record's fields. Unknown field or
+  a non-literal key ⇒ error. They are the same place to narrowing (§5.3) too: a guard on either
+  narrows a read of either, and assigning either ends it.
 - **array** is 1-based; indexing `a[i]` **always yields `T?`** _(v1)_ and must be narrowed
   before use (no static bounds analysis — chosen for implementation simplicity). The
   per-element binding inside an `ipairs` loop is already `T`, so loops are the ergonomic

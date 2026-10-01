@@ -356,7 +356,7 @@ fn a_panic_in_top_level_code_lets_it_run_again() {
 // ---- what top-level code builds is frozen -------------------------------------------
 
 /// A write through an alias of a module value gets past `E0307` and is refused at run time —
-/// for a record, an array, and a map alike.
+/// for a record (by field or by literal key), an array, and a map alike.
 #[test]
 fn a_write_through_an_aliased_module_value_is_refused() {
     let src = "\
@@ -364,11 +364,12 @@ local T = {x = 1}
 local A = {1, 2}
 local M = {[\"k\"] = 1}
 function rec() local t = T t.x = 2 return t.x end
+function rec_key() local t = T t[\"x\"] = 2 return t[\"x\"] end
 function arr() local a = A a[1] = 9 return a[1] end
 function map() local m = M m[\"k\"] = 2 return m[\"k\"] end
 ";
     let mut ex = Executors::new(src, &TypeConfig::default());
-    for f in ["rec", "arr", "map"] {
+    for f in ["rec", "rec_key", "arr", "map"] {
         // Repeated: a call must not unfreeze anything for the next.
         for _ in 0..2 {
             ex.assert_fails(f, vec![], "frozen module value");
@@ -404,14 +405,15 @@ local T = {x = 1}
 T.x = T.x + 1
 local function bump() return T.x + 1 end
 T.x = bump()
+T[\"x\"] = T[\"x\"] * 2
 function f()
   local mine = {x = T.x}
-  mine.x = mine.x * 10
+  mine[\"x\"] = mine.x * 10
   return mine.x
 end
 ";
     let mut ex = Executors::new(src, &TypeConfig::default());
-    ex.assert_returns("f", vec![], "30");
+    ex.assert_returns("f", vec![], "60");
 }
 
 // ---- the embedding API ---------------------------------------------------------------

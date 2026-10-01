@@ -406,6 +406,29 @@ fn record_literal_and_field() {
 }
 
 #[test]
+fn record_field_by_literal_key() {
+    // `SPEC.md` §5.4: `t["k"]` with a literal key is the field `t.k`, read or written, and
+    // narrowed like it: the guarded read unwraps `number?` to a native number in the JIT.
+    let src = "function f(n)\n\
+                 local t = { a = 0, b = \"x\", inner = { v = 1 } }\n\
+                 t[\"a\"] = n\n\
+                 t[\"a\"] = t[\"a\"] + t.a\n\
+                 t[\"b\"] = t.b .. \"y\"\n\
+                 t[\"inner\"][\"v\"] = t[\"inner\"].v + t[\"a\"]\n\
+                 return t[\"b\"] .. tostring(t.inner[\"v\"])\n\
+               end\n\
+               function guard(s)\n\
+                 local t = { a = tonumber(s) }\n\
+                 if t[\"a\"] ~= nil then return t[\"a\"] * 2 + t.a end\n\
+                 return -1\n\
+               end";
+    assert_all_return(src, "f", vec![Value::Number(3.0)], "xy7");
+    for (s, want) in [("4", "12"), ("x", "-1")] {
+        assert_all_return(src, "guard", vec![Value::string(s)], want);
+    }
+}
+
+#[test]
 fn recursion() {
     let src = "function fib(n)\n\
                  if n < 2 then return n end\n\

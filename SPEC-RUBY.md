@@ -396,7 +396,8 @@ leave out the ones it doesn't use. Each form is a loop, so it is a statement: as
 
 Interpolated values go through `tostring`, so each must be a `number`, `bool`, or `string`,
 and interpolating a parameter doesn't settle its type: annotate it (`# @param name string`).
-Record fields are read with `r.name` or `r[:name]` (the literal key `"name"`, SPEC.md §5.4).
+Record fields are read and assigned with `r.name` or `r[:name]` (the literal key `"name"`,
+SPEC.md §5.4).
 
 ### 4.7 Operators
 | Ruby | Becomes |

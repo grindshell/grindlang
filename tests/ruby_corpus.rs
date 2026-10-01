@@ -339,6 +339,14 @@ def record
   r[:damage] + r.damage
 end
 
+def record_by_key(n)
+  r = { name: "sword", damage: 5, hit: n.to_s.to_f }
+  r[:damage] = r[:damage] * 2
+  r[:name] = "#{r.name}+"
+  r[:hit] = nil if n < 0
+  r[:hit].nil? ? r[:name] : "#{r[:name]}#{r[:damage] + r[:hit]}"
+end
+
 def lookup(key)
   m = { "fire" => 2, :ice => 3 }
   v = m[key]
@@ -358,6 +366,8 @@ end
     ex.assert_returns("at", vec![nums(&[5.0, 6.0]), num(2.0)], "-1");
     ex.assert_returns("at", vec![nums(&[5.0, 6.0]), num(-1.0)], "-1");
     ex.assert_returns("record", vec![], "12");
+    ex.assert_returns("record_by_key", vec![num(3.0)], "sword+13");
+    ex.assert_returns("record_by_key", vec![num(-1.0)], "sword+");
     ex.assert_returns("lookup", vec![string("ice")], "3");
     ex.assert_returns("lookup", vec![string("mud")], "0");
 }

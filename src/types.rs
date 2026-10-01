@@ -1573,7 +1573,7 @@ impl<'a> Checker<'a> {
             ExprKind::Name(_) => self.check_name(expr),
             ExprKind::Function(body) => self.check_function(body, None),
             ExprKind::Field { base, name } => self.check_field(base, name, expr.span),
-            ExprKind::Index { base, index, .. } => self.check_index(base, index),
+            ExprKind::Index { base, index, .. } => self.check_index(base, index, expr.span),
             ExprKind::Call { callee, args } => self.check_call(callee, args, expr.span),
             ExprKind::MethodCall {
                 receiver,
@@ -1703,7 +1703,16 @@ impl<'a> Checker<'a> {
         ty
     }
 
-    fn check_index(&mut self, base: &Expr, index: &Expr) -> Type {
+    fn check_index(&mut self, base: &Expr, index: &Expr, span: Span) -> Type {
+        // `t["k"]` is the place `t.k` (`place_of`), so it reads a narrowing as `t.k` does.
+        if let ExprKind::Str(key) = &index.kind
+            && let Some(base_place) = self.place_of(base)
+        {
+            let place = Place::Field(Box::new(base_place), key.clone());
+            if let Some(t) = self.read_narrowed(&place, span) {
+                return t;
+            }
+        }
         let bt = self.check_expr(base);
         match self.u.shallow(&bt) {
             Type::Array(e) => {
@@ -1721,28 +1730,7 @@ impl<'a> Checker<'a> {
                 );
                 Type::optional(*v)
             }
-            Type::Record(fields) => {
-                if let ExprKind::Str(key) = &index.kind {
-                    match fields.get(key) {
-                        Some(t) => t.clone(),
-                        None => {
-                            self.error(
-                                "E0420",
-                                format!("no field `{key}` on {}", self.u.deep(&bt)),
-                                index.span,
-                            );
-                            Type::Error
-                        }
-                    }
-                } else {
-                    self.error(
-                        "E0423",
-                        "a record can only be indexed by a string literal key",
-                        index.span,
-                    );
-                    Type::Error
-                }
-            }
+            Type::Record(fields) => self.record_key(&bt, &fields, index, false),
             Type::Error => Type::Error,
             // The base type is still unknown — drive inference from the index. A numeric
             // key implies an array (the only numerically-indexed type); a string key
@@ -1763,6 +1751,43 @@ impl<'a> Checker<'a> {
                     "E0424",
                     format!("type {} cannot be indexed", self.u.deep(&other)),
                     base.span,
+                );
+                Type::Error
+            }
+        }
+    }
+
+    /// The type of the field of record `rec` (with `fields`) that `index` names, read or (if
+    /// `write`) assigned: `t["k"]` takes a string literal key, checked as `t.k` is (`SPEC.md`
+    /// §5.4). A key from the Ruby surface counts from 0 only for an array, so it is used as
+    /// written.
+    fn record_key(
+        &mut self,
+        rec: &Type,
+        fields: &BTreeMap<String, Type>,
+        index: &Expr,
+        write: bool,
+    ) -> Type {
+        let ExprKind::Str(key) = &index.kind else {
+            self.error(
+                "E0423",
+                "a record can only be indexed by a string literal key",
+                index.span,
+            );
+            return Type::Error;
+        };
+        match fields.get(key) {
+            Some(t) => t.clone(),
+            None => {
+                let added = if write {
+                    " (fields cannot be added)"
+                } else {
+                    ""
+                };
+                self.error(
+                    "E0420",
+                    format!("no field `{key}` on {}{added}", self.u.deep(rec)),
+                    index.span,
                 );
                 Type::Error
             }
@@ -2594,6 +2619,7 @@ impl<'a> Checker<'a> {
                         );
                         *v
                     }
+                    Type::Record(fields) => self.record_key(&bt, &fields, index, true),
                     // Not known yet: the index decides, as it does for a read (`check_index`).
                     Type::Var(_) => {
                         let it = self.check_expr(index);
@@ -2628,8 +2654,10 @@ impl<'a> Checker<'a> {
     }
 
     /// Map an lvalue-ish expression to the [`Place`] it denotes, if it is a narrowable
-    /// location (a bare local/upvalue, a memory root, or a field path over one). Anything
-    /// else (calls, indexing, literals) is not a place and yields `None`.
+    /// location (a bare local/upvalue, a memory root, or a field path over one). A string
+    /// literal key names a field as `.` does (`t["k"]` is `t.k`), so writing either ends a
+    /// guard on the other. Anything else (calls, other indexing, literals) is not a place and
+    /// yields `None`.
     fn place_of(&self, expr: &Expr) -> Option<Place> {
         match &expr.kind {
             ExprKind::Paren(inner) => self.place_of(inner),
@@ -2646,6 +2674,12 @@ impl<'a> Checker<'a> {
                 Box::new(self.place_of(base)?),
                 name.node.clone(),
             )),
+            ExprKind::Index { base, index, .. } => match &index.kind {
+                ExprKind::Str(key) => {
+                    Some(Place::Field(Box::new(self.place_of(base)?), key.clone()))
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -3249,6 +3283,77 @@ mod tests {
             ),
             "E0413",
         );
+    }
+
+    #[test]
+    fn a_record_field_is_written_by_its_literal_key() {
+        // `SPEC.md` §5.4: `t["k"] = v` assigns the field `t.k`, checked as `t.k = v` is.
+        let info = ok(
+            "function f()\n\
+               local t = { a = 0, inner = { v = 1 } }\n\
+               t[\"a\"] = 1\n\
+               t[\"inner\"][\"v\"] = t[\"a\"]\n\
+               return t[\"inner\"].v\n\
+             end",
+            &empty(),
+        );
+        assert_eq!(info.exports["f"].to_string(), "fn() -> number");
+        for (write, code) in [
+            ("t[\"zz\"] = 1", "E0420"),
+            ("t[k] = 1", "E0423"),
+            ("t[\"a\"] = \"x\"", "E0402"),
+            ("t[\"a\"] = nil", "E0402"),
+        ] {
+            let src = format!(
+                "---@param k string\n\
+                 function f(k)\n\
+                   local t = {{ a = 0 }}\n\
+                   {write}\n\
+                 end"
+            );
+            assert_eq!(err_code(&src, &empty()), code, "{write}");
+        }
+    }
+
+    #[test]
+    fn a_literal_key_is_the_same_place_as_the_field() {
+        // `t["k"]` is `t.k`: a guard on either narrows a read of either…
+        for (guard, read) in [
+            ("t[\"b\"]", "t[\"b\"]"),
+            ("t[\"b\"]", "t.b"),
+            ("t.b", "t[\"b\"]"),
+        ] {
+            let info = ok(
+                &format!(
+                    "function f()\n\
+                       local t = {{ b = tonumber(\"5\") }}\n\
+                       if {guard} ~= nil then return {read} + 1 end\n\
+                       return 0\n\
+                     end"
+                ),
+                &empty(),
+            );
+            assert_eq!(info.exports["f"].to_string(), "fn() -> number", "{guard}");
+        }
+        // …and writing either ends it, including a write through the key to a field under it.
+        for (guard, write, read) in [
+            ("t.b", "t[\"b\"] = nil", "t.b"),
+            ("t[\"b\"]", "t.b = nil", "t[\"b\"]"),
+            ("t.c.d", "t[\"c\"].d = nil", "t.c.d"),
+            ("t.c.d", "t[\"c\"][\"d\"] = nil", "t.c.d"),
+        ] {
+            let src = format!(
+                "function f()\n\
+                   local t = {{ b = tonumber(\"5\"), c = {{ d = tonumber(\"6\") }} }}\n\
+                   if {guard} ~= nil then\n\
+                     {write}\n\
+                     return {read} + 1\n\
+                   end\n\
+                   return 0\n\
+                 end"
+            );
+            assert_eq!(err_code(&src, &empty()), "E0401", "{write}");
+        }
     }
 
     #[test]
