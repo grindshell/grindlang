@@ -1434,6 +1434,68 @@ end
     assert_eq!(call_all(&mut all, "use", -1.0).unwrap().to_string(), "neg");
 }
 
+// ---- An optional parameter accepts a value ---------------------------------
+//
+// A `number` or `bool` passed for a `number?`/`bool?` parameter reached the callee as the native
+// scalar where its signature takes the optional's handle, so the JIT failed cranelift
+// verification (an `f64` where an `i64` was expected). An argument is now coerced to its
+// parameter, as a returned value is to the declared result: by a direct call, and by a call of a
+// closure value.
+
+#[test]
+fn optional_parameters_take_a_value_everywhere() {
+    let src = "\
+---@param x number?
+function num(x) if x ~= nil then return x * 2 end return -1 end
+---@param b bool?
+function flag(b) if b ~= nil then return b end return false end
+function use(n)
+  local narrowed = 0
+  local parsed = tonumber(tostring(n))
+  if parsed ~= nil then narrowed = num(parsed) end
+  local bonus = 0
+  if flag(n > 0) then bonus = 100 end
+  return num(n) + num(nil) + narrowed + bonus
+end
+";
+    let mut all = triple(src, &TypeConfig::default());
+    for (n, want) in [(3.0, "111"), (-2.0, "-9")] {
+        let got = call_all(&mut all, "use", n).unwrap_or_else(|e| panic!("use({n}): {e}"));
+        assert_eq!(got.to_string(), want, "use({n})");
+    }
+}
+
+#[test]
+fn a_closure_with_an_optional_parameter_takes_a_value_everywhere() {
+    // `keep` gives back the closure it is passed, typed `fn(number?) -> number`, so the script
+    // calls a closure value whose parameter is optional.
+    let ty = Type::function(vec![Type::optional(Type::Number)], Type::Number);
+    let mut cfg = TypeConfig::default();
+    cfg.host_functions.insert(
+        "keep".to_string(),
+        FnType {
+            params: vec![ty.clone()],
+            ret: Box::new(ty),
+        },
+    );
+    let src = "\
+function use(n)
+  local g = keep(function(x) if x ~= nil then return x * 2 end return -1 end)
+  return g(n) + g(nil)
+end
+";
+    let mut all = triple(src, &cfg);
+    let keep = |a: &[Value]| Ok(a[0].clone());
+    let (interp, vm, jit) = &mut all;
+    interp.set_host_function("keep", keep);
+    vm.set_host_function("keep", keep);
+    jit.set_host_function("keep", keep);
+    for (n, want) in [(3.0, "5"), (-2.0, "-5")] {
+        let got = call_all(&mut all, "use", n).unwrap_or_else(|e| panic!("use({n}): {e}"));
+        assert_eq!(got.to_string(), want, "use({n})");
+    }
+}
+
 // ---- Deep source must not overflow any later phase ------------------------
 
 /// Source nested just inside the parser's limit (`E0209`) must survive every recursive phase —

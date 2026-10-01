@@ -126,11 +126,13 @@ pub fn trampoline_signature(call_conv: CallConv, env: bool) -> Signature {
     sig
 }
 
-/// Shared lookups the translator needs: shim and script-function ids.
+/// Shared lookups the translator needs: shim and script-function ids, and each script function's
+/// parameter representations, which a direct call coerces its arguments to.
 pub struct Context<'a> {
     pub call_conv: CallConv,
     pub shims: &'a HashMap<&'static str, FuncId>,
     pub typed_ids: &'a HashMap<String, FuncId>,
+    pub typed_params: &'a HashMap<String, Vec<Repr>>,
 }
 
 /// Translates one IR [`Function`] into the builder's clif function.
@@ -859,9 +861,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         let sig = typed_signature(self.cx.call_conv, &param_reprs, ret_repr);
         let sigref = self.builder.import_signature(sig);
         let mut call_args = vec![self.ctx_val, self.depth_val, clo];
-        for &a in args {
-            call_args.push(self.val(a));
-        }
+        call_args.extend(self.typed_args(args, &param_reprs[1..]));
         let call = self.builder.ins().call_indirect(sigref, addr, &call_args);
         let result = self.builder.inst_results(call).first().copied();
         self.guard_errored();
@@ -1015,18 +1015,32 @@ impl<'a, 'b> Translator<'a, 'b> {
     }
 
     fn translate_call_script(&mut self, name: &str, args: &[ValueId]) -> Option<ClifValue> {
-        let id = self.cx.typed_ids[name];
+        let cx = self.cx;
+        let id = cx.typed_ids[name];
         let fref = self.script_ref(id);
         let mut call_args = vec![self.ctx_val, self.depth_val];
-        for &a in args {
-            call_args.push(self.val(a));
-        }
+        call_args.extend(self.typed_args(args, &cx.typed_params[name]));
         let call = self.builder.ins().call(fref, &call_args);
         let result = self.builder.inst_results(call).first().copied();
         // A callee that failed took its own error-exit and returned that block's default, which
         // is indistinguishable from a real result — so propagate through the context flag.
         self.guard_errored();
         result
+    }
+
+    /// The clif values of call arguments `args`, each coerced to its parameter's representation
+    /// in `params`: a `number` or `bool` passed for an optional parameter is boxed into the
+    /// optional's handle, as a returned one is for an optional result.
+    fn typed_args(&mut self, args: &[ValueId], params: &[Repr]) -> Vec<ClifValue> {
+        debug_assert_eq!(args.len(), params.len(), "a call's arity is checked");
+        args.iter()
+            .zip(params)
+            .map(|(&a, &to)| {
+                let from = self.value_repr(a);
+                let val = self.val(a);
+                self.coerce(val, from, to)
+            })
+            .collect()
     }
 
     /// Read module slot `slot` as `repr`.

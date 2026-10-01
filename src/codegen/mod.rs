@@ -214,6 +214,7 @@ impl JitModule {
 
         // Declare every function (typed bodies + uniform trampolines).
         let mut typed_ids: HashMap<String, FuncId> = HashMap::new();
+        let mut typed_params: HashMap<String, Vec<Repr>> = HashMap::new();
         let mut fn_tramp_ids: HashMap<String, FuncId> = HashMap::new();
         // Lifted closures get an env-trampoline (not a plain one): they are never exported and
         // are reached only indirectly (in-script) or via the host `call_value` path.
@@ -230,6 +231,7 @@ impl JitModule {
                 .declare_function(&format!("fn_{name}"), Linkage::Local, &sig)
                 .map_err(|e| JitError::Cranelift(e.to_string()))?;
             typed_ids.insert(name.clone(), id);
+            typed_params.insert(name.clone(), params.clone());
 
             let tsig = trampoline_signature(call_conv, f.is_closure);
             if f.is_closure {
@@ -282,6 +284,7 @@ impl JitModule {
             call_conv,
             shims: &shims,
             typed_ids: &typed_ids,
+            typed_params: &typed_params,
         };
 
         let mut fbctx = FunctionBuilderContext::new();
