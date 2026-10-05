@@ -167,7 +167,7 @@ the source was read in, and the identity of the `grindlang` executable that wrot
 size, and modification time), so editing the script or rebuilding `grindlang` invalidates it
 automatically.
 
-Two flags adjust this:
+Three flags adjust this:
 
 - `--cache` compiles and writes the IR cache **without running** the script (a pre-warm step).
 - `--no-cache` runs the script but neither reads nor writes the cache.
@@ -240,8 +240,9 @@ The crate is decoupled by backend. The default gives a fully usable JIT crate.
 cargo build                          # default = jit
 cargo test                           # jit-only: unit + api + doctests + snapshots
 cargo test --features interp         # ALSO runs the interp-vs-jit differential/fuzz/property suites
-cargo test --all-features            # everything (interp + jit + serde)
-cargo bench                          # criterion: parse/compile/call, JIT vs interp, vs a Luau baseline
+cargo test --all-features            # everything (interp + jit + serde + ruby)
+cargo bench                          # criterion: parse/compile/call vs a Luau baseline
+cargo bench --features interp        # ALSO JIT vs the two interpreters
 cargo bench --features ruby          # ALSO the Ruby surface's front end, beside the Lua one's
 cargo run --features serde --bin grindlang -- FILE  # CLI runner (caches IR; needs serde)
 cargo run --features serde,ruby --bin grindlang -- FILE.rb  # a Ruby-surface script

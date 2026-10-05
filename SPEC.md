@@ -443,7 +443,7 @@ unification:
   `map<string, T>`. Mixing record and array forms in one literal is a type error.
 
 If a parameter's type cannot be inferred (e.g. it is only stored/passed through) and is
-not annotated, compilation fails with an "ambiguous type, add an annotation" diagnostic.
+not annotated, compilation fails (`E0410`); a `---@param` annotation (§5.6) pins it.
 
 ### 5.3 Optionals & narrowing
 

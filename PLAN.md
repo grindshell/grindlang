@@ -124,9 +124,9 @@ src/
   ast.rs
   parser.rs
   resolve.rs        scope + constraint enforcement
-  types/            type lattice, inference, unification, checking
-  ir.rs             mid-level typed IR
-  interp.rs         reference interpreter + IR VM oracles (feature: `interp`)
+  types.rs          type lattice, inference, unification, checking
+  ir.rs             mid-level typed IR, plus the IR VM oracle (feature: `interp`)
+  interp.rs         reference interpreter oracle (feature: `interp`)
   codegen/          cranelift lowering (feature: `jit`, default)
   runtime/          arena, string/table reprs, host ABI, builtins
   api.rs            Engine, Module, Value, host-fn registration, memory binding
@@ -261,7 +261,7 @@ and the per-call memo.
 - Tree-walking interpreter over the typed AST/IR implementing the canonical semantics,
   including arena-style value lifetimes, host-fn calls, and memory access.
 - Becomes the **differential-testing oracle** for the JIT and a debug/fallback execution
-  mode (`Engine::interpret`).
+  mode (`interp::Interpreter`).
 - **Exit:** end-to-end "compile → call exported fn → get result" works without cranelift;
   drives the public API tests.
 
@@ -305,7 +305,7 @@ and the per-call memo.
 > cranelift 0.132) compiles the typed IR to native code. Numbers/bools flow **unboxed**
 > (`f64`/`i8`) so arithmetic, comparisons, branches, loops, and numeric-for are genuinely
 > native cranelift; **reference values flow as `i64` handles** into a per-call runtime
-> context (`codegen::rt::RtCtx`) that stores `interp::Value`, and reference ops
+> context (`codegen::rt::RtCtx`) that stores `value::Value`, and reference ops
 > (MakeArray/FieldGet/MapGet/builtins/host/memory) lower to `extern "C"` calls into `rt_*`
 > shims — heap correctness delegated to the proven runtime. The ctx is a hidden first param;
 > each export gets a uniform `(ctx, argv, argc) -> handle` trampoline. Errors: shims record
@@ -435,7 +435,7 @@ therefore produces only what the Lua frontend can, plus the core additions below
 
 ```
 src/ruby/        feature `ruby`, off by default; front end only, no backend dependency
-  mod.rs         parse_ruby(), RubyConfig, entry points
+  mod.rs         parse(), parse_module(), RubyConfig, entry points
   lexer.rs       tokens and spans, string interpolation, `# @param` doc lines
   ast.rs         the Ruby-shaped syntax tree
   parser.rs      Ruby subset grammar → ruby::ast

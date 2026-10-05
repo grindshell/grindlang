@@ -27,11 +27,16 @@ Grindlang is a **separate engine** from dialogmark + Luau, which keep handling M
 dialog trees. Grindlang is its own embeddable calc/decision engine and is **not** required to
 match Luau's API or semantics.
 
+**Consumers.** `backend/` (`crates/game/src/calc.rs`) and `editor/` (`crates/skill-core`)
+path-depend on this crate with default features and compile calc scripts through `api::Engine`:
+the shared `grindshell-stats/calc/*.luau`, the backend's own `crates/game/calc/*.luau`, and an
+editor project's `calc/*.luau`. A breaking change to `api` or to the Lua surface breaks both builds.
+
 ## 2. Status
 
 Phases 0–9 are delivered (front end, resolver, type system, reference interpreter, mid-level
 IR, shared runtime, cranelift JIT, host embedding API; plus Phase 9 hardening: differential +
-fuzz + property tests, criterion benchmarks with a rough Luau baseline, this `CLAUDE.md`, the
+fuzz + property tests, criterion benchmarks with a rough Luau baseline, this `AGENTS.md`, the
 `SPEC.md`, the `embed` example, and the `grindlang` CLI runner). Closures with upvalues,
 calling first-class function values (see `src/capture.rs`), host-memory method calls
 (`mem:m(args)`, `SPEC.md` §7), and top-level code (run once, then frozen — `SPEC.md` §3.1) have
@@ -88,8 +93,8 @@ re-introduce a `jit → interp` dependency: `Value` lives in its own always-comp
 cargo build                          # default = jit
 cargo test                           # jit-only: unit + api + doctests + snapshots
 cargo test --features interp         # ALSO runs the interp-vs-jit differential/fuzz/prop suites
-cargo test --all-features            # everything (interp + jit + serde)
-cargo bench                          # criterion: parse/compile/call, JIT vs interp, vs Luau
+cargo test --all-features            # everything (interp + jit + serde + ruby)
+cargo bench                          # criterion: parse/compile/call vs Luau; --features interp adds JIT vs interp
 cargo run --features serde --bin grindlang -- FILE  # CLI: run FILE's `main` (pyc-style IR cache)
 cargo run --features serde,ruby --bin grindlang -- --print-lua FILE.rb  # what a Ruby script becomes
 cargo clippy --all-targets --all-features -- -D warnings
