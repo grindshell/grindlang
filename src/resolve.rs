@@ -1,6 +1,6 @@
 //! Resolver: name binding + the deeper constraint rules (`PLAN.md` Phase 2).
 //!
-//! The parser already enforced the *structural* contract (no `repeat`/varargs/goto,
+//! The parser already enforced the *structural* contract (no `repeat`/varargs/labels,
 //! generic-`for` iterators restricted, assignable targets). The resolver enforces the rules
 //! that need a symbol table:
 //!

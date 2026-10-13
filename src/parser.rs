@@ -4,7 +4,7 @@
 //!   * **Shape the chunk** — function declarations, `NAME = expr` constants, and top-level
 //!     statements in source order, plus an optional curated `return { ... }` that must come
 //!     last. (Scoping, the no-free-globals rule, and type checks belong to later phases.)
-//!   * **Reject unsupported-but-lexable constructs** (`repeat`/`until`, `goto`/labels,
+//!   * **Reject unsupported-but-lexable constructs** (`repeat`/`until`, labels `::name::`,
 //!     varargs `...`) where they appear, with a "not supported in Grindlang" message.
 //!
 //! The parser bails on the first error (no recovery) — adequate for the current phase;

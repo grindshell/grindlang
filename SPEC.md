@@ -1,11 +1,11 @@
-# Grindlang — Language Specification (draft)
+# Grindlang — Language Specification
 
 > Companion to [PLAN.md](PLAN.md). This document defines the **lexical structure**,
 > **grammar**, **module model**, and the **type/interop rules** needed to read the
 > grammar. It is the authoring contract for `.lua`-syntax Grindlang scripts.
 >
-> Status: draft. Sections marked _(v1)_ are the initial target; _(later)_ items are
-> deliberately deferred.
+> Status: built. A rule marked _(v1)_ holds for this version and may be relaxed later;
+> [PLAN.md](PLAN.md) §4 lists what is deferred.
 
 ## 1. What a Grindlang program is
 
@@ -70,11 +70,14 @@ function if    in     local  nil    not    or     repeat
 return then    true   until  while
 ```
 Reserved-but-unsupported (tokenized as keywords, but rejected with a "not supported in
-Grindlang" diagnostic wherever they appear): `goto` and Lua's label syntax `::name::`;
-`repeat` / `until` (the `repeat … until` loop is not supported — use `while`).
+Grindlang" diagnostic wherever they appear): `repeat` / `until` (the `repeat … until` loop is
+not supported — use `while`). Lua's label syntax `::name::` is rejected the same way (`E0202`).
 
 `continue` (from Luau) is not reserved: as in Luau, it is the `continue` statement (§3.3) where
 a statement starts with it and doesn't call or assign it, and an ordinary name everywhere else.
+
+`goto` is not reserved either (Luau has none): it is an ordinary name, so `goto top` is rejected
+as an expression that is not a statement (`E0205`), with no diagnostic of its own.
 
 ### 2.5 Numbers
 All numeric literals denote `f64`. Accepted forms (Lua-compatible):
@@ -635,8 +638,16 @@ A small, pure, deterministic set — no global namespace pollution beyond these 
   operate on `number`. `math.log10` is base-10 logarithm; like `math.pow` it has no native
   cranelift instruction, so the JIT routes it through the shared reference impl (`f64::log10`),
   keeping the three oracles bit-identical.
-- **string**: `string.len`, `string.sub`, `string.upper`, `string.lower`,
-  `string.find` _(plain, no patterns in v1)_, `string.format` _(restricted verbs)_.
+- **string**: `string.len`, `string.sub`, `string.upper`, `string.lower`, `string.find`,
+  `string.format`.
+  - `string.find(s, sub)` is a plain substring search: no patterns, and no `init` or `plain`
+    argument. It returns the 1-based byte index where `sub` starts, or `nil` (`number?`); Lua's
+    second result, the end index, is not returned.
+  - `string.format(fmt, ...)` takes five verbs: `%d`/`%i` (truncated toward zero), `%f` (six
+    decimals), `%g` (as `tostring` prints a number, so `42`, not `42.0`), `%s` (any value; a
+    missing argument prints `nil`) and `%%`. There are no flags, widths or precisions. The
+    arguments are not type-checked; a numeric verb given a non-number, any other verb, or a
+    trailing `%` is a runtime error, and extra arguments are ignored.
 - **iteration**: `ipairs(array<T>)`, `pairs(map<string,T>)` — usable only in
   `genericfor` (§3.3).
 - **conversion**: `tostring(x)` → `string` for `number`/`bool`/`string`; `tonumber(s)` →
@@ -781,7 +792,8 @@ Each produces a targeted, span-pointing error:
 - `break` or `continue` outside a loop (`E0306`, `E0311`) — §3.3
 - `local M = {} … return M` idiom (use implicit exports)
 - free global read/write; `_G`, `_ENV`
-- `goto` / labels; varargs `...`; `repeat … until` loops
+- labels `::name::`; varargs `...`; `repeat … until` loops. `goto` is an ordinary name (§2.4),
+  so `goto top` gets the general not-a-statement error (`E0205`)
 - `setmetatable`/`getmetatable`, metatable-driven behavior
 - `require`, `load`, `dofile`, `loadstring`, `pcall`/`error`-based control flow _(v1)_
 - truthiness coercion (non-`bool` condition; an `and`/`or` whose left operand is never `nil` or
@@ -883,6 +895,5 @@ both read/write persistent memory.
   host functions but not use memory. `local` makes a top-level name private. A constant's
   initializer may be any expression; constants are built once and frozen like any other module
   value (they used to be literal-only, and rebuilt per call).
-
-### Open spec items still to settle during implementation
-- `string.format` verb whitelist and `string.find` plain-vs-pattern policy (§6).
+- **`string.find` is plain and `string.format` has five verbs** (§6): no Lua patterns, and no
+  format flags, widths or precisions.
