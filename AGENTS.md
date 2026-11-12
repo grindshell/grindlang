@@ -106,7 +106,7 @@ cargo fmt
 > them to **zero tests** — it does *not* exercise the core correctness oracle. Run
 > `cargo test --features interp` (or `--all-features`) before trusting a codegen change.
 
-No `mask` / workspace tooling — this crate is freestanding.
+No workspace tooling — this crate is freestanding. `yio.md` collects these commands (`yio check` is the green bar).
 
 ## 5. Architecture & pipeline
 
